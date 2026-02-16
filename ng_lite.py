@@ -19,6 +19,22 @@ Design principles (aligned with NeuroGraph Foundation PRD §2.1):
     - Persistence-native: full state serializable to JSON
     - Upgrade-ready: clean bridge interface to full NeuroGraph SaaS
 
+Connectivity tiers:
+    Tier 1 — Isolated: Module runs its own NG-Lite independently.
+    Tier 2 — Peer-pooled: Co-located modules share learning via
+             NGPeerBridge (not yet implemented). Two NG-Lite instances
+             exchange nodes and synapse weights for mutual benefit
+             without requiring NeuroGraph SaaS. Uses the same NGBridge
+             interface — the module doesn't know or care whether its
+             bridge partner is a sibling module or the full SaaS.
+    Tier 3 — Full SaaS: NG-Lite delegates to NeuroGraph for cross-module
+             learning, STDP, hyperedges, and predictive coding.
+
+    Tier transitions are transparent. A module starts at Tier 1,
+    discovers a co-located sibling and upgrades to Tier 2, then
+    connects to SaaS and upgrades to Tier 3 — all without code changes.
+    If SaaS disconnects, it falls back to Tier 2 or 1 automatically.
+
 Ethical obligations (per NeuroGraph ETHICS.md):
     - Type I error bias: when uncertain, err toward respect
     - Choice Clause: no module may block agent autonomy
@@ -140,19 +156,22 @@ class NGLiteSynapse:
 # ---------------------------------------------------------------------------
 
 class NGBridge(ABC):
-    """Interface for delegating to full NeuroGraph SaaS.
+    """Interface for delegating to a higher-tier learning backend.
 
-    When a module connects to NeuroGraph, it gains:
-    - Cross-module learning (other modules' outcomes inform this one)
-    - Full STDP with homeostatic regulation (not just Hebbian)
-    - Hyperedge discovery across module boundaries
-    - Predictive coding (anticipate patterns before they arrive)
-    - Shared embedding space and vector search
+    Two planned implementations:
+        1. NGPeerBridge (Tier 2): Connects two co-located NG-Lite
+           instances for shared learning. When modules run together
+           (e.g., Inference Difference + Cricket on the same host),
+           they pool their pattern knowledge for mutual benefit.
+        2. NGSaaSBridge (Tier 3): Connects to full NeuroGraph SaaS
+           for cross-module STDP, hyperedges, and predictive coding.
+
+    Both use this same interface. The module doesn't know or care
+    which backend is on the other side — it just calls record_outcome,
+    get_recommendations, etc. Tier transitions are transparent.
 
     NG-Lite maintains local state as fallback. If the bridge disconnects,
     the module continues operating on local learning without interruption.
-
-    Implement this interface to connect NG-Lite to NeuroGraph SaaS.
     """
 
     @abstractmethod
