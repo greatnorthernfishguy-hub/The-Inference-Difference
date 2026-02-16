@@ -16,7 +16,7 @@ from inference_difference.classifier import RequestClassification, classify_requ
 from inference_difference.router import RoutingEngine, RoutingDecision
 from inference_difference.quality import QualityEvaluation, evaluate_quality
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "InferenceDifferenceConfig",

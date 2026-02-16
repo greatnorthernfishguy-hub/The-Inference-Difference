@@ -1,17 +1,20 @@
 """
 FastAPI application for The Inference Difference.
 
-Exposes the routing engine as an HTTP API. Other modules (Cricket,
-ClawGuard, Observatory, etc.) call this to route their inference
-requests to optimal models.
+Exposes the routing engine as an HTTP API AND as an OpenAI-compatible
+transparent proxy. Agents point OPENAI_BASE_URL at TID and every
+inference request is automatically classified, routed, executed,
+quality-evaluated, and learned from.
 
 Endpoints:
-    POST /route          — Route a request to the best model
-    POST /outcome        — Report routing outcome for learning
-    GET  /health         — Health check with hardware/model status
-    GET  /stats          — Router statistics and performance data
-    GET  /models         — List available models
-    GET  /classify       — Classify a request (debug/introspection)
+    POST /v1/chat/completions  — OpenAI-compatible proxy (the main event)
+    GET  /v1/models            — OpenAI-compatible model listing
+    POST /route                — Route a request (advisory API)
+    POST /outcome              — Report routing outcome for learning
+    GET  /health               — Health check with hardware/model status
+    GET  /stats                — Router statistics and performance data
+    GET  /models               — List available models (TID format)
+    POST /classify             — Classify a request (debug/introspection)
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from inference_difference.config import (
     default_openrouter_models,
 )
 from inference_difference.hardware import HardwareProfile, detect_hardware
+from inference_difference.proxy import init_proxy, model_client, proxy_router
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
 
@@ -183,6 +187,10 @@ async def lifespan(app: FastAPI):
     )
     _state.recent_decisions = {}
 
+    # Initialize proxy
+    init_proxy(_state)
+    await model_client.startup()
+
     logger.info(
         "The Inference Difference started: %d models, GPU=%s",
         len(_state.config.get_enabled_models()),
@@ -190,6 +198,9 @@ async def lifespan(app: FastAPI):
     )
 
     yield
+
+    # Shutdown proxy client
+    await model_client.shutdown()
 
     # Persist NG-Lite state on shutdown
     if _state.ng_lite is not None:
@@ -209,11 +220,16 @@ app = FastAPI(
     description=(
         "Intelligent inference routing gateway for E-T Systems. "
         "Routes requests to optimal models based on hardware, complexity, "
-        "learned performance, and consciousness-aware priorities."
+        "learned performance, and consciousness-aware priorities. "
+        "Exposes an OpenAI-compatible /v1/chat/completions proxy — "
+        "point OPENAI_BASE_URL here and everything flows through automatically."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
+
+# Mount the transparent proxy
+app.include_router(proxy_router)
 
 
 # ---------------------------------------------------------------------------

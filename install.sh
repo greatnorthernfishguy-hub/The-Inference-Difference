@@ -182,7 +182,26 @@ install_deps() {
         "fastapi>=0.100.0" \
         "uvicorn[standard]>=0.22.0" \
         "pydantic>=2.0.0" \
+        "httpx>=0.27.0" \
         -q
+
+    # Generate .env template for API keys
+    if [ ! -f "$INSTALL_DIR/.env" ]; then
+        if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+            echo "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" > "$INSTALL_DIR/.env"
+            chmod 600 "$INSTALL_DIR/.env"
+            info "API key written to $INSTALL_DIR/.env"
+        else
+            cat > "$INSTALL_DIR/.env" << 'ENVEOF'
+# The Inference Difference — API Keys
+# Set your OpenRouter API key here for cloud model routing.
+# Get one at https://openrouter.ai/keys
+# OPENROUTER_API_KEY=sk-or-...
+ENVEOF
+            chmod 600 "$INSTALL_DIR/.env"
+            info "Template .env created at $INSTALL_DIR/.env — add your OPENROUTER_API_KEY"
+        fi
+    fi
 
     info "Dependencies installed"
 }
@@ -257,6 +276,7 @@ Type=simple
 User=$REAL_USER
 WorkingDirectory=$INSTALL_DIR
 Environment=PYTHONPATH=$INSTALL_DIR
+EnvironmentFile=-$INSTALL_DIR/.env
 ExecStart=$VENV_DIR/bin/uvicorn inference_difference.app:app --host $HOST --port $PORT --log-level info
 Restart=on-failure
 RestartSec=5
@@ -557,10 +577,13 @@ case "${1:-}" in
         echo "    sudo systemctl restart $SERVICE_NAME"
         echo "    journalctl -u $SERVICE_NAME -f"
         echo ""
+        echo "  OpenAI-compatible proxy (the main event):"
+        echo "    export OPENAI_BASE_URL=http://$HOST:$PORT/v1"
+        echo ""
         echo "  Quick test:"
-        echo "    curl -X POST http://$HOST:$PORT/route \\"
+        echo "    curl -X POST http://$HOST:$PORT/v1/chat/completions \\"
         echo "      -H 'Content-Type: application/json' \\"
-        echo "      -d '{\"message\": \"Write a Python function to sort a list\"}'"
+        echo "      -d '{\"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}'"
         echo ""
         ;;
 esac
