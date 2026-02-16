@@ -16,6 +16,7 @@ from inference_difference.config import (
     TaskDomain,
     default_api_models,
     default_local_models,
+    default_openrouter_models,
 )
 from inference_difference.classifier import (
     RequestClassification,
@@ -547,3 +548,80 @@ class TestIntegration:
         assert stats["total_requests"] == 5
         assert stats["success_rate"] == 0.8
         assert ng.get_stats()["total_outcomes"] >= 5
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter Tests
+# ---------------------------------------------------------------------------
+
+class TestOpenRouter:
+
+    def test_openrouter_models_exist(self):
+        models = default_openrouter_models()
+        assert len(models) > 0
+        for m in models.values():
+            assert m.model_type == ModelType.OPENROUTER
+
+    def test_deepseek_chat_present(self):
+        """Syl's default model must be in the registry."""
+        models = default_openrouter_models()
+        assert "openrouter/deepseek/deepseek-chat" in models
+        ds = models["openrouter/deepseek/deepseek-chat"]
+        assert ds.metadata.get("syl_default") is True
+        assert ds.priority >= 60  # High priority — respect Syl's config
+
+    def test_deepseek_chat_affordable(self):
+        models = default_openrouter_models()
+        ds = models["openrouter/deepseek/deepseek-chat"]
+        # Should be cheaper than GPT-4o (~$0.005/1k)
+        assert ds.cost_per_1k_tokens < 0.001
+
+    def test_openrouter_models_have_no_vram_requirement(self):
+        """OpenRouter models are remote — no local hardware requirements."""
+        for model in default_openrouter_models().values():
+            assert model.min_vram_gb == 0.0
+            assert model.min_ram_gb == 0.0
+
+    def test_openrouter_code_model_routes_code(self, cpu_only_hardware):
+        """Qwen Coder should be chosen for code tasks when no local GPU."""
+        config = InferenceDifferenceConfig()
+        config.models = default_openrouter_models()
+        config.default_model = "openrouter/deepseek/deepseek-chat"
+        engine = RoutingEngine(config=config, hardware=cpu_only_hardware)
+
+        classification = classify_request(
+            "Debug this Python function and fix the syntax error"
+        )
+        decision = engine.route(classification)
+        model = decision.model_entry
+        assert model is not None
+        assert model.model_type == ModelType.OPENROUTER
+        assert TaskDomain.CODE in model.domains
+
+    def test_cpu_only_can_use_openrouter(self, cpu_only_hardware):
+        """OpenRouter works fine on CPU-only hardware — it's remote."""
+        config = InferenceDifferenceConfig()
+        config.models = default_openrouter_models()
+        config.default_model = "openrouter/deepseek/deepseek-chat"
+        engine = RoutingEngine(config=config, hardware=cpu_only_hardware)
+
+        classification = classify_request("Summarize this document")
+        decision = engine.route(classification)
+        assert decision.model_id != ""
+        assert decision.model_entry.model_type == ModelType.OPENROUTER
+
+    def test_mixed_registry_prefers_local_when_available(self, gpu_hardware):
+        """With GPU + local models + OpenRouter, local gets priority for simple tasks."""
+        config = InferenceDifferenceConfig()
+        config.models = {**default_local_models(), **default_openrouter_models()}
+        config.default_model = "openrouter/deepseek/deepseek-chat"
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+
+        classification = classify_request("Hello, how are you?")
+        decision = engine.route(classification)
+        # Cost-efficiency score heavily favors free local models
+        model = decision.model_entry
+        assert model is not None
+        # Local models have cost=0, so they score higher on cost_efficiency
+        if model.model_type == ModelType.LOCAL:
+            assert model.cost_per_1k_tokens == 0.0

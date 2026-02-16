@@ -31,6 +31,7 @@ from inference_difference.config import (
     ModelEntry,
     default_api_models,
     default_local_models,
+    default_openrouter_models,
 )
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.quality import evaluate_quality
@@ -141,15 +142,21 @@ async def lifespan(app: FastAPI):
     logger.info("Detecting hardware...")
     _state.hardware = detect_hardware()
 
-    # Build model registry
+    # Build model registry (local + OpenRouter + direct API)
     _state.config = InferenceDifferenceConfig()
-    _state.config.models = {**default_local_models(), **default_api_models()}
+    _state.config.models = {
+        **default_local_models(),
+        **default_openrouter_models(),
+        **default_api_models(),
+    }
 
-    # Set default model (prefer local if available)
-    if _state.hardware.has_gpu:
+    # Set default model.
+    # Syl's configured default is DeepSeek via OpenRouter — respect that.
+    # Fall back to a local model if one is available (free and fast).
+    if _state.hardware.has_gpu and _state.hardware.ollama_available:
         _state.config.default_model = "ollama/llama3.1:8b"
     else:
-        _state.config.default_model = "anthropic/claude-haiku-4-5-20251001"
+        _state.config.default_model = "openrouter/deepseek/deepseek-chat"
 
     # Initialize NG-Lite for learning
     try:

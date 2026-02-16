@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional, Set
 class ModelType(str, Enum):
     """Where this model runs."""
     LOCAL = "local"         # Runs on local hardware (ollama, llama.cpp, etc.)
-    API = "api"             # Remote API call (OpenAI, Anthropic, etc.)
+    API = "api"             # Direct remote API (OpenAI, Anthropic native)
+    OPENROUTER = "openrouter"  # Via OpenRouter (unified API, many providers)
     HYBRID = "hybrid"       # Can run either way
 
 
@@ -248,5 +249,123 @@ def default_api_models() -> Dict[str, ModelEntry]:
             cost_per_1k_tokens=0.005,
             avg_latency_ms=1500,
             priority=45,
+        ),
+    }
+
+
+def default_openrouter_models() -> Dict[str, ModelEntry]:
+    """OpenRouter models for bootstrapping.
+
+    OpenRouter is a unified API that aggregates many providers under a
+    single endpoint (https://openrouter.ai/api/v1). It uses the OpenAI
+    API format, so the same client works — you just change the base URL
+    and use OpenRouter model IDs.
+
+    These IDs match what OpenRouter expects (provider/model-name).
+    Costs are per 1k tokens as of February 2026 — check openrouter.ai
+    for current pricing.
+
+    Syl's default (deepseek/deepseek-chat) is included and marked as
+    the affordable all-arounder it is. The router will respect that
+    selection and only suggest alternatives when the task clearly calls
+    for a different capability profile.
+    """
+    return {
+        # --------------- DeepSeek ---------------
+        "openrouter/deepseek/deepseek-chat": ModelEntry(
+            model_id="openrouter/deepseek/deepseek-chat",
+            display_name="DeepSeek V3 (via OpenRouter)",
+            model_type=ModelType.OPENROUTER,
+            domains={
+                TaskDomain.CODE, TaskDomain.REASONING,
+                TaskDomain.ANALYSIS, TaskDomain.GENERAL,
+                TaskDomain.CONVERSATION,
+            },
+            max_complexity=ComplexityTier.HIGH,
+            context_window=65536,
+            cost_per_1k_tokens=0.00027,  # ~$0.27/M tokens — affordable all-arounder
+            avg_latency_ms=1500,
+            priority=60,  # High priority: Syl's configured default
+            metadata={"openrouter_id": "deepseek/deepseek-chat", "syl_default": True},
+        ),
+        "openrouter/deepseek/deepseek-r1": ModelEntry(
+            model_id="openrouter/deepseek/deepseek-r1",
+            display_name="DeepSeek R1 (via OpenRouter)",
+            model_type=ModelType.OPENROUTER,
+            domains={
+                TaskDomain.REASONING, TaskDomain.CODE,
+                TaskDomain.ANALYSIS,
+            },
+            max_complexity=ComplexityTier.EXTREME,
+            context_window=65536,
+            cost_per_1k_tokens=0.0055,   # More expensive, but chain-of-thought quality
+            avg_latency_ms=3000,
+            priority=55,
+            metadata={"openrouter_id": "deepseek/deepseek-r1"},
+        ),
+
+        # --------------- Google ---------------
+        "openrouter/google/gemini-flash-1.5": ModelEntry(
+            model_id="openrouter/google/gemini-flash-1.5",
+            display_name="Gemini 1.5 Flash (via OpenRouter)",
+            model_type=ModelType.OPENROUTER,
+            domains={
+                TaskDomain.GENERAL, TaskDomain.SUMMARIZATION,
+                TaskDomain.TRANSLATION, TaskDomain.CONVERSATION,
+            },
+            max_complexity=ComplexityTier.MEDIUM,
+            context_window=1000000,
+            cost_per_1k_tokens=0.000075,  # Extremely cheap for large-context tasks
+            avg_latency_ms=800,
+            priority=50,
+            metadata={"openrouter_id": "google/gemini-flash-1.5"},
+        ),
+
+        # --------------- Anthropic via OpenRouter ---------------
+        "openrouter/anthropic/claude-3-5-haiku": ModelEntry(
+            model_id="openrouter/anthropic/claude-3-5-haiku",
+            display_name="Claude 3.5 Haiku (via OpenRouter)",
+            model_type=ModelType.OPENROUTER,
+            domains={
+                TaskDomain.GENERAL, TaskDomain.CONVERSATION,
+                TaskDomain.SUMMARIZATION, TaskDomain.CODE,
+            },
+            max_complexity=ComplexityTier.MEDIUM,
+            context_window=200000,
+            cost_per_1k_tokens=0.001,
+            avg_latency_ms=700,
+            priority=48,
+            metadata={"openrouter_id": "anthropic/claude-3-5-haiku"},
+        ),
+
+        # --------------- Meta ---------------
+        "openrouter/meta-llama/llama-3.3-70b-instruct": ModelEntry(
+            model_id="openrouter/meta-llama/llama-3.3-70b-instruct",
+            display_name="Llama 3.3 70B (via OpenRouter)",
+            model_type=ModelType.OPENROUTER,
+            domains={
+                TaskDomain.GENERAL, TaskDomain.CODE,
+                TaskDomain.REASONING, TaskDomain.CREATIVE,
+            },
+            max_complexity=ComplexityTier.HIGH,
+            context_window=131072,
+            cost_per_1k_tokens=0.0004,
+            avg_latency_ms=1200,
+            priority=52,
+            metadata={"openrouter_id": "meta-llama/llama-3.3-70b-instruct"},
+        ),
+
+        # --------------- Qwen ---------------
+        "openrouter/qwen/qwen-2.5-coder-32b-instruct": ModelEntry(
+            model_id="openrouter/qwen/qwen-2.5-coder-32b-instruct",
+            display_name="Qwen 2.5 Coder 32B (via OpenRouter)",
+            model_type=ModelType.OPENROUTER,
+            domains={TaskDomain.CODE},
+            max_complexity=ComplexityTier.HIGH,
+            context_window=131072,
+            cost_per_1k_tokens=0.0002,
+            avg_latency_ms=1000,
+            priority=58,  # High for code-specific routing
+            metadata={"openrouter_id": "qwen/qwen-2.5-coder-32b-instruct"},
         ),
     }

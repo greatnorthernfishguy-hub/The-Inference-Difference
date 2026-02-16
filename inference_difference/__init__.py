@@ -10,7 +10,7 @@ Date: February 2026
 License: AGPL-3.0
 """
 
-from inference_difference.config import InferenceDifferenceConfig, ModelEntry
+from inference_difference.config import InferenceDifferenceConfig, ModelEntry, ModelType
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.classifier import RequestClassification, classify_request
 from inference_difference.router import RoutingEngine, RoutingDecision
