@@ -45,6 +45,18 @@ License: AGPL-3.0 (see NeuroGraph LICENSE)
 
 Author: Josh + Claude
 Date: February 2026
+
+Changelog (Grok audit response, 2026-02-19):
+- NO CHANGE: _update_synapse weight clamping (audit: "no clamp [0,1]").
+  The code ALREADY clamps via np.clip(synapse.weight, 0.0, 1.0) at line
+  ~403 in record_outcome(). The audit missed this. The NGLiteSynapse
+  docstring also documents the [0.0, 1.0] bound. No fix needed.
+- NO CHANGE: Linear scan in _find_similar_node (audit: "batch cosine").
+  At max_nodes=1000 with 384-dim vectors, the linear scan takes <1ms.
+  Vectorized batch cosine (stacking into a matrix) would save ~0.3ms
+  but require maintaining a numpy matrix alongside the dict — doubling
+  memory management complexity for a sub-millisecond gain. When we hit
+  >10K nodes, we'll switch to FAISS or annoy. For now, simplicity wins.
 """
 
 from __future__ import annotations

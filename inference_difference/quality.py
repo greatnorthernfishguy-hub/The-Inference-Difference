@@ -11,6 +11,22 @@ Quality signals:
     - Length appropriateness (not too short, not too padded)
     - Error indicators (apologies, refusals, error messages)
     - Latency (did it meet the time budget?)
+
+Changelog (Grok audit response, 2026-02-19):
+- FIXED: _score_latency now clamps negative latency to 0 (audit:
+  "penalize negatives?"). Negative latency is a data error, not a fast
+  response. Returns 1.0 (no penalty) for latency <= 0 — same as "no data".
+- KEPT: Heuristic-only completion scoring (audit: "misses indirect answers").
+  By design. The quality evaluator is a fast, cheap signal — not a judge
+  model. Running another LLM to evaluate the first LLM's response would
+  defeat the cost-saving purpose of TID. The heuristics catch the obvious
+  failures (empty, error, refusal) which is sufficient for NG-Lite learning.
+- KEPT: No request-aware coherence (audit: "ignores request for coherence").
+  Syntax checking code responses would require a parser per language. Phase 2
+  could pipe code responses through a linter, but that's a separate module.
+- KEPT: Weighted scoring (audit: "avg — weighted by importance?"). The code
+  already uses QUALITY_WEIGHTS for weighted scoring. The audit misread the
+  implementation — it's not a simple average.
 """
 
 from __future__ import annotations
@@ -276,7 +292,14 @@ def _score_error_free(lower: str) -> float:
 
 
 def _score_latency(latency_ms: float, budget_ms: float) -> float:
-    """Score latency against budget."""
+    """Score latency against budget.
+
+    Negative latency is treated as missing data (returns 1.0 = no penalty).
+    """
+    # Clamp: negative latency is a data error, not a fast response
+    latency_ms = max(0.0, latency_ms)
+    budget_ms = max(0.0, budget_ms)
+
     if latency_ms <= 0 or budget_ms <= 0:
         return 1.0  # No latency data or no budget
 

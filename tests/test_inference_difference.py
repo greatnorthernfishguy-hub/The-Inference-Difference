@@ -2,8 +2,19 @@
 Tests for The Inference Difference routing gateway.
 
 Covers: config, hardware, classifier, router, quality evaluator,
-NG-Lite integration, and consciousness-aware routing.
+NG-Lite integration, consciousness-aware routing, subprocess mocks,
+and concurrent routing.
+
+Changelog (Grok audit response, 2026-02-19):
+- ADDED: Subprocess mocks for hardware detection (audit: "no mocks, flaky CI").
+- ADDED: Concurrent routing stress test (audit: "no threading").
+- ADDED: Config validation tests (audit: "no checks on bad values").
+- ADDED: Gibberish response quality test (audit: "gibberish—low score?").
+- ADDED: Negative latency edge case test (audit: "zero latency=1.0").
 """
+
+import concurrent.futures
+from unittest.mock import patch, MagicMock
 
 import numpy as np
 import pytest
@@ -21,7 +32,12 @@ from inference_difference.classifier import (
     RequestClassification,
     classify_request,
 )
-from inference_difference.hardware import HardwareProfile, GPUInfo
+from inference_difference.hardware import (
+    HardwareProfile,
+    GPUInfo,
+    detect_hardware,
+    _clamp_vram,
+)
 from inference_difference.quality import evaluate_quality, QualityEvaluation
 from inference_difference.router import RoutingEngine, RoutingDecision
 from ng_lite import NGLite
@@ -547,3 +563,194 @@ class TestIntegration:
         assert stats["total_requests"] == 5
         assert stats["success_rate"] == 0.8
         assert ng.get_stats()["total_outcomes"] >= 5
+
+
+# ---------------------------------------------------------------------------
+# Config Validation Tests (Grok audit: "no validation")
+# ---------------------------------------------------------------------------
+
+class TestConfigValidation:
+
+    def test_negative_cost_raises(self):
+        with pytest.raises(ValueError, match="cost_per_1k_tokens"):
+            ModelEntry(model_id="bad", cost_per_1k_tokens=-0.01)
+
+    def test_zero_context_window_raises(self):
+        with pytest.raises(ValueError, match="context_window"):
+            ModelEntry(model_id="bad", context_window=0)
+
+    def test_negative_latency_raises(self):
+        with pytest.raises(ValueError, match="avg_latency_ms"):
+            ModelEntry(model_id="bad", avg_latency_ms=-100)
+
+    def test_negative_vram_raises(self):
+        with pytest.raises(ValueError, match="min_vram_gb"):
+            ModelEntry(model_id="bad", min_vram_gb=-1.0)
+
+    def test_negative_ram_raises(self):
+        with pytest.raises(ValueError, match="min_ram_gb"):
+            ModelEntry(model_id="bad", min_ram_gb=-1.0)
+
+    def test_valid_model_entry_passes(self):
+        """Verify that valid entries don't raise."""
+        model = ModelEntry(
+            model_id="valid",
+            cost_per_1k_tokens=0.0,
+            context_window=4096,
+            avg_latency_ms=0.0,
+            min_vram_gb=0.0,
+            min_ram_gb=0.0,
+        )
+        assert model.model_id == "valid"
+
+
+# ---------------------------------------------------------------------------
+# Hardware Mock Tests (Grok audit: "no mocks for subprocess")
+# ---------------------------------------------------------------------------
+
+class TestHardwareMocked:
+
+    @patch("inference_difference.hardware.shutil.which")
+    @patch("inference_difference.hardware.subprocess.run")
+    def test_detect_hardware_no_gpu_no_ollama(self, mock_run, mock_which):
+        """No GPU tools, no ollama — should return zeros cleanly."""
+        mock_which.return_value = None  # No nvidia-smi, no rocm-smi, no ollama
+        profile = detect_hardware()
+        assert profile.has_gpu is False
+        assert profile.total_vram_gb == 0.0
+        assert profile.ollama_available is False
+        assert profile.ollama_models == []
+
+    @patch("inference_difference.hardware._detect_ollama_models")
+    @patch("inference_difference.hardware._detect_ollama", return_value=True)
+    @patch("inference_difference.hardware._detect_amd_gpus", return_value=[])
+    @patch("inference_difference.hardware._detect_nvidia_gpus")
+    def test_detect_hardware_with_nvidia(
+        self, mock_nvidia, mock_amd, mock_ollama, mock_models
+    ):
+        """Mocked nvidia-smi returns a GPU."""
+        mock_nvidia.return_value = [
+            GPUInfo(index=0, name="RTX 4090", vram_total_gb=24.0, vram_free_gb=22.0),
+        ]
+        mock_models.return_value = ["llama3.1:8b"]
+        profile = detect_hardware()
+        assert profile.has_gpu is True
+        assert profile.total_vram_gb == 24.0
+        assert profile.ollama_available is True
+
+    def test_vram_clamp_negative(self):
+        assert _clamp_vram(-5.0) == 0.0
+
+    def test_vram_clamp_infinite(self):
+        assert _clamp_vram(float("inf")) == 512.0
+
+    def test_vram_clamp_normal(self):
+        assert _clamp_vram(12.0) == 12.0
+
+    def test_vram_clamp_upper_bound(self):
+        assert _clamp_vram(999.0) == 512.0
+
+
+# ---------------------------------------------------------------------------
+# Concurrent Routing Tests (Grok audit: "no threading")
+# ---------------------------------------------------------------------------
+
+class TestConcurrentRouting:
+
+    def test_concurrent_routing_thread_safe(self, full_config, gpu_hardware):
+        """Multiple threads routing simultaneously should not crash."""
+        ng = NGLite(module_id="concurrent_test")
+        engine = RoutingEngine(
+            config=full_config, hardware=gpu_hardware, ng_lite=ng,
+        )
+
+        messages = [
+            "Write Python code",
+            "Explain quantum physics",
+            "Translate to Spanish",
+            "Debug this error",
+            "Write a poem",
+            "Summarize this article",
+            "Quick hello",
+            "Design a database schema",
+        ]
+
+        def route_and_report(msg):
+            classification = classify_request(msg)
+            decision = engine.route(classification)
+            engine.report_outcome(
+                decision=decision,
+                success=True,
+                quality_score=0.8,
+                latency_ms=500,
+            )
+            return decision.model_id
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(route_and_report, m) for m in messages]
+            results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        # All should have returned a valid model_id
+        assert len(results) == len(messages)
+        assert all(r != "" for r in results)
+
+        stats = engine.get_stats()
+        assert stats["total_requests"] == len(messages)
+
+
+# ---------------------------------------------------------------------------
+# Quality Edge Case Tests (Grok audit additions)
+# ---------------------------------------------------------------------------
+
+class TestQualityEdgeCases:
+
+    def test_gibberish_response_low_score(self):
+        """Gibberish should score low on coherence."""
+        result = evaluate_quality(
+            response_text="asdf asdf asdf asdf asdf asdf asdf asdf asdf asdf"
+        )
+        assert result.coherence_score < 0.8
+
+    def test_negative_latency_no_penalty(self):
+        """Negative latency (data error) should not penalize."""
+        result = evaluate_quality(
+            response_text="Good response with substance.",
+            latency_ms=-100.0,
+            latency_budget_ms=5000.0,
+        )
+        assert result.latency_score == 1.0
+
+    def test_ambiguous_query_moderate_confidence(self):
+        """Ambiguous query hitting multiple domains should have <1.0 confidence."""
+        result = classify_request(
+            "Help me analyze and explain this data trend"
+        )
+        # Hits CONVERSATION (help), ANALYSIS (analyze, data, trend),
+        # and REASONING (explain) — should not be fully confident
+        assert result.confidence < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Router Verbose Reasoning Tests
+# ---------------------------------------------------------------------------
+
+class TestRouterReasoning:
+
+    def test_verbose_reasoning(self, full_config, gpu_hardware):
+        engine = RoutingEngine(
+            config=full_config, hardware=gpu_hardware, verbose_reasoning=True,
+        )
+        classification = classify_request("Write Python code")
+        decision = engine.route(classification)
+        # Verbose should include "Top factors"
+        assert "Top factors" in decision.reasoning
+
+    def test_concise_reasoning(self, full_config, gpu_hardware):
+        engine = RoutingEngine(
+            config=full_config, hardware=gpu_hardware, verbose_reasoning=False,
+        )
+        classification = classify_request("Write Python code")
+        decision = engine.route(classification)
+        # Concise should NOT include "Top factors"
+        assert "Top factors" not in decision.reasoning
+        assert "Selected" in decision.reasoning

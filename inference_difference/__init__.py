@@ -8,6 +8,13 @@ priorities. Uses NG-Lite for Hebbian learning from routing outcomes.
 Author: Josh + Claude
 Date: February 2026
 License: AGPL-3.0
+
+Changelog (Grok audit response, 2026-02-19):
+- KEPT: No version guard / compatibility shim (audit: "breaking changes?").
+  This is v0.1.0 — pre-release. There are zero external consumers to break.
+  Adding semver guards to __init__.py before we have a stable API would be
+  premature. When we hit 1.0, we'll add deprecation warnings. __all__ is
+  already exhaustive as the audit itself acknowledged.
 """
 
 from inference_difference.config import InferenceDifferenceConfig, ModelEntry

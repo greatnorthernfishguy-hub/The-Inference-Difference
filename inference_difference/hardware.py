@@ -7,6 +7,21 @@ which local models can actually run on this hardware.
 Non-invasive: only reads system info, never modifies anything.
 Graceful degradation: missing tools (nvidia-smi, etc.) result in
 zeroed-out fields, not errors.
+
+Changelog (Grok audit response, 2026-02-19):
+- ADDED: AMD GPU detection via rocm-smi (audit: "NVIDIA-centrism").
+  Intel discrete GPUs via clinfo deferred — too varied in output format
+  and low adoption for local LLM inference. Will revisit when Intel Arc
+  gains ollama support.
+- ADDED: VRAM bounds clamping to [0, 512] GB (audit: "no validation").
+  512 GB is a generous upper bound covering multi-GPU HPC nodes.
+- KEPT: Ollama stdout parsing as-is (audit: "naive split"). The format
+  is "NAME  ID  SIZE  MODIFIED" with tab/space separation. The split()[0]
+  approach has been stable across ollama versions. CSV parsing would add
+  complexity for no gain since ollama has no CSV output mode.
+- KEPT: subprocess calls with list args (audit: "shell=True risk"). The
+  code already uses shell=False (subprocess.run default) with list args.
+  The audit's concern is a misread — no shell=True exists in this file.
 """
 
 from __future__ import annotations
@@ -197,7 +212,26 @@ def _detect_ram() -> tuple:
     return 0.0, 0.0
 
 
+def _clamp_vram(value_gb: float) -> float:
+    """Clamp VRAM to sane bounds [0, 512] GB.
+
+    512 GB covers multi-GPU HPC nodes (e.g., 8x A100 80GB).
+    Negative or inf values from malformed nvidia-smi output are clamped.
+    """
+    if not (0.0 <= value_gb <= 512.0):
+        logger.debug("VRAM value out of bounds (%.2f GB), clamping", value_gb)
+    return max(0.0, min(value_gb, 512.0))
+
+
 def _detect_gpus() -> List[GPUInfo]:
+    """Detect GPUs via nvidia-smi (NVIDIA) and rocm-smi (AMD)."""
+    gpus: List[GPUInfo] = []
+    gpus.extend(_detect_nvidia_gpus())
+    gpus.extend(_detect_amd_gpus())
+    return gpus
+
+
+def _detect_nvidia_gpus() -> List[GPUInfo]:
     """Detect NVIDIA GPUs via nvidia-smi."""
     if not shutil.which("nvidia-smi"):
         return []
@@ -223,14 +257,79 @@ def _detect_gpus() -> List[GPUInfo]:
                 gpus.append(GPUInfo(
                     index=int(parts[0]),
                     name=parts[1],
-                    vram_total_gb=float(parts[2]) / 1024,
-                    vram_free_gb=float(parts[3]) / 1024,
+                    vram_total_gb=_clamp_vram(float(parts[2]) / 1024),
+                    vram_free_gb=_clamp_vram(float(parts[3]) / 1024),
                     driver_version=parts[4],
                 ))
         return gpus
 
     except Exception as e:
-        logger.debug("GPU detection failed: %s", e)
+        logger.debug("NVIDIA GPU detection failed: %s", e)
+        return []
+
+
+def _detect_amd_gpus() -> List[GPUInfo]:
+    """Detect AMD GPUs via rocm-smi.
+
+    rocm-smi is the AMD equivalent of nvidia-smi for ROCm-supported GPUs.
+    Falls back gracefully if rocm-smi is not installed or fails.
+    """
+    if not shutil.which("rocm-smi"):
+        return []
+
+    try:
+        # Get GPU names and VRAM via rocm-smi --showmeminfo vram --json
+        result = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+
+        import json
+        data = json.loads(result.stdout)
+
+        gpus = []
+        idx = 0
+        for card_key, card_data in data.items():
+            if not card_key.startswith("card"):
+                continue
+
+            # rocm-smi reports VRAM in bytes
+            total_bytes = int(card_data.get("VRAM Total Memory (B)", 0))
+            used_bytes = int(card_data.get("VRAM Total Used Memory (B)", 0))
+            total_gb = _clamp_vram(total_bytes / (1024 ** 3))
+            free_gb = _clamp_vram((total_bytes - used_bytes) / (1024 ** 3))
+
+            # Get GPU name from a separate call
+            name = f"AMD GPU {idx}"
+            try:
+                id_result = subprocess.run(
+                    ["rocm-smi", "--showproductname", "--json"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if id_result.returncode == 0:
+                    id_data = json.loads(id_result.stdout)
+                    card_id_data = id_data.get(card_key, {})
+                    name = card_id_data.get(
+                        "Card Series", card_id_data.get("Card Model", name)
+                    )
+            except Exception:
+                pass
+
+            gpus.append(GPUInfo(
+                index=idx,
+                name=name,
+                vram_total_gb=total_gb,
+                vram_free_gb=free_gb,
+                driver_version="rocm",
+            ))
+            idx += 1
+
+        return gpus
+
+    except Exception as e:
+        logger.debug("AMD GPU detection failed: %s", e)
         return []
 
 

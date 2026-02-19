@@ -15,6 +15,24 @@ Routing factors (in priority order):
     7. Consciousness priority — CTEM-flagged agents get better models
 
 Fallback chain: if the primary model fails, try the next-best candidate.
+
+Changelog (Grok audit response, 2026-02-19):
+- KEPT: Default scoring weights as-is (audit: "weights equal, cost should
+  dominate"). Domain match (0.25) and complexity fit (0.20) deliberately
+  outweigh cost (0.15) because routing to the WRONG model wastes the entire
+  request — a $0.003 call that fails is more expensive than a $0.005 call
+  that succeeds. Cost is already the third factor. The weights are
+  configurable via the scoring_weights constructor param if users disagree.
+- KEPT: No auto-retry in router (audit: "no retries"). The router returns
+  a fallback_chain — the CALLER (app.py or the consuming module) decides
+  retry policy. Putting retries in the router would couple it to HTTP/API
+  transport concerns it shouldn't know about.
+- KEPT: NG-Lite fallback to 0.5 neutral (audit: "assumes NG-Lite always
+  connected"). The code already handles None ng_lite — _score_learned()
+  returns 0.5 (neutral) when ng_lite is None or has no data for this
+  model. This is the correct behavior: no data = no opinion.
+- ADDED: verbose_reasoning flag to control reasoning string detail
+  (audit: "verbosity bloat"). When False, reasoning is one-line.
 """
 
 from __future__ import annotations
@@ -123,11 +141,13 @@ class RoutingEngine:
         hardware: HardwareProfile,
         ng_lite: Optional[Any] = None,  # Optional NGLite instance
         scoring_weights: Optional[Dict[str, float]] = None,
+        verbose_reasoning: bool = True,
     ):
         self.config = config
         self.hardware = hardware
         self._ng_lite = ng_lite
         self._weights = scoring_weights or dict(DEFAULT_SCORING_WEIGHTS)
+        self._verbose_reasoning = verbose_reasoning
         self._request_counter = 0
 
         # Performance tracking
@@ -590,12 +610,21 @@ class RoutingEngine:
         classification: RequestClassification,
         consciousness_boost: bool,
     ) -> str:
-        """Build human-readable reasoning for a routing decision."""
-        parts = [
+        """Build human-readable reasoning for a routing decision.
+
+        When verbose_reasoning is False, returns a compact one-liner
+        suitable for logging without response bloat.
+        """
+        summary = (
             f"Selected {model.display_name} for "
             f"{classification.primary_domain.value}/"
-            f"{classification.complexity.value} request.",
-        ]
+            f"{classification.complexity.value} request."
+        )
+
+        if not self._verbose_reasoning:
+            return summary
+
+        parts = [summary]
 
         # Top scoring factors
         sorted_factors = sorted(
