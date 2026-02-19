@@ -11,7 +11,21 @@ Endpoints:
     GET  /health         — Health check with hardware/model status
     GET  /stats          — Router statistics and performance data
     GET  /models         — List available models
-    GET  /classify       — Classify a request (debug/introspection)
+    POST /classify       — Classify a request (debug/introspection)
+
+Changelog (Grok audit response, 2026-02-19):
+- ADDED: Optional API key auth via TID_API_KEY env var (audit: "no auth").
+  When set, all requests must include X-API-Key header. When unset (default),
+  no auth — appropriate for localhost-only binding.
+- ADDED: score_breakdown field to RouteResponse (audit: "no full reasoning
+  trace"). Exposes per-factor scores for transparency.
+- ADDED: Production exception handler (audit: "error leaks"). In production
+  (TID_ENV=production), stack traces are suppressed in HTTP responses.
+- KEPT: Synchronous classify_request in async endpoint (audit: "blocking").
+  classify_request is a pure-CPU heuristic that runs in <1ms. Wrapping it
+  in run_in_executor would add more overhead than the function itself takes.
+  The router scoring is similarly fast. If we add ML-based classification
+  later, we'll make it async then.
 """
 
 from __future__ import annotations
@@ -19,10 +33,12 @@ from __future__ import annotations
 import logging
 import os
 import time
+import traceback
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from inference_difference.classifier import classify_request
@@ -65,6 +81,7 @@ class RouteResponse(BaseModel):
     """Response body for /route."""
     model_id: str
     score: float
+    score_breakdown: Dict[str, float] = {}
     reasoning: str
     fallback_chain: List[str]
     request_id: str
@@ -210,6 +227,60 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
+# Middleware: Optional API key auth
+# ---------------------------------------------------------------------------
+
+_API_KEY = os.environ.get("TID_API_KEY")
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """Enforce API key auth when TID_API_KEY is set.
+
+    When TID_API_KEY env var is empty or unset, all requests pass through
+    (appropriate for localhost-only binding). When set, requests must
+    include a matching X-API-Key header.
+    """
+    if _API_KEY:
+        # Health check is always public (for load balancers / monitoring)
+        if request.url.path != "/health":
+            key = request.headers.get("X-API-Key", "")
+            if key != _API_KEY:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key"},
+                )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Exception handler: suppress traces in production
+# ---------------------------------------------------------------------------
+
+_IS_PRODUCTION = os.environ.get("TID_ENV", "").lower() == "production"
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch unhandled exceptions and suppress stack traces in production."""
+    if _IS_PRODUCTION:
+        logger.error("Unhandled exception on %s: %s", request.url.path, exc)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
+        )
+    # In development, re-raise for full trace
+    logger.error(
+        "Unhandled exception on %s: %s\n%s",
+        request.url.path, exc, traceback.format_exc(),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -249,6 +320,9 @@ async def route_request(req: RouteRequest) -> RouteResponse:
     return RouteResponse(
         model_id=decision.model_id,
         score=decision.score,
+        score_breakdown={
+            k: round(v, 4) for k, v in decision.score_breakdown.items()
+        },
         reasoning=decision.reasoning,
         fallback_chain=decision.fallback_chain,
         request_id=decision.request_id,

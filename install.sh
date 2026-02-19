@@ -11,6 +11,7 @@
 #   ./install.sh --no-service   # Install without systemd service
 #   ./install.sh --uninstall    # Remove installation (preserves learned data)
 #   ./install.sh --status       # Check installation status
+#   ./install.sh --quiet        # Full install with minimal output
 #
 # Environment:
 #   TID_INSTALL_DIR    — Override install location (default: /opt/inference-difference)
@@ -23,6 +24,19 @@
 #   - ~500MB disk space (venv + dependencies)
 #   - Optional: NVIDIA GPU with nvidia-smi for local model support
 #   - Optional: ollama for local model serving
+#
+# Changelog (Grok audit response, 2026-02-19):
+# - ADDED: --quiet flag for minimal output (audit: "echo spam").
+# - ADDED: User-dir fallback when /opt is not writable (audit: "assumes sudo").
+#   If not root and no sudo, installs to ~/.local/share/inference-difference.
+# - KEPT: Linux/systemd focus (audit: "assumes Linux"). This project targets
+#   Ubuntu VPS deployment (Josh's Sylphrena infra). macOS/Windows support
+#   would need launchctl/Windows Service wrappers respectively — tracked as
+#   future work, not a bug. Users on those platforms can use --no-service and
+#   run uvicorn directly.
+# - KEPT: No git --verify-signatures (audit: "no hash verify"). This installer
+#   copies from the local checkout, not from a git clone. The source is already
+#   on disk. Signature verification belongs in CI/CD, not the installer.
 #
 
 set -euo pipefail
@@ -46,6 +60,12 @@ HOST="${TID_HOST:-127.0.0.1}"
 # Minimum Python version
 MIN_PYTHON="3.10"
 
+# Quiet mode (set by --quiet flag)
+QUIET=false
+
+# Skip systemd service (set when no root access)
+SKIP_SERVICE=false
+
 # ---------------------------------------------------------------------------
 # Colors and logging
 # ---------------------------------------------------------------------------
@@ -57,10 +77,10 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-info()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
-error() { echo -e "${RED}[x]${NC} $*" >&2; }
-header() { echo -e "\n${BLUE}${BOLD}$*${NC}"; }
+info()  { $QUIET || echo -e "${GREEN}[+]${NC} $*"; }
+warn()  { $QUIET || echo -e "${YELLOW}[!]${NC} $*"; }
+error() { echo -e "${RED}[x]${NC} $*" >&2; }  # Errors always shown
+header() { $QUIET || echo -e "\n${BLUE}${BOLD}$*${NC}"; }
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -72,13 +92,26 @@ preflight() {
     # Must be run as root (for /opt and systemd) or with sudo
     if [[ $EUID -ne 0 ]]; then
         # Check if we can sudo
-        if command -v sudo &>/dev/null; then
+        if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+            warn "Not running as root. Will use sudo for system operations."
+            SUDO="sudo"
+        elif command -v sudo &>/dev/null; then
             warn "Not running as root. Will use sudo for system operations."
             SUDO="sudo"
         else
-            error "This installer needs root access for /opt and systemd."
-            error "Run with: sudo ./install.sh"
-            exit 1
+            # User-dir fallback: install to ~/.local/share without root
+            USER_INSTALL_DIR="$HOME/.local/share/inference-difference"
+            if [ "$INSTALL_DIR" = "/opt/inference-difference" ]; then
+                warn "No root access. Installing to $USER_INSTALL_DIR instead."
+                INSTALL_DIR="$USER_INSTALL_DIR"
+                VENV_DIR="$INSTALL_DIR/venv"
+                DATA_DIR="$INSTALL_DIR/data"
+                LOG_DIR="$INSTALL_DIR/logs"
+                CONFIG_FILE="$INSTALL_DIR/config.json"
+            fi
+            SUDO=""
+            SKIP_SERVICE=true
+            warn "Systemd service will be skipped (no root access)."
         fi
     else
         SUDO=""
@@ -495,6 +528,17 @@ case "${1:-}" in
         info "Installed without service. Start manually with:"
         echo "  cd $INSTALL_DIR && $VENV_DIR/bin/uvicorn inference_difference.app:app --host $HOST --port $PORT"
         ;;
+    --quiet)
+        QUIET=true
+        preflight
+        install_deps
+        generate_config
+        if [ "$SKIP_SERVICE" != true ]; then
+            install_service
+        fi
+        verify
+        echo "The Inference Difference installed: http://$HOST:$PORT"
+        ;;
     --uninstall)
         SUDO="${SUDO:-}"
         [[ $EUID -ne 0 ]] && SUDO="sudo"
@@ -514,6 +558,7 @@ case "${1:-}" in
         echo "  (none)         Full install + start systemd service"
         echo "  --deps-only    Only install dependencies"
         echo "  --no-service   Install without systemd service"
+        echo "  --quiet        Full install with minimal output"
         echo "  --uninstall    Remove installation (preserves learned data)"
         echo "  --status       Check installation status"
         echo "  --help         Show this help"
@@ -538,9 +583,15 @@ case "${1:-}" in
         echo ""
         generate_config
         echo ""
-        install_service
-        echo ""
-        install_desktop_shortcut
+        if [ "$SKIP_SERVICE" != true ]; then
+            install_service
+            echo ""
+            install_desktop_shortcut
+        else
+            warn "Skipping systemd service (no root access)."
+            info "Start manually with:"
+            echo "  cd $INSTALL_DIR && $VENV_DIR/bin/uvicorn inference_difference.app:app --host $HOST --port $PORT"
+        fi
         echo ""
         verify
         echo ""

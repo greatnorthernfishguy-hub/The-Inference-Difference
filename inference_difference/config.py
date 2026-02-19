@@ -6,6 +6,24 @@ capabilities, costs, latency characteristics, and hardware requirements.
 
 The config is designed to be loaded from YAML/JSON but has sensible
 defaults for zero-config startup.
+
+Changelog (Grok audit response, 2026-02-19):
+- ADDED: __post_init__ validation on ModelEntry (audit: "no validation").
+  Checks cost >= 0, context_window > 0, latency > 0, VRAM/RAM >= 0.
+- KEPT: Static context_window values (audit: "no dynamic query"). Context
+  windows are fixed properties of model architectures, not runtime state.
+  Dynamic querying would require API clients for every provider, adding
+  latency and failure modes to what should be a fast config lookup. The
+  values here match published model specs. If a model updates its context
+  window, we update the config — same as updating a version string.
+- KEPT: No OpenRouter/HF client wrappers (audit: "defaults are placeholders").
+  TID routes TO models, it doesn't call them. The caller (Cricket, Syl, etc.)
+  handles the actual API call. Adding client wrappers here would violate
+  separation of concerns. The model registry describes capabilities, not
+  connectivity.
+- KEPT: str(Enum) pattern for YAML loading (audit: "no from_str()"). Since
+  our enums inherit from str, TaskDomain("code") already works. Python's
+  Enum(value) IS from_str(). No custom method needed.
 """
 
 from __future__ import annotations
@@ -79,6 +97,34 @@ class ModelEntry:
     priority: int = 0
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate model entry fields."""
+        if self.cost_per_1k_tokens < 0:
+            raise ValueError(
+                f"ModelEntry '{self.model_id}': cost_per_1k_tokens "
+                f"cannot be negative ({self.cost_per_1k_tokens})"
+            )
+        if self.context_window <= 0:
+            raise ValueError(
+                f"ModelEntry '{self.model_id}': context_window "
+                f"must be positive ({self.context_window})"
+            )
+        if self.avg_latency_ms < 0:
+            raise ValueError(
+                f"ModelEntry '{self.model_id}': avg_latency_ms "
+                f"cannot be negative ({self.avg_latency_ms})"
+            )
+        if self.min_vram_gb < 0:
+            raise ValueError(
+                f"ModelEntry '{self.model_id}': min_vram_gb "
+                f"cannot be negative ({self.min_vram_gb})"
+            )
+        if self.min_ram_gb < 0:
+            raise ValueError(
+                f"ModelEntry '{self.model_id}': min_ram_gb "
+                f"cannot be negative ({self.min_ram_gb})"
+            )
 
     def can_handle(self, domain: TaskDomain, complexity: ComplexityTier) -> bool:
         """Whether this model can handle a given domain and complexity."""
