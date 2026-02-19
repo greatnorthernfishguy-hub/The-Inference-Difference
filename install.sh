@@ -356,6 +356,73 @@ DESKTOPEOF
 }
 
 # ---------------------------------------------------------------------------
+# E-T module registry (~/.et_modules/registry.json)
+# ---------------------------------------------------------------------------
+
+register_module() {
+    header "Registering in E-T module registry"
+
+    REAL_USER="${SUDO_USER:-$USER}"
+    REAL_HOME=$(eval echo "~$REAL_USER")
+    REGISTRY_DIR="$REAL_HOME/.et_modules"
+    REGISTRY_FILE="$REGISTRY_DIR/registry.json"
+
+    # Create registry dir if needed (owned by the real user, not root)
+    if [ ! -d "$REGISTRY_DIR" ]; then
+        mkdir -p "$REGISTRY_DIR"
+        chown "$REAL_USER:$REAL_USER" "$REGISTRY_DIR"
+    fi
+
+    # Add/update TID entry in the registry
+    $PYTHON -c "
+import json, os
+
+registry_file = '$REGISTRY_FILE'
+
+# Load existing registry or start fresh
+if os.path.exists(registry_file):
+    with open(registry_file) as f:
+        registry = json.load(f)
+else:
+    registry = {}
+
+registry.setdefault('modules', {})
+registry['modules']['inference_difference'] = {
+    'install_path': '$INSTALL_DIR',
+    'version': '0.1.0',
+    'service': '$SERVICE_NAME',
+    'port': $PORT,
+}
+
+with open(registry_file, 'w') as f:
+    json.dump(registry, f, indent=2)
+"
+
+    chown "$REAL_USER:$REAL_USER" "$REGISTRY_FILE"
+    info "Registered as 'inference_difference' in $REGISTRY_FILE"
+}
+
+unregister_module() {
+    REAL_USER="${SUDO_USER:-$USER}"
+    REAL_HOME=$(eval echo "~$REAL_USER")
+    REGISTRY_FILE="$REAL_HOME/.et_modules/registry.json"
+
+    if [ -f "$REGISTRY_FILE" ]; then
+        $PYTHON -c "
+import json
+
+with open('$REGISTRY_FILE') as f:
+    registry = json.load(f)
+
+registry.get('modules', {}).pop('inference_difference', None)
+
+with open('$REGISTRY_FILE', 'w') as f:
+    json.dump(registry, f, indent=2)
+" 2>/dev/null && info "Removed from E-T module registry" || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
 
@@ -483,6 +550,10 @@ uninstall() {
         return
     fi
 
+    # Remove from E-T module registry
+    PYTHON="${PYTHON:-python3}"
+    unregister_module
+
     # Stop and disable service
     if [ -f "$SERVICE_FILE" ]; then
         $SUDO systemctl stop "$SERVICE_NAME" 2>/dev/null || true
@@ -530,6 +601,7 @@ case "${1:-}" in
         preflight
         install_deps
         generate_config
+        register_module
         verify
         echo ""
         info "Installed without service. Start manually with:"
@@ -543,6 +615,7 @@ case "${1:-}" in
         if [ "$SKIP_SERVICE" != true ]; then
             install_service
         fi
+        register_module
         verify
         echo "The Inference Difference installed: http://$HOST:$PORT"
         ;;
@@ -599,6 +672,8 @@ case "${1:-}" in
             info "Start manually with:"
             echo "  cd $INSTALL_DIR && $VENV_DIR/bin/uvicorn inference_difference.app:app --host $HOST --port $PORT"
         fi
+        echo ""
+        register_module
         echo ""
         verify
         echo ""
