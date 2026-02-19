@@ -7,3 +7,9 @@ dist/
 build/
 .eggs/
 *.db
+
+# In-place install artifacts (created by install.sh)
+venv/
+data/
+logs/
+config.json

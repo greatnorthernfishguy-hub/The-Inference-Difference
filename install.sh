@@ -14,7 +14,7 @@
 #   ./install.sh --quiet        # Full install with minimal output
 #
 # Environment:
-#   TID_INSTALL_DIR    — Override install location (default: /opt/inference-difference)
+#   TID_INSTALL_DIR    — Override install location (default: repo directory)
 #   TID_PORT           — Override API port (default: 7437)
 #   TID_HOST           — Override bind host (default: 127.0.0.1)
 #
@@ -27,8 +27,11 @@
 #
 # Changelog (Grok audit response, 2026-02-19):
 # - ADDED: --quiet flag for minimal output (audit: "echo spam").
-# - ADDED: User-dir fallback when /opt is not writable (audit: "assumes sudo").
-#   If not root and no sudo, installs to ~/.local/share/inference-difference.
+# - CHANGED: Default install dir is now SCRIPT_DIR (the repo itself), not /opt/.
+#   Josh's setup has ALL modules living in /home/josh/. Copying to a second
+#   location (/opt/ or ~/.local/share/) causes confusion and drift. The venv,
+#   data/, and logs/ directories are created inside the repo checkout. Override
+#   with TID_INSTALL_DIR if you want a separate install location.
 # - KEPT: Linux/systemd focus (audit: "assumes Linux"). This project targets
 #   Ubuntu VPS deployment (Josh's Sylphrena infra). macOS/Windows support
 #   would need launchctl/Windows Service wrappers respectively — tracked as
@@ -46,7 +49,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="${TID_INSTALL_DIR:-/opt/inference-difference}"
+INSTALL_DIR="${TID_INSTALL_DIR:-$SCRIPT_DIR}"
 VENV_DIR="$INSTALL_DIR/venv"
 DATA_DIR="$INSTALL_DIR/data"
 LOG_DIR="$INSTALL_DIR/logs"
@@ -99,19 +102,10 @@ preflight() {
             warn "Not running as root. Will use sudo for system operations."
             SUDO="sudo"
         else
-            # User-dir fallback: install to ~/.local/share without root
-            USER_INSTALL_DIR="$HOME/.local/share/inference-difference"
-            if [ "$INSTALL_DIR" = "/opt/inference-difference" ]; then
-                warn "No root access. Installing to $USER_INSTALL_DIR instead."
-                INSTALL_DIR="$USER_INSTALL_DIR"
-                VENV_DIR="$INSTALL_DIR/venv"
-                DATA_DIR="$INSTALL_DIR/data"
-                LOG_DIR="$INSTALL_DIR/logs"
-                CONFIG_FILE="$INSTALL_DIR/config.json"
-            fi
             SUDO=""
             SKIP_SERVICE=true
-            warn "Systemd service will be skipped (no root access)."
+            warn "No root/sudo access. Systemd service will be skipped."
+            warn "Install dir: $INSTALL_DIR (run manually or use --no-service)."
         fi
     else
         SUDO=""
@@ -193,15 +187,28 @@ install_deps() {
     $SUDO mkdir -p "$DATA_DIR"
     $SUDO mkdir -p "$LOG_DIR"
 
-    # Set ownership to the real user (not root)
+    # Set ownership to the real user (not root) — only for separate install dirs.
+    # In-place installs already have the right ownership; chown -R on the repo
+    # would also hit .git/ which we don't want to touch.
     REAL_USER="${SUDO_USER:-$USER}"
     REAL_HOME=$(eval echo "~$REAL_USER")
-    $SUDO chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
+    if [ "$INSTALL_DIR" != "$SCRIPT_DIR" ]; then
+        $SUDO chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
+    else
+        # Only chown the dirs we created
+        for d in "$DATA_DIR" "$LOG_DIR"; do
+            [ -d "$d" ] && $SUDO chown -R "$REAL_USER:$REAL_USER" "$d"
+        done
+    fi
 
-    # Copy source files
-    info "Copying source files..."
-    cp "$SCRIPT_DIR/ng_lite.py" "$INSTALL_DIR/"
-    cp -r "$SCRIPT_DIR/inference_difference" "$INSTALL_DIR/"
+    # Copy source files (skip if installing in-place)
+    if [ "$INSTALL_DIR" != "$SCRIPT_DIR" ]; then
+        info "Copying source files to $INSTALL_DIR..."
+        cp "$SCRIPT_DIR/ng_lite.py" "$INSTALL_DIR/"
+        cp -r "$SCRIPT_DIR/inference_difference" "$INSTALL_DIR/"
+    else
+        info "Installing in-place (source files already here)"
+    fi
 
     # Create virtual environment
     info "Creating Python virtual environment..."
@@ -564,7 +571,7 @@ case "${1:-}" in
         echo "  --help         Show this help"
         echo ""
         echo "Environment:"
-        echo "  TID_INSTALL_DIR   Install location (default: /opt/inference-difference)"
+        echo "  TID_INSTALL_DIR   Install location (default: repo directory)"
         echo "  TID_PORT          API port (default: 7437)"
         echo "  TID_HOST          Bind host (default: 127.0.0.1)"
         ;;
