@@ -33,6 +33,12 @@ Changelog (Grok audit response, 2026-02-19):
   model. This is the correct behavior: no data = no opinion.
 - ADDED: verbose_reasoning flag to control reasoning string detail
   (audit: "verbosity bloat"). When False, reasoning is one-line.
+- ADDED: Optional CatalogManager integration for dynamic profile-based
+  routing (§4.5). When a CatalogManager is provided, route_with_profile()
+  resolves a requirements profile against the live catalog before routing.
+- ADDED: Optional DreamCycle integration for model property correlation
+  analysis (§4.5.5). When provided, outcome reports are forwarded to
+  the DreamCycle for analysis.
 """
 
 from __future__ import annotations
@@ -142,12 +148,16 @@ class RoutingEngine:
         ng_lite: Optional[Any] = None,  # Optional NGLite instance
         scoring_weights: Optional[Dict[str, float]] = None,
         verbose_reasoning: bool = True,
+        catalog_manager: Optional[Any] = None,  # Optional CatalogManager
+        dream_cycle: Optional[Any] = None,       # Optional DreamCycle
     ):
         self.config = config
         self.hardware = hardware
         self._ng_lite = ng_lite
         self._weights = scoring_weights or dict(DEFAULT_SCORING_WEIGHTS)
         self._verbose_reasoning = verbose_reasoning
+        self._catalog_manager = catalog_manager
+        self._dream_cycle = dream_cycle
         self._request_counter = 0
 
         # Performance tracking
@@ -228,6 +238,75 @@ class RoutingEngine:
 
         return decision
 
+    def route_with_profile(
+        self,
+        profile_name: str,
+        classification: RequestClassification,
+        consciousness_score: Optional[float] = None,
+        request_id: Optional[str] = None,
+    ) -> RoutingDecision:
+        """Route using a dynamic requirements profile (§4.5).
+
+        Resolves the profile against the live catalog first. If a
+        CatalogManager is available and the profile resolves to a model,
+        that model is used. Otherwise falls back to standard routing.
+
+        Args:
+            profile_name: Name of the requirements profile to resolve.
+            classification: The request classification.
+            consciousness_score: Optional CTEM consciousness score.
+            request_id: Optional request identifier.
+
+        Returns:
+            RoutingDecision with selected model.
+        """
+        if self._catalog_manager is not None:
+            resolved_id = self._catalog_manager.resolve_profile(profile_name)
+            if resolved_id:
+                # Check if the resolved model is in our config registry
+                model = self.config.get_model(resolved_id)
+                if model and model.enabled:
+                    self._request_counter += 1
+                    rid = request_id or f"req_{self._request_counter}"
+                    return RoutingDecision(
+                        model_id=model.model_id,
+                        model_entry=model,
+                        score=1.0,
+                        score_breakdown={"profile_match": 1.0},
+                        reasoning=(
+                            f"Profile '{profile_name}' resolved to "
+                            f"{model.display_name} via dynamic catalog."
+                        ),
+                        request_id=rid,
+                        timestamp=time.time(),
+                        classification=classification,
+                    )
+                else:
+                    # Model from catalog but not in local config —
+                    # return the ID for the caller to handle
+                    self._request_counter += 1
+                    rid = request_id or f"req_{self._request_counter}"
+                    return RoutingDecision(
+                        model_id=resolved_id,
+                        score=0.9,
+                        score_breakdown={"catalog_resolved": 1.0},
+                        reasoning=(
+                            f"Profile '{profile_name}' resolved to "
+                            f"'{resolved_id}' via dynamic catalog "
+                            f"(not in local config registry)."
+                        ),
+                        request_id=rid,
+                        timestamp=time.time(),
+                        classification=classification,
+                    )
+
+        # Fallback: no catalog manager or profile not found — standard routing
+        return self.route(
+            classification=classification,
+            consciousness_score=consciousness_score,
+            request_id=request_id,
+        )
+
     def report_outcome(
         self,
         decision: RoutingDecision,
@@ -283,6 +362,51 @@ class RoutingEngine:
                 success=success,
                 metadata=metadata,
             )
+
+        # Forward to Dream Cycle for model property correlation analysis
+        if self._dream_cycle is not None:
+            try:
+                from inference_difference.dream_cycle import RoutingOutcome
+                catalog_model = None
+                if self._catalog_manager is not None:
+                    catalog_model = self._catalog_manager.get_model_by_id(
+                        decision.model_id
+                    )
+
+                dream_outcome = RoutingOutcome(
+                    request_id=decision.request_id,
+                    model_id=decision.model_id,
+                    semantic_route=outcome.get("domain", ""),
+                    success=success,
+                    quality_score=quality_score,
+                    latency_ms=latency_ms,
+                    model_context_window=(
+                        catalog_model.context_window if catalog_model else 0
+                    ),
+                    model_cost_per_1m_input=(
+                        catalog_model.cost_per_1m_input if catalog_model else 0.0
+                    ),
+                    model_cost_per_1m_output=(
+                        catalog_model.cost_per_1m_output if catalog_model else 0.0
+                    ),
+                    model_provider_tier=(
+                        catalog_model.provider_tier if catalog_model else ""
+                    ),
+                    model_capabilities=(
+                        catalog_model.capabilities if catalog_model else []
+                    ),
+                    model_provider=(
+                        catalog_model.provider if catalog_model else ""
+                    ),
+                    estimated_tokens=(
+                        decision.classification.estimated_tokens
+                        if decision.classification else 0
+                    ),
+                    request_complexity=outcome.get("complexity", ""),
+                )
+                self._dream_cycle.record_outcome(dream_outcome)
+            except Exception as e:
+                logger.debug("Dream Cycle outcome recording failed: %s", e)
 
     def get_stats(self) -> Dict[str, Any]:
         """Router statistics for monitoring."""

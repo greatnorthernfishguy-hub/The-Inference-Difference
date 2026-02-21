@@ -1,0 +1,61 @@
+# Task Requirements Profiles for Dynamic Model Catalog Selection (§4.5.2)
+#
+# Instead of routing to a named model, TID routes to a requirements profile
+# — a description of what a task needs — and resolves that profile against
+# a live catalog at request time.
+#
+# Profiles define constraints (cost ceilings, context window minimums,
+# required capabilities) and sorting preferences. The CatalogManager
+# resolves each profile against the cached model catalog and returns
+# the best available model that fits.
+#
+# Cost values are in USD per 1M tokens (matching OpenRouter's pricing format).
+
+version: 1
+
+profiles:
+
+  local:
+    prefer_local: true
+    fallback_to_cloud: false
+    # No catalog query needed — always Ollama
+
+  simple_chat:
+    max_cost_per_1m_input_tokens: 0.50
+    max_cost_per_1m_output_tokens: 1.50
+    min_context_window: 4096
+    required_capabilities: []
+    sort_by: cost_asc
+    max_candidates: 3          # Pick from top 3 cheapest that qualify
+
+  coding:
+    max_cost_per_1m_input_tokens: 3.00
+    max_cost_per_1m_output_tokens: 9.00
+    min_context_window: 32000
+    required_capabilities: ["code"]
+    sort_by: cost_asc
+    max_candidates: 3
+
+  analysis:
+    max_cost_per_1m_input_tokens: 5.00
+    max_cost_per_1m_output_tokens: 15.00
+    min_context_window: 16000
+    sort_by: cost_asc
+    max_candidates: 3
+
+  premium:
+    provider_tiers: ["frontier"]   # OpenRouter metadata classification
+    sort_by: quality_desc
+    max_candidates: 2
+
+  long_context:
+    min_context_window: 100000
+    sort_by: cost_asc
+    max_candidates: 3
+
+  # Special: high-confidence routing for NeuroGraph surprise > 0.7
+  surprise_escalation:
+    provider_tiers: ["frontier", "performance"]
+    min_context_window: 32000
+    sort_by: quality_desc
+    max_candidates: 2
