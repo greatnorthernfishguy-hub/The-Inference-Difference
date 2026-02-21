@@ -1,0 +1,40 @@
+# Tier Models Configuration (§4.5.7 — Backward Compatible)
+#
+# Both formats work simultaneously:
+#   Old format: Explicit model list with name + priority (passthrough)
+#   New format: Profile reference (resolved dynamically via catalog)
+#
+# Old-format entries are used as-is. New-format entries resolve via
+# the CatalogManager against the live model catalog.
+
+tiers:
+
+  # Old format — explicit model, still works
+  local:
+    models:
+      - name: "ollama/qwen2.5:7b"
+        priority: 1
+
+  # New format — resolves dynamically against live catalog
+  coding:
+    profile: "coding"
+
+  # New format
+  premium:
+    profile: "premium"
+
+  # New format
+  analysis:
+    profile: "analysis"
+
+  # New format
+  simple_chat:
+    profile: "simple_chat"
+
+  # New format — for long context needs
+  long_context:
+    profile: "long_context"
+
+  # New format — NeuroGraph surprise escalation
+  surprise_escalation:
+    profile: "surprise_escalation"

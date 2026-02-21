@@ -1,0 +1,28 @@
+# Catalog Filters for Dynamic Model Catalog Selection (§4.5.4)
+#
+# Operator-level overrides for the model catalog. Even with the full
+# catalog open, operators need controls for provider reliability,
+# privacy concerns, terms of service, or cost controls.
+
+version: 1
+
+# Models or providers NEVER to use, regardless of profile match
+blocklist:
+  providers: []          # e.g. ["some-provider"] blocks all their models
+  models: []             # e.g. ["openrouter/x/sketchy-model"]
+
+# If non-empty, ONLY these providers are eligible (overrides blocklist)
+# Leave empty to allow all providers
+allowlist:
+  providers:
+    - "openrouter"
+    - "huggingface"
+  # models: []           # Leave empty to allow all models from allowed providers
+
+# Hard cost ceiling — no request ever routes to a model above this price
+# regardless of profile configuration. Safety valve against bugs in
+# profile resolution accidentally routing a simple "what time is it?"
+# to a $60/1M token model.
+hard_ceiling:
+  max_cost_per_1m_input_tokens: 20.00
+  max_cost_per_1m_output_tokens: 60.00

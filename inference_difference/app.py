@@ -41,6 +41,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from inference_difference.catalog_manager import CatalogManager
 from inference_difference.classifier import classify_request
 from inference_difference.config import (
     InferenceDifferenceConfig,
@@ -48,6 +49,7 @@ from inference_difference.config import (
     default_api_models,
     default_local_models,
 )
+from inference_difference.dream_cycle import DreamCycle
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
@@ -136,6 +138,8 @@ class AppState:
     hardware: HardwareProfile
     engine: RoutingEngine
     ng_lite: Optional[Any] = None
+    catalog_manager: Optional[CatalogManager] = None
+    dream_cycle: Optional[DreamCycle] = None
     start_time: float = 0.0
 
     # Track recent routing decisions for outcome matching
@@ -185,11 +189,45 @@ async def lifespan(app: FastAPI):
         logger.warning("NG-Lite initialization failed: %s", e)
         _state.ng_lite = None
 
+    # Initialize CatalogManager for dynamic model selection (§4.5)
+    try:
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+        db_path = os.path.join(base_dir, "gateway.db")
+        _state.catalog_manager = CatalogManager(
+            db_path=db_path,
+            fallback_model=_state.config.default_model,
+        )
+        _state.catalog_manager.initialize()
+
+        # Load profiles and filters
+        profiles_path = os.path.join(base_dir, "task_requirements.yaml")
+        filters_path = os.path.join(base_dir, "catalog_filters.yaml")
+        tiers_path = os.path.join(base_dir, "tier_models.yaml")
+
+        _state.catalog_manager.load_profiles(profiles_path)
+        _state.catalog_manager.load_filters(filters_path)
+        _state.catalog_manager.load_tiers(tiers_path)
+
+        # Refresh catalog (graceful degradation — uses cache on failure)
+        _state.catalog_manager.refresh()
+        logger.info(
+            "CatalogManager ready: %d models in catalog",
+            len(_state.catalog_manager.models),
+        )
+    except Exception as e:
+        logger.warning("CatalogManager initialization failed: %s", e)
+        _state.catalog_manager = None
+
+    # Initialize DreamCycle for model property correlation analysis (§4.5.5)
+    _state.dream_cycle = DreamCycle()
+
     # Create routing engine
     _state.engine = RoutingEngine(
         config=_state.config,
         hardware=_state.hardware,
         ng_lite=_state.ng_lite,
+        catalog_manager=_state.catalog_manager,
+        dream_cycle=_state.dream_cycle,
     )
     _state.recent_decisions = {}
 
@@ -200,6 +238,14 @@ async def lifespan(app: FastAPI):
     )
 
     yield
+
+    # Close CatalogManager database connection
+    if _state.catalog_manager is not None:
+        try:
+            _state.catalog_manager.close()
+            logger.info("CatalogManager closed on shutdown")
+        except Exception as e:
+            logger.warning("CatalogManager close failed: %s", e)
 
     # Persist NG-Lite state on shutdown
     if _state.ng_lite is not None:
@@ -400,7 +446,25 @@ async def get_stats() -> Dict[str, Any]:
     stats = _state.engine.get_stats()
     if _state.ng_lite is not None:
         stats["ng_lite"] = _state.ng_lite.get_stats()
+    if _state.catalog_manager is not None:
+        stats["catalog"] = _state.catalog_manager.get_catalog_stats()
+    if _state.dream_cycle is not None:
+        stats["dream_cycle"] = _state.dream_cycle.get_stats()
     return stats
+
+
+@app.get("/catalog")
+async def catalog_info() -> Dict[str, Any]:
+    """Dynamic model catalog information (§4.5)."""
+    if _state.catalog_manager is None:
+        return {"status": "not_initialized", "models": []}
+
+    return {
+        "status": "active",
+        "stats": _state.catalog_manager.get_catalog_stats(),
+        "profiles": list(_state.catalog_manager.profiles.keys()),
+        "tiers": list(_state.catalog_manager.tiers.keys()),
+    }
 
 
 @app.get("/models")

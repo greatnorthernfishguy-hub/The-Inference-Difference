@@ -17,7 +17,9 @@ Changelog (Grok audit response, 2026-02-19):
   already exhaustive as the audit itself acknowledged.
 """
 
+from inference_difference.catalog_manager import CatalogManager, CatalogModel
 from inference_difference.config import InferenceDifferenceConfig, ModelEntry
+from inference_difference.dream_cycle import DreamCycle
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.classifier import RequestClassification, classify_request
 from inference_difference.router import RoutingEngine, RoutingDecision
@@ -26,6 +28,9 @@ from inference_difference.quality import QualityEvaluation, evaluate_quality
 __version__ = "0.1.0"
 
 __all__ = [
+    "CatalogManager",
+    "CatalogModel",
+    "DreamCycle",
     "InferenceDifferenceConfig",
     "ModelEntry",
     "HardwareProfile",
