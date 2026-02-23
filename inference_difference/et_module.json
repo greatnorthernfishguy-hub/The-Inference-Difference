@@ -1,0 +1,19 @@
+{
+    "name": "inference_difference",
+    "version": "0.1.0",
+    "description": "Intelligent inference routing gateway for E-T Systems. Routes requests to optimal models based on hardware, complexity, learned performance, and consciousness-aware priorities.",
+    "author": "Josh + Claude",
+    "hooks": ["pre_route", "post_route", "post_response"],
+    "ng_config": {
+        "max_nodes": 1000,
+        "max_synapses": 5000,
+        "learning_rate": 0.1,
+        "success_boost": 0.15,
+        "failure_penalty": 0.20,
+        "novelty_threshold": 0.7
+    },
+    "capabilities": ["routing", "model_selection", "quality_evaluation", "catalog_management"],
+    "dependencies": [],
+    "priority": 50,
+    "enabled": true
+}
