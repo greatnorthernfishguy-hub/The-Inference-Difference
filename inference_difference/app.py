@@ -1,9 +1,22 @@
 """
 FastAPI application for The Inference Difference.
 
-Exposes the routing engine as an HTTP API. Other modules (Cricket,
-ClawGuard, Observatory, etc.) call this to route their inference
-requests to optimal models.
+TID operates as an ET Module host — a proxy/router that runs pluggable
+ET modules through a standardized hook lifecycle on every request. The
+modules (TrollGuard, OpenClaw, CTEM, etc.) plug into four lifecycle
+phases: pre_route, post_route, pre_response, post_response.
+
+The routing pipeline:
+    1. Receive request
+    2. Run pre_route hooks (TrollGuard scans, OpenClaw checks compliance)
+    3. Classify request
+    4. Route to best model
+    5. Run post_route hooks (logging, auditing)
+    6. [Caller executes the model — TID is a router, not a caller]
+    7. Receive outcome via /outcome
+    8. Run pre_response hooks (content filters)
+    9. Evaluate quality
+    10. Run post_response hooks (learning, telemetry)
 
 Endpoints:
     POST /route          — Route a request to the best model
@@ -11,21 +24,26 @@ Endpoints:
     GET  /health         — Health check with hardware/model status
     GET  /stats          — Router statistics and performance data
     GET  /models         — List available models
+    GET  /modules        — List registered ET modules
     POST /classify       — Classify a request (debug/introspection)
 
 Changelog (Grok audit response, 2026-02-19):
 - ADDED: Optional API key auth via TID_API_KEY env var (audit: "no auth").
-  When set, all requests must include X-API-Key header. When unset (default),
-  no auth — appropriate for localhost-only binding.
 - ADDED: score_breakdown field to RouteResponse (audit: "no full reasoning
   trace"). Exposes per-factor scores for transparency.
 - ADDED: Production exception handler (audit: "error leaks"). In production
   (TID_ENV=production), stack traces are suppressed in HTTP responses.
 - KEPT: Synchronous classify_request in async endpoint (audit: "blocking").
-  classify_request is a pure-CPU heuristic that runs in <1ms. Wrapping it
-  in run_in_executor would add more overhead than the function itself takes.
-  The router scoring is similarly fast. If we add ML-based classification
-  later, we'll make it async then.
+  classify_request is a pure-CPU heuristic that runs in <1ms.
+
+Changelog (ET Module Integration, 2026-02-23):
+- ADDED: ET Module system — ModuleRegistry, hook lifecycle dispatch.
+- ADDED: NG Ecosystem coordinator for cross-module learning.
+- ADDED: TrollGuard module auto-registration on startup.
+- ADDED: OpenClaw adapter auto-registration on startup.
+- ADDED: /modules endpoint for module introspection.
+- REFACTORED: /route now runs pre_route and post_route hooks.
+- REFACTORED: /outcome now runs pre_response and post_response hooks.
 """
 
 from __future__ import annotations
@@ -50,6 +68,11 @@ from inference_difference.config import (
     default_local_models,
 )
 from inference_difference.dream_cycle import DreamCycle
+from inference_difference.et_module import (
+    HookContext,
+    HookPhase,
+    ModuleRegistry,
+)
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
@@ -140,6 +163,8 @@ class AppState:
     ng_lite: Optional[Any] = None
     catalog_manager: Optional[CatalogManager] = None
     dream_cycle: Optional[DreamCycle] = None
+    module_registry: Optional[ModuleRegistry] = None
+    ng_ecosystem: Optional[Any] = None
     start_time: float = 0.0
 
     # Track recent routing decisions for outcome matching
@@ -231,13 +256,94 @@ async def lifespan(app: FastAPI):
     )
     _state.recent_decisions = {}
 
+    # Initialize NG Ecosystem coordinator for cross-module learning
+    try:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from ng_ecosystem import NGEcosystem
+
+        _state.ng_ecosystem = NGEcosystem()
+
+        # Register TID itself as a module in the ecosystem
+        if _state.ng_lite is not None:
+            _state.ng_ecosystem._modules["inference_difference"] = (
+                __import__("ng_ecosystem").ModuleNGState(
+                    module_id="inference_difference",
+                    ng_lite=_state.ng_lite,
+                    tier=1,
+                )
+            )
+
+        logger.info("NG Ecosystem coordinator initialized")
+    except Exception as e:
+        logger.warning("NG Ecosystem initialization failed: %s", e)
+        _state.ng_ecosystem = None
+
+    # Initialize ET Module Registry and register built-in modules
+    _state.module_registry = ModuleRegistry()
+
+    # Register TrollGuard
+    try:
+        from inference_difference.trollguard import create_trollguard
+        trollguard = create_trollguard()
+        _state.module_registry.register(trollguard)
+        logger.info("TrollGuard module registered")
+    except Exception as e:
+        logger.warning("TrollGuard registration failed: %s", e)
+
+    # Register OpenClaw adapter (standalone mode)
+    try:
+        from inference_difference.et_module import ETModuleManifest
+        from inference_difference.openclaw_adapter import OpenClawAdapter
+        openclaw_manifest = ETModuleManifest(
+            name="openclaw",
+            version="1.0.0",
+            description="Compliance and governance adapter",
+            hooks=["pre_route", "post_route"],
+            capabilities=["compliance", "governance"],
+            priority=10,
+        )
+        openclaw = OpenClawAdapter(openclaw_manifest)
+        _state.module_registry.register(openclaw)
+        logger.info("OpenClaw adapter registered (standalone mode)")
+    except Exception as e:
+        logger.warning("OpenClaw adapter registration failed: %s", e)
+
+    # Connect NG Ecosystem peers if multiple modules registered
+    if _state.ng_ecosystem is not None:
+        try:
+            connections = _state.ng_ecosystem.connect_peers()
+            if connections > 0:
+                logger.info(
+                    "NG Ecosystem: %d peer connections established",
+                    connections,
+                )
+        except Exception as e:
+            logger.warning("NG Ecosystem peer connection failed: %s", e)
+
     logger.info(
-        "The Inference Difference started: %d models, GPU=%s",
+        "The Inference Difference started: %d models, GPU=%s, "
+        "%d ET modules registered",
         len(_state.config.get_enabled_models()),
         _state.hardware.has_gpu,
+        len(_state.module_registry.get_all_modules()),
     )
 
     yield
+
+    # Shutdown ET modules
+    if _state.module_registry is not None:
+        for module in _state.module_registry.get_all_modules():
+            _state.module_registry.unregister(module.name)
+
+    # Save NG Ecosystem state
+    if _state.ng_ecosystem is not None:
+        try:
+            base_dir = os.path.dirname(os.path.dirname(__file__))
+            _state.ng_ecosystem.save_all(base_dir)
+            logger.info("NG Ecosystem state saved on shutdown")
+        except Exception as e:
+            logger.warning("NG Ecosystem save failed: %s", e)
 
     # Close CatalogManager database connection
     if _state.catalog_manager is not None:
@@ -334,22 +440,64 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def route_request(req: RouteRequest) -> RouteResponse:
     """Route an inference request to the best available model.
 
-    Classifies the request, scores all candidate models, and returns
-    the best match with a fallback chain and full reasoning trace.
+    Runs the full ET module hook lifecycle:
+        1. pre_route hooks (TrollGuard, OpenClaw)
+        2. Classification
+        3. Routing decision
+        4. post_route hooks (logging, auditing)
     """
+    # Build hook context
+    ctx = HookContext(
+        request_id=req.request_id or "",
+        message=req.message,
+        conversation_history=req.conversation_history,
+        metadata=req.metadata or {},
+        consciousness_score=req.consciousness_score,
+    )
+
+    # --- Phase 1: pre_route hooks ---
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.PRE_ROUTE, ctx)
+
+    # Check if hooks cancelled the request
+    if ctx.cancelled:
+        return RouteResponse(
+            model_id="",
+            score=0.0,
+            score_breakdown={},
+            reasoning=f"Request cancelled: {ctx.cancel_reason}",
+            fallback_chain=[],
+            request_id=ctx.request_id,
+            classification={},
+            consciousness_boost=False,
+        )
+
+    # Use consciousness score from hooks if set (e.g., CTEM module)
+    consciousness_score = (
+        ctx.consciousness_score
+        if ctx.consciousness_score is not None
+        else req.consciousness_score
+    )
+
     # Classify
     classification = classify_request(
         message=req.message,
         conversation_history=req.conversation_history,
         metadata=req.metadata,
     )
+    ctx.classification = classification
 
     # Route
     decision = _state.engine.route(
         classification=classification,
-        consciousness_score=req.consciousness_score,
+        consciousness_score=consciousness_score,
         request_id=req.request_id,
     )
+    ctx.routing_decision = decision
+
+    # --- Phase 2: post_route hooks ---
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.POST_ROUTE, ctx)
 
     # Store for outcome matching
     _state.recent_decisions[decision.request_id] = decision
@@ -387,12 +535,26 @@ async def route_request(req: RouteRequest) -> RouteResponse:
 async def report_outcome(req: OutcomeRequest) -> OutcomeResponse:
     """Report the outcome of a routing decision for learning.
 
-    Evaluates response quality and feeds the result back into
-    NG-Lite to improve future routing decisions.
+    Runs the second half of the ET module hook lifecycle:
+        1. pre_response hooks (content filters)
+        2. Quality evaluation
+        3. post_response hooks (learning, telemetry)
     """
     # Get the original decision (if tracked)
     decision = _state.recent_decisions.get(req.request_id)
     classification = decision.classification if decision else None
+
+    # Build hook context for response-phase hooks
+    ctx = HookContext(
+        request_id=req.request_id,
+        response_text=req.response_text,
+        classification=classification,
+        routing_decision=decision,
+    )
+
+    # --- Phase 3: pre_response hooks (content filters) ---
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.PRE_RESPONSE, ctx)
 
     # Evaluate quality
     quality = evaluate_quality(
@@ -402,6 +564,7 @@ async def report_outcome(req: OutcomeRequest) -> OutcomeResponse:
         latency_budget_ms=_state.config.latency_budget_ms,
         quality_threshold=_state.config.quality_threshold,
     )
+    ctx.quality_evaluation = quality
 
     # Determine success
     success = req.success if req.success is not None else quality.is_success
@@ -417,6 +580,10 @@ async def report_outcome(req: OutcomeRequest) -> OutcomeResponse:
             metadata=req.metadata,
         )
         learned = True
+
+    # --- Phase 4: post_response hooks (learning, telemetry) ---
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.POST_RESPONSE, ctx)
 
     return OutcomeResponse(
         request_id=req.request_id,
@@ -450,6 +617,10 @@ async def get_stats() -> Dict[str, Any]:
         stats["catalog"] = _state.catalog_manager.get_catalog_stats()
     if _state.dream_cycle is not None:
         stats["dream_cycle"] = _state.dream_cycle.get_stats()
+    if _state.module_registry is not None:
+        stats["modules"] = _state.module_registry.get_stats()
+    if _state.ng_ecosystem is not None:
+        stats["ng_ecosystem"] = _state.ng_ecosystem.get_stats()
     return stats
 
 
@@ -484,6 +655,18 @@ async def list_models() -> List[Dict[str, Any]]:
             "priority": model.priority,
         })
     return models
+
+
+@app.get("/modules")
+async def list_modules() -> List[Dict[str, Any]]:
+    """List registered ET modules with their status and capabilities."""
+    if _state.module_registry is None:
+        return []
+
+    modules = []
+    for module in _state.module_registry.get_all_modules():
+        modules.append(module.get_stats())
+    return modules
 
 
 @app.post("/classify")
