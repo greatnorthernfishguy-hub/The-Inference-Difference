@@ -538,3 +538,195 @@ class TestDebugEndpointsStillWork:
     def test_modules_endpoint(self, client):
         resp = client.get("/modules")
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Tests: OpenRouter catalog prefix handling
+# ---------------------------------------------------------------------------
+
+class TestOpenRouterCatalogPrefix:
+    """Catalog models use 'openrouter/' prefix — model_client must strip it."""
+
+    def test_openrouter_prefix_stripped(self):
+        """openrouter/deepseek/deepseek-chat → sends 'deepseek/deepseek-chat'."""
+        from inference_difference.model_client import _resolve_provider
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-test"}):
+            base_url, api_key, model = _resolve_provider(
+                "openrouter/deepseek/deepseek-chat"
+            )
+        assert "openrouter" in base_url
+        assert model == "deepseek/deepseek-chat"
+        assert api_key == "sk-or-test"
+
+    def test_openrouter_prefix_meta_llama(self):
+        """openrouter/meta-llama/llama-3.1-70b → sends 'meta-llama/llama-3.1-70b'."""
+        from inference_difference.model_client import _resolve_provider
+        base_url, _, model = _resolve_provider(
+            "openrouter/meta-llama/llama-3.1-70b-instruct"
+        )
+        assert "openrouter" in base_url
+        assert model == "meta-llama/llama-3.1-70b-instruct"
+
+    def test_bare_prefix_still_works(self):
+        """deepseek/deepseek-chat (no openrouter/ prefix) still routes to OR."""
+        from inference_difference.model_client import _resolve_provider
+        base_url, _, model = _resolve_provider("deepseek/deepseek-chat")
+        assert "openrouter" in base_url
+        assert model == "deepseek/deepseek-chat"
+
+    def test_litellm_overrides_openrouter_prefix(self):
+        """When LiteLLM is configured, even openrouter/ models go through it."""
+        from inference_difference.model_client import _resolve_provider
+        with patch.dict("os.environ", {"LITELLM_BASE_URL": "http://litellm:4000"}):
+            base_url, _, model = _resolve_provider(
+                "openrouter/deepseek/deepseek-chat"
+            )
+        assert base_url == "http://litellm:4000"
+        assert model == "openrouter/deepseek/deepseek-chat"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Catalog model registration in routing config
+# ---------------------------------------------------------------------------
+
+class TestCatalogModelRegistration:
+    """Catalog models get converted to ModelEntry for routing."""
+
+    def test_catalog_models_registered_at_startup(self, client):
+        """After startup, config should include catalog models (if any)."""
+        from inference_difference.app import _state
+        # The static config has 7 models (4 local + 3 API).
+        # If catalog fetched any, total should be higher.
+        # Even if catalog fetch failed (no network in CI), static models
+        # must still be there.
+        assert len(_state.config.models) >= 7
+
+    def test_register_catalog_models_converts_correctly(self):
+        """_register_catalog_models converts CatalogModel → ModelEntry."""
+        from inference_difference.app import (
+            _register_catalog_models,
+            _state,
+        )
+        from inference_difference.catalog_manager import CatalogModel
+
+        # Save original state
+        original_models = dict(_state.config.models)
+        original_cm = _state.catalog_manager
+
+        try:
+            # Create a fake catalog manager with one model
+            fake_cm = MagicMock()
+            fake_cm.models = [
+                CatalogModel(
+                    id="openrouter/test-provider/test-model",
+                    provider="openrouter",
+                    display_name="Test Model",
+                    context_window=32000,
+                    cost_per_1m_input=1.0,
+                    cost_per_1m_output=3.0,
+                    provider_tier="performance",
+                    capabilities=["code"],
+                    is_active=True,
+                ),
+            ]
+            _state.catalog_manager = fake_cm
+            _register_catalog_models()
+
+            # Verify it was registered
+            assert "openrouter/test-provider/test-model" in _state.config.models
+            entry = _state.config.models["openrouter/test-provider/test-model"]
+            assert entry.display_name == "Test Model"
+            assert entry.context_window == 32000
+            assert entry.cost_per_1k_tokens == pytest.approx(0.001)
+            from inference_difference.config import (
+                ComplexityTier,
+                ModelType,
+                TaskDomain,
+            )
+            assert entry.model_type == ModelType.API
+            assert entry.max_complexity == ComplexityTier.HIGH  # "performance"
+            assert TaskDomain.CODE in entry.domains
+            assert TaskDomain.GENERAL in entry.domains
+        finally:
+            # Restore original state
+            _state.config.models = original_models
+            _state.catalog_manager = original_cm
+
+    def test_static_models_not_overwritten(self):
+        """Static config entries are preserved, not replaced by catalog."""
+        from inference_difference.app import (
+            _register_catalog_models,
+            _state,
+        )
+        from inference_difference.catalog_manager import CatalogModel
+
+        original_models = dict(_state.config.models)
+        original_cm = _state.catalog_manager
+
+        try:
+            # Inject a catalog model with same ID as a static entry
+            static_id = list(original_models.keys())[0]
+            original_display = original_models[static_id].display_name
+
+            fake_cm = MagicMock()
+            fake_cm.models = [
+                CatalogModel(
+                    id=static_id,
+                    provider="openrouter",
+                    display_name="SHOULD NOT REPLACE",
+                    context_window=4096,
+                    cost_per_1m_input=0.0,
+                    cost_per_1m_output=0.0,
+                    provider_tier="standard",
+                    capabilities=[],
+                    is_active=True,
+                ),
+            ]
+            _state.catalog_manager = fake_cm
+            _register_catalog_models()
+
+            # Original entry preserved
+            assert _state.config.models[static_id].display_name == original_display
+        finally:
+            _state.config.models = original_models
+            _state.catalog_manager = original_cm
+
+    def test_v1_models_includes_auto(self, client):
+        """The /v1/models endpoint always includes the 'auto' virtual model."""
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200
+        body = resp.json()
+        model_ids = [m["id"] for m in body["data"]]
+        assert "auto" in model_ids
+
+    def test_v1_models_includes_static_models(self, client):
+        """Static models appear in /v1/models."""
+        resp = client.get("/v1/models")
+        body = resp.json()
+        model_ids = [m["id"] for m in body["data"]]
+        assert "ollama/llama3.1:8b" in model_ids
+
+    def test_v1_models_owned_by_for_openrouter_catalog(self, client):
+        """openrouter/deepseek/deepseek-chat → owned_by='deepseek'."""
+        from inference_difference.app import _state
+        from inference_difference.config import ModelEntry, ModelType, TaskDomain
+
+        # Inject a catalog-style model
+        _state.config.models["openrouter/deepseek/deepseek-chat"] = ModelEntry(
+            model_id="openrouter/deepseek/deepseek-chat",
+            display_name="DeepSeek Chat",
+            model_type=ModelType.API,
+            domains={TaskDomain.GENERAL},
+            context_window=65536,
+        )
+
+        try:
+            resp = client.get("/v1/models")
+            body = resp.json()
+            for m in body["data"]:
+                if m["id"] == "openrouter/deepseek/deepseek-chat":
+                    assert m["owned_by"] == "deepseek"
+                    return
+            pytest.fail("openrouter/deepseek/deepseek-chat not in model list")
+        finally:
+            del _state.config.models["openrouter/deepseek/deepseek-chat"]

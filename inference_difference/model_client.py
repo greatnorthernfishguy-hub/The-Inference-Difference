@@ -79,8 +79,16 @@ def _resolve_provider(model_id: str) -> tuple[str, str, str]:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         return "https://api.anthropic.com", api_key, model_name
 
-    # OpenRouter models: deepseek/, google/, meta-llama/, qwen/, etc.
-    # Or any unrecognized prefix — try OpenRouter
+    # Catalog models use "openrouter/" prefix — strip it for the API call.
+    # OpenRouter expects just "deepseek/deepseek-chat", not
+    # "openrouter/deepseek/deepseek-chat".
+    if model_id.startswith("openrouter/"):
+        model_name = model_id[len("openrouter/"):]
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        return "https://openrouter.ai/api", api_key, model_name
+
+    # Any other prefix (deepseek/, google/, meta-llama/, etc.) —
+    # try OpenRouter directly since they aggregate most providers
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     return "https://openrouter.ai/api", api_key, model_id
 

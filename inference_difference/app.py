@@ -77,8 +77,11 @@ from pydantic import BaseModel, Field
 from inference_difference.catalog_manager import CatalogManager
 from inference_difference.classifier import classify_request
 from inference_difference.config import (
+    ComplexityTier,
     InferenceDifferenceConfig,
     ModelEntry,
+    ModelType,
+    TaskDomain,
     default_api_models,
     default_local_models,
 )
@@ -219,6 +222,85 @@ _state = AppState()
 
 
 # ---------------------------------------------------------------------------
+# Catalog → Config bridge
+# ---------------------------------------------------------------------------
+
+# Maps OpenRouter provider_tier → ModelEntry.max_complexity
+_TIER_TO_COMPLEXITY = {
+    "frontier": ComplexityTier.EXTREME,
+    "performance": ComplexityTier.HIGH,
+    "standard": ComplexityTier.MEDIUM,
+    "budget": ComplexityTier.LOW,
+}
+
+# Maps OpenRouter provider_tier → ModelEntry.priority
+_TIER_TO_PRIORITY = {
+    "frontier": 40,
+    "performance": 30,
+    "standard": 20,
+    "budget": 10,
+}
+
+
+def _register_catalog_models() -> None:
+    """Register catalog models in the routing config.
+
+    Converts CatalogModel entries from the dynamic catalog into ModelEntry
+    objects so the router's standard 6-factor scoring can consider them
+    alongside the hardcoded defaults. This is what makes ALL OpenRouter
+    models available for routing — not just the 7 static entries.
+
+    Skips models already in the static config to avoid overwriting
+    hand-tuned entries with generic metadata.
+    """
+    if _state.catalog_manager is None:
+        return
+
+    registered = 0
+    for cm in _state.catalog_manager.models:
+        if cm.id in _state.config.models:
+            continue  # Don't overwrite hand-tuned static entries
+
+        # Map capabilities to task domains
+        domains = {TaskDomain.GENERAL}
+        for cap in cm.capabilities:
+            if cap == "code":
+                domains.add(TaskDomain.CODE)
+
+        # Clamp cost to zero — some providers report negative costs
+        # for promotional pricing, but ModelEntry requires >= 0.
+        cost_per_1k = max(cm.cost_per_1m_input / 1000.0, 0.0)
+
+        try:
+            entry = ModelEntry(
+                model_id=cm.id,
+                display_name=cm.display_name or cm.id,
+                model_type=ModelType.API,
+                domains=domains,
+                max_complexity=_TIER_TO_COMPLEXITY.get(
+                    cm.provider_tier, ComplexityTier.MEDIUM,
+                ),
+                context_window=max(cm.context_window, 4096),
+                cost_per_1k_tokens=cost_per_1k,
+                avg_latency_ms=2000.0,  # Sensible default for cloud APIs
+                priority=_TIER_TO_PRIORITY.get(cm.provider_tier, 20),
+                enabled=cm.is_active,
+            )
+        except (ValueError, TypeError) as e:
+            logger.debug("Skipping catalog model %s: %s", cm.id, e)
+            continue
+
+        _state.config.models[cm.id] = entry
+        registered += 1
+
+    if registered:
+        logger.info(
+            "Registered %d catalog models for routing (%d total available)",
+            registered, len(_state.config.models),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -286,6 +368,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("CatalogManager initialization failed: %s", e)
         _state.catalog_manager = None
+
+    # Register ALL catalog models (OpenRouter, HuggingFace) in the routing
+    # config so the router's standard scoring considers them as candidates.
+    # This is what makes every OpenRouter model available, not just the
+    # 7 hardcoded defaults.
+    _register_catalog_models()
 
     # Initialize DreamCycle for model property correlation analysis (§4.5.5)
     _state.dream_cycle = DreamCycle()
@@ -701,15 +789,26 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
 async def openai_models_list() -> JSONResponse:
     """OpenAI-compatible model listing.
 
-    Returns models in the format OpenAI clients expect.
+    Returns ALL available models — static defaults plus every model
+    from the dynamic catalog (OpenRouter, HuggingFace, etc.).
     """
     models = []
     for model in _state.config.get_enabled_models():
+        # Determine owner: "openrouter/deepseek/..." → "deepseek",
+        # "ollama/llama3.1:8b" → "ollama", etc.
+        parts = model.model_id.split("/")
+        if len(parts) >= 3 and parts[0] == "openrouter":
+            owned_by = parts[1]  # The actual provider behind OpenRouter
+        elif len(parts) >= 2:
+            owned_by = parts[0]
+        else:
+            owned_by = "local"
+
         models.append({
             "id": model.model_id,
             "object": "model",
             "created": int(_state.start_time),
-            "owned_by": model.model_id.split("/")[0] if "/" in model.model_id else "local",
+            "owned_by": owned_by,
         })
     # Also list "auto" as a virtual model
     models.append({
