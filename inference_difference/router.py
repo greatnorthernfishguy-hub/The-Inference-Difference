@@ -2,11 +2,16 @@
 Core routing engine for The Inference Difference.
 
 The router takes a classified request and decides which model handles it.
+This decision is authoritative — callers use the model TID selects.
+The router is not advisory; it is the enforcement point for model
+selection within TID's pipeline.
+
 Uses a multi-factor scoring system with NG-Lite learning to improve
 decisions over time.
 
 Routing factors (in priority order):
-    1. Hardware feasibility — can this model run here at all?
+    1. Hardware feasibility — hard filter. Models that can't run on
+       available hardware are excluded before scoring begins.
     2. Domain match — is this model good at this kind of task?
     3. Complexity fit — can this model handle this difficulty level?
     4. Learned performance — NG-Lite weight from past outcomes
@@ -14,7 +19,8 @@ Routing factors (in priority order):
     6. Latency fit — meet timing requirements
     7. Consciousness priority — CTEM-flagged agents get better models
 
-Fallback chain: if the primary model fails, try the next-best candidate.
+Fallback chain: if the primary model fails, the caller retries with
+the next model in the chain — but the chain itself is TID's decision.
 
 Changelog (Grok audit response, 2026-02-19):
 - KEPT: Default scoring weights as-is (audit: "weights equal, cost should
