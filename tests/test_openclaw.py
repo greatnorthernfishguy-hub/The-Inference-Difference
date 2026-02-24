@@ -282,8 +282,15 @@ class TestOpenClawStats:
         openclaw.pre_route(context)
         assert "openclaw" in context.annotations
         ann = context.annotations["openclaw"]
-        assert "checks_run" in ann
+        assert "local_checks_run" in ann
         assert "results" in ann
+        assert "gateway_connected" in ann
+
+    def test_stats_include_gateway_fields(self, openclaw):
+        stats = openclaw.get_stats()
+        assert "gateway_checks" in stats
+        assert "gateway_errors" in stats
+        assert stats["endpoint"] == "(standalone)"
 
 
 # ---------------------------------------------------------------------------
