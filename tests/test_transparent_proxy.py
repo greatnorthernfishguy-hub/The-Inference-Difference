@@ -730,3 +730,205 @@ class TestCatalogModelRegistration:
             pytest.fail("openrouter/deepseek/deepseek-chat not in model list")
         finally:
             del _state.config.models["openrouter/deepseek/deepseek-chat"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Streaming support (stream=true)
+# ---------------------------------------------------------------------------
+
+def _make_mock_stream_chunks(content: str = "Hello from streaming!"):
+    """Create mock SSE chunks that model_client.call_stream would yield."""
+    chunk_id = f"chatcmpl-mock-{int(time.time())}"
+
+    # Role chunk
+    role_data = json.dumps({
+        "id": chunk_id, "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": "mock-model",
+        "choices": [{"index": 0, "delta": {"role": "assistant"},
+                     "finish_reason": None}],
+    })
+    yield f"data: {role_data}\n\n"
+
+    # Content chunk
+    content_data = json.dumps({
+        "id": chunk_id, "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": "mock-model",
+        "choices": [{"index": 0, "delta": {"content": content},
+                     "finish_reason": None}],
+    })
+    yield f"data: {content_data}\n\n"
+
+    # Finish chunk
+    finish_data = json.dumps({
+        "id": chunk_id, "object": "chat.completion.chunk",
+        "created": int(time.time()), "model": "mock-model",
+        "choices": [{"index": 0, "delta": {},
+                     "finish_reason": "stop"}],
+    })
+    yield f"data: {finish_data}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+
+def _make_stream_mock_client(content: str = "Hello from streaming!"):
+    """Create a mock ModelClient that supports both call() and call_stream()."""
+    from inference_difference.model_client import StreamResult
+
+    client = _make_mock_client()
+
+    stream_result = StreamResult(
+        model="mock-model",
+        content=content,
+        finish_reason="stop",
+        latency_ms=100.0,
+        success=True,
+    )
+    client.call_stream = MagicMock(
+        return_value=(_make_mock_stream_chunks(content), stream_result),
+    )
+    return client
+
+
+class TestStreaming:
+    """Streaming (stream=true) — SSE chunks flow to the caller."""
+
+    def test_stream_returns_event_stream(self, client):
+        """stream=true returns text/event-stream content type."""
+        from inference_difference.app import _state
+        _state.model_client = _make_stream_mock_client()
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": True,
+        })
+
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers.get("content-type", "")
+
+    def test_stream_contains_sse_data_lines(self, client):
+        """Streamed response contains data: lines and ends with [DONE]."""
+        from inference_difference.app import _state
+        _state.model_client = _make_stream_mock_client()
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": True,
+        })
+
+        body = resp.text
+        assert "data: " in body
+        assert "data: [DONE]" in body
+
+    def test_stream_chunks_are_valid_json(self, client):
+        """Each data: line (except [DONE]) contains valid JSON."""
+        from inference_difference.app import _state
+        _state.model_client = _make_stream_mock_client()
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Tell me a joke"}],
+            "stream": True,
+        })
+
+        for line in resp.text.strip().split("\n"):
+            line = line.strip()
+            if not line or line == "data: [DONE]":
+                continue
+            if line.startswith("data: "):
+                chunk = json.loads(line[6:])
+                assert chunk["object"] == "chat.completion.chunk"
+                assert "choices" in chunk
+
+    def test_stream_includes_content(self, client):
+        """The streamed content is present in the chunks."""
+        from inference_difference.app import _state
+        _state.model_client = _make_stream_mock_client("Syl says hello!")
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Hi Syl"}],
+            "stream": True,
+        })
+
+        assert "Syl says hello!" in resp.text
+
+    def test_non_stream_still_works(self, client):
+        """stream=false (default) still returns normal JSON."""
+        from inference_difference.app import _state
+        _state.model_client = _make_stream_mock_client()
+
+        resp = client.post("/v1/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        })
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["object"] == "chat.completion"
+
+    def test_stream_calls_call_stream_not_call(self, client):
+        """When streaming, model_client.call_stream() is used, not call()."""
+        from inference_difference.app import _state
+        mock = _make_stream_mock_client()
+        _state.model_client = mock
+
+        client.post("/v1/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": True,
+        })
+
+        mock.call_stream.assert_called_once()
+        # call() should NOT have been called for the main request
+        # (it may be called by other internal mechanisms, so we just
+        # verify call_stream was called)
+
+
+class TestStreamResultAggregation:
+    """StreamResult collects content from streamed chunks."""
+
+    def test_stream_result_fields(self):
+        """StreamResult has the right fields."""
+        from inference_difference.model_client import StreamResult
+        r = StreamResult(
+            model="test",
+            content="hello",
+            finish_reason="stop",
+            latency_ms=42.0,
+            success=True,
+        )
+        assert r.model == "test"
+        assert r.content == "hello"
+        assert r.latency_ms == 42.0
+
+    def test_fake_stream_from_blocking(self):
+        """_fake_stream_from_blocking wraps a blocking response as SSE."""
+        from inference_difference.model_client import ModelClient, ModelResponse
+        client = ModelClient()
+
+        # Mock the blocking call
+        mock_response = ModelResponse(
+            id="test-id",
+            model="anthropic/claude-haiku",
+            content="I am a haiku response",
+            success=True,
+            latency_ms=50.0,
+        )
+        client.call = MagicMock(return_value=mock_response)
+
+        iterator, result = client._fake_stream_from_blocking(
+            "anthropic/claude-haiku",
+            [{"role": "user", "content": "Hi"}],
+            0.7, None,
+        )
+
+        chunks = list(iterator)
+        full_text = "".join(chunks)
+
+        assert "data: [DONE]" in full_text
+        assert "I am a haiku response" in full_text
+        assert result.content == "I am a haiku response"
+        assert result.success is True

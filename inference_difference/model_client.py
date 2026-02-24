@@ -98,6 +98,21 @@ def _resolve_provider(model_id: str) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class StreamResult:
+    """Metadata collected after a streaming call completes.
+
+    The actual chunks are yielded in real-time; this holds the
+    aggregated data needed for quality evaluation and learning.
+    """
+    model: str = ""
+    content: str = ""
+    finish_reason: str = "stop"
+    latency_ms: float = 0.0
+    success: bool = True
+    error: str = ""
+
+
+@dataclass
 class ModelResponse:
     """Response from a model provider, normalized to OpenAI format.
 
@@ -397,3 +412,261 @@ class ModelClient:
                 success=False,
                 error=str(e),
             )
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def call_stream(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Iterator[str], StreamResult]:
+        """Stream a model call, yielding raw SSE lines.
+
+        Returns (chunk_iterator, result_holder). The caller iterates
+        over chunks and sends them to the client. After iteration
+        completes, result_holder contains aggregated metadata for
+        quality evaluation and learning.
+
+        Each yielded string is a complete SSE line (e.g. "data: {...}\\n\\n").
+        The final "data: [DONE]\\n\\n" is always yielded.
+        """
+        base_url, api_key, model_name = _resolve_provider(model_id)
+
+        # Anthropic streaming uses a different format — for now, fall back
+        # to non-streaming for Anthropic and wrap result as fake SSE.
+        if model_id.startswith("anthropic/") and "anthropic.com" in base_url:
+            return self._fake_stream_from_blocking(
+                model_id, messages, temperature, max_tokens,
+            )
+
+        result = StreamResult(model=model_name)
+        iterator = self._stream_openai_compat(
+            base_url, api_key, model_name, messages,
+            temperature, max_tokens, extra_params, result,
+        )
+        return iterator, result
+
+    def _stream_openai_compat(
+        self,
+        base_url: str,
+        api_key: str,
+        model_name: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+        extra_params: Optional[Dict[str, Any]],
+        result: StreamResult,
+    ) -> Iterator[str]:
+        """Stream from an OpenAI-compatible endpoint, yielding SSE lines."""
+        url = f"{base_url}/v1/chat/completions"
+        start = time.monotonic()
+
+        body: Dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        if extra_params:
+            body.update(extra_params)
+
+        data = json.dumps(body).encode("utf-8")
+
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+
+        collected_content: List[str] = []
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=self._timeout)
+
+            # Read SSE stream line by line
+            buffer = b""
+            for raw_chunk in iter(lambda: resp.read(4096), b""):
+                buffer += raw_chunk
+                while b"\n" in buffer:
+                    line_bytes, buffer = buffer.split(b"\n", 1)
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+
+                    if not line:
+                        continue
+
+                    if line == "data: [DONE]":
+                        result.latency_ms = (
+                            (time.monotonic() - start) * 1000
+                        )
+                        result.content = "".join(collected_content)
+                        result.success = True
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    if line.startswith("data: "):
+                        # Extract content delta for aggregation
+                        try:
+                            chunk_data = json.loads(line[6:])
+                            choices = chunk_data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content_piece = delta.get("content", "")
+                                if content_piece:
+                                    collected_content.append(content_piece)
+                                fr = choices[0].get("finish_reason")
+                                if fr:
+                                    result.finish_reason = fr
+                        except json.JSONDecodeError:
+                            pass
+
+                        yield line + "\n\n"
+
+            # If we exit the loop without [DONE], finalize
+            result.latency_ms = (time.monotonic() - start) * 1000
+            result.content = "".join(collected_content)
+            result.success = True
+            yield "data: [DONE]\n\n"
+
+        except urllib.error.HTTPError as e:
+            result.latency_ms = (time.monotonic() - start) * 1000
+            result.success = False
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8")
+            except Exception:
+                pass
+            result.error = f"HTTP {e.code}: {error_body[:200]}"
+            logger.warning(
+                "Stream call failed: %s %d — %s",
+                model_name, e.code, error_body[:200],
+            )
+            # Yield an error chunk so the client knows something went wrong
+            error_chunk = {
+                "id": f"chatcmpl-tid-err-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"[TID upstream error: {result.error}]"},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            result.latency_ms = (time.monotonic() - start) * 1000
+            result.success = False
+            result.error = str(e)
+            logger.warning("Stream call failed: %s — %s", model_name, e)
+            error_chunk = {
+                "id": f"chatcmpl-tid-err-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"[TID upstream error: {result.error}]"},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    def _fake_stream_from_blocking(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int],
+    ) -> tuple[Iterator[str], StreamResult]:
+        """For providers without streaming, wrap a blocking call as SSE.
+
+        Makes a normal blocking call, then yields the entire response
+        as a single chunk followed by [DONE]. The client sees valid SSE.
+        """
+        response = self.call(
+            model_id=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        result = StreamResult(
+            model=response.model,
+            content=response.content,
+            finish_reason=response.finish_reason,
+            latency_ms=response.latency_ms,
+            success=response.success,
+            error=response.error,
+        )
+
+        def _generate() -> Iterator[str]:
+            if not response.success:
+                error_chunk = {
+                    "id": response.id or f"chatcmpl-tid-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": response.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "content": f"[TID upstream error: {response.error}]",
+                        },
+                        "finish_reason": "stop",
+                    }],
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+            else:
+                # Role chunk (first chunk convention)
+                role_chunk = {
+                    "id": response.id or f"chatcmpl-tid-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": response.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(role_chunk)}\n\n"
+
+                # Content chunk
+                content_chunk = {
+                    "id": response.id or f"chatcmpl-tid-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": response.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": response.content},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+
+                # Finish chunk
+                finish_chunk = {
+                    "id": response.id or f"chatcmpl-tid-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": response.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": response.finish_reason,
+                    }],
+                }
+                yield f"data: {json.dumps(finish_chunk)}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return _generate(), result
