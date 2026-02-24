@@ -71,7 +71,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from inference_difference.catalog_manager import CatalogManager
@@ -92,7 +92,7 @@ from inference_difference.et_module import (
     ModuleRegistry,
 )
 from inference_difference.hardware import HardwareProfile, detect_hardware
-from inference_difference.model_client import ModelClient, ModelResponse
+from inference_difference.model_client import ModelClient, ModelResponse, StreamResult
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
 from inference_difference.translation_shim import translate_request
@@ -701,6 +701,16 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         _state.module_registry.dispatch(HookPhase.POST_ROUTE, ctx)
 
     # --- Step 5: Forward to provider ---
+    # Branch: streaming vs blocking. Most chat UIs send stream=true
+    # by default — without this path, the client hangs waiting for SSE
+    # chunks that never come.
+
+    if req.stream:
+        return _stream_response(
+            req, selected_model, fallback_chain, decision,
+            classification, ctx, request_id,
+        )
+
     model_response = _state.model_client.call(
         model_id=selected_model,
         messages=req.messages,
@@ -783,6 +793,78 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     }
 
     return JSONResponse(content=response_dict)
+
+
+def _stream_response(
+    req: ChatCompletionRequest,
+    selected_model: str,
+    fallback_chain: List[str],
+    decision: Any,
+    classification: Any,
+    ctx: HookContext,
+    request_id: str,
+) -> StreamingResponse:
+    """Stream SSE chunks from the upstream provider to the caller.
+
+    Most OpenAI-compatible clients (SillyTavern, Open WebUI, etc.)
+    send stream=true by default. Without this, the client hangs
+    waiting for SSE chunks that never arrive.
+
+    Learning and quality hooks run AFTER the stream completes — the
+    StreamResult is populated as chunks flow through.
+    """
+    chunk_iter, stream_result = _state.model_client.call_stream(
+        model_id=selected_model,
+        messages=req.messages,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+    )
+
+    def _generate():
+        # Yield all chunks from the upstream provider
+        yield from chunk_iter
+
+        # --- Post-stream: learning and hooks (caller never sees this) ---
+        ctx.response_text = stream_result.content
+
+        if _state.module_registry is not None:
+            _state.module_registry.dispatch(HookPhase.PRE_RESPONSE, ctx)
+
+        quality = evaluate_quality(
+            response_text=stream_result.content,
+            classification=classification,
+            latency_ms=stream_result.latency_ms,
+            latency_budget_ms=_state.config.latency_budget_ms,
+            quality_threshold=_state.config.quality_threshold,
+        )
+        ctx.quality_evaluation = quality
+
+        if decision is not None:
+            _state.engine.report_outcome(
+                decision=decision,
+                success=stream_result.success and quality.is_success,
+                quality_score=quality.overall_score,
+                latency_ms=stream_result.latency_ms,
+            )
+
+        if _state.module_registry is not None:
+            _state.module_registry.dispatch(HookPhase.POST_RESPONSE, ctx)
+
+        logger.info(
+            "Streamed %s via %s (%.0fms, quality=%.2f)",
+            request_id, selected_model,
+            stream_result.latency_ms, quality.overall_score,
+        )
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/v1/models")
