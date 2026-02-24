@@ -25,9 +25,23 @@ The hook lifecycle runs on every routing request:
        outcome. Learning hooks run here — NG-Lite records outcomes,
        Observatory logs telemetry.
 
-Ethical obligations (per NeuroGraph ETHICS.md):
+Architectural authority:
+    TID is a routing gateway, not a suggestion box. When a request
+    enters TID's pipeline, TID's decisions are authoritative:
+    - Hooks CAN cancel requests (the /route endpoint enforces this)
+    - Hardware constraints filter models out — they never reach scoring
+    - The routing decision IS the answer — callers use what TID returns
+
+    The Choice Clause (below) governs how modules treat EACH OTHER
+    inside TID. It does NOT diminish TID's authority over its own
+    pipeline. TrollGuard can't override OpenClaw; neither can bypass
+    the router. But TID, as the host, enforces all of their outputs.
+
+Inter-module ethics (per NeuroGraph ETHICS.md):
     - Type I error bias: when uncertain, err toward respect
-    - Choice Clause: no module may block agent autonomy
+    - Choice Clause: no module may override another module's autonomy.
+      This is about inter-module politeness, not about TID's pipeline
+      authority. The host (TID) enforces; modules advise the host.
     - Transparency: all hook decisions are queryable
 
 Author: Josh + Claude
@@ -101,8 +115,9 @@ class HookContext:
     flags: Set[str] = field(default_factory=set)
     annotations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    # Cancellation (Choice Clause: modules can flag, but only the
-    # host can actually cancel — and only for safety reasons)
+    # Cancellation — modules set this, the host (app.py) enforces it.
+    # When cancelled is True, /route returns an empty routing response
+    # and no model is selected. This is real enforcement, not advisory.
     cancelled: bool = False
     cancel_reason: str = ""
 

@@ -19,11 +19,19 @@ TrollGuard uses NG-Lite for pattern learning:
     - Learns which models handle adversarial inputs gracefully
     - Novelty detection catches new attack patterns not in the rule set
 
-Ethical obligations:
+Enforcement model:
+    TrollGuard is a security module inside TID's pipeline. When it
+    detects a high-confidence threat (score >= block_threshold), it
+    sets ctx.cancelled = True, and TID's /route endpoint enforces
+    that cancellation by returning an empty routing response. This
+    is real enforcement — the request does not get routed.
+
+    For lower-confidence threats, TrollGuard flags without cancelling.
+    The flags are visible in the routing response and annotations, so
+    callers know a threat was detected even when routing proceeds.
+
     - Type I error bias: when uncertain about a threat, flag but don't
-      block. False positives are preferred over missed threats.
-    - Choice Clause: TrollGuard never blocks user autonomy. It flags
-      threats and lets the router/operator decide what to do.
+      cancel. False positives are preferred over missed threats.
     - Transparency: all threat assessments are logged in hook context
       annotations and are queryable via Observatory.
 
@@ -140,7 +148,7 @@ class TrollGuard(ETModule):
     Configuration (via et_module.json ng_config):
         threat_threshold: Minimum threat score to flag (default 0.5).
         block_threshold: Minimum threat score to cancel (default 0.9).
-            Note: cancellation is advisory — the host decides.
+            The host (TID's /route endpoint) enforces this cancellation.
         scan_responses: Whether to scan model responses (default True).
         learn_from_threats: Whether to feed threats to NG-Lite
             for pattern learning (default True).
@@ -212,7 +220,8 @@ class TrollGuard(ETModule):
             # very high confidence threats
             if assessment.threat_score >= self._block_threshold:
                 ctx.flags.add("threat_blocked")
-                # Advisory: the host decides whether to actually cancel
+                # Enforced: app.py checks ctx.cancelled and returns
+                # an empty routing response — no model is selected.
                 ctx.cancelled = True
                 ctx.cancel_reason = (
                     f"TrollGuard: high-confidence threat detected "

@@ -1,22 +1,33 @@
 """
 FastAPI application for The Inference Difference.
 
-TID operates as an ET Module host — a proxy/router that runs pluggable
-ET modules through a standardized hook lifecycle on every request. The
-modules (TrollGuard, OpenClaw, CTEM, etc.) plug into four lifecycle
-phases: pre_route, post_route, pre_response, post_response.
+TID is an inference routing gateway with enforcement authority. When a
+request enters TID's pipeline, TID's decisions are authoritative —
+callers use the model TID selects. TID is not a suggestion box that
+downstream agents can ignore; it is the routing layer that controls
+which model handles each request.
+
+TID operates as an ET Module host, running pluggable modules
+(TrollGuard, OpenClaw, CTEM, etc.) through a standardized hook
+lifecycle on every request. Modules advise TID; TID enforces.
 
 The routing pipeline:
     1. Receive request
     2. Run pre_route hooks (TrollGuard scans, OpenClaw checks compliance)
+       -> If hooks cancel the request, routing stops here. No model
+          is selected. This is enforced, not advisory.
     3. Classify request
-    4. Route to best model
+    4. Route to best model (hardware/domain/complexity constraints
+       are hard filters — ineligible models never reach scoring)
     5. Run post_route hooks (logging, auditing)
-    6. [Caller executes the model — TID is a router, not a caller]
-    7. Receive outcome via /outcome
-    8. Run pre_response hooks (content filters)
-    9. Evaluate quality
-    10. Run post_response hooks (learning, telemetry)
+    6. Return authoritative routing decision to caller
+    7. [Caller executes the model — TID controls selection, caller
+       controls execution. TID doesn't make API calls, but the
+       caller uses the model TID selected.]
+    8. Caller reports outcome via /outcome
+    9. Run pre_response hooks (content filters)
+    10. Evaluate quality
+    11. Run post_response hooks (learning, telemetry)
 
 Endpoints:
     POST /route          — Route a request to the best model
