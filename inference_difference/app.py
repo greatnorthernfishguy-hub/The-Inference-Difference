@@ -1,67 +1,64 @@
 """
 FastAPI application for The Inference Difference.
 
-TID is an inference routing gateway with enforcement authority. When a
-request enters TID's pipeline, TID's decisions are authoritative —
-callers use the model TID selects. TID is not a suggestion box that
-downstream agents can ignore; it is the routing layer that controls
-which model handles each request.
+TID is a TRANSPARENT INFERENCE PROXY. Callers send standard
+OpenAI-compatible requests to POST /v1/chat/completions. TID
+intercepts the call, classifies it, routes it to the best model,
+forwards the request to the actual provider, and returns the
+response. The caller never knows TID exists — they just get a
+response as if they talked to OpenAI/Ollama/OpenRouter directly.
 
-TID operates as an ET Module host, running pluggable modules
-(TrollGuard, OpenClaw, CTEM, etc.) through a standardized hook
-lifecycle on every request. Modules advise TID; TID enforces.
+Point OPENAI_BASE_URL at TID and everything just works:
+    export OPENAI_BASE_URL=http://localhost:4001/v1
 
-The routing pipeline:
-    1. Receive request
-    2. Run pre_route hooks (TrollGuard scans, OpenClaw checks compliance)
-       -> If hooks cancel the request, routing stops here. No model
-          is selected. This is enforced, not advisory.
-    3. Classify request
-    4. Route to best model (hardware/domain/complexity constraints
-       are hard filters — ineligible models never reach scoring)
-    5. Run post_route hooks (logging, auditing)
-    6. Return authoritative routing decision to caller
-    7. [Caller executes the model — TID controls selection, caller
-       controls execution. TID doesn't make API calls, but the
-       caller uses the model TID selected.]
-    8. Caller reports outcome via /outcome
-    9. Run pre_response hooks (content filters)
-    10. Evaluate quality
+The proxy pipeline (all internal, invisible to caller):
+    1. Receive OpenAI-compatible request
+    2. Translation Shim: normalize model names, fix malformed calls
+    3. Run pre_route hooks (TrollGuard scans, OpenClaw checks compliance)
+       -> If hooks cancel, return a refusal response (still OpenAI format)
+    4. Classify request (domain, complexity, tokens)
+    5. Route to best model (hardware/domain/complexity hard filters,
+       then 6-factor weighted scoring with NG-Lite learning)
+    6. Run post_route hooks (logging, auditing)
+    7. Forward request to actual provider (Ollama/OpenRouter/Anthropic/etc.)
+    8. If model fails, auto-retry with fallback chain
+    9. Run pre_response hooks (content filters scan response)
+    10. Evaluate quality, teach NG-Lite from outcome
     11. Run post_response hooks (learning, telemetry)
+    12. Return standard OpenAI response to caller
 
-Endpoints:
-    POST /route          — Route a request to the best model
-    POST /outcome        — Report routing outcome for learning
-    GET  /health         — Health check with hardware/model status
-    GET  /stats          — Router statistics and performance data
-    GET  /models         — List available models
-    GET  /modules        — List registered ET modules
-    POST /classify       — Classify a request (debug/introspection)
+Primary endpoint:
+    POST /v1/chat/completions  — The transparent proxy (this is TID)
+    GET  /v1/models            — List available models (OpenAI format)
+
+Debug/introspection endpoints (not needed for normal use):
+    POST /route          — Inspect routing decision without forwarding
+    POST /outcome        — Manual outcome reporting
+    GET  /health         — Health check
+    GET  /stats          — Performance data
+    GET  /models         — TID model list
+    GET  /modules        — Registered ET modules
+    POST /classify       — Inspect classification
 
 Changelog (Grok audit response, 2026-02-19):
-- ADDED: Optional API key auth via TID_API_KEY env var (audit: "no auth").
-- ADDED: score_breakdown field to RouteResponse (audit: "no full reasoning
-  trace"). Exposes per-factor scores for transparency.
-- ADDED: Production exception handler (audit: "error leaks"). In production
-  (TID_ENV=production), stack traces are suppressed in HTTP responses.
-- KEPT: Synchronous classify_request in async endpoint (audit: "blocking").
-  classify_request is a pure-CPU heuristic that runs in <1ms.
+- ADDED: Optional API key auth via TID_API_KEY env var.
+- ADDED: score_breakdown field to RouteResponse.
+- ADDED: Production exception handler.
 
 Changelog (ET Module Integration, 2026-02-23):
-- ADDED: ET Module system — ModuleRegistry, hook lifecycle dispatch.
-- ADDED: NG Ecosystem coordinator for cross-module learning.
-- ADDED: TrollGuard module auto-registration on startup.
-- ADDED: OpenClaw adapter auto-registration on startup.
-- ADDED: /modules endpoint for module introspection.
-- REFACTORED: /route now runs pre_route and post_route hooks.
-- REFACTORED: /outcome now runs pre_response and post_response hooks.
+- ADDED: ET Module system, TrollGuard, OpenClaw adapter.
 
 Changelog (OpenClaw Gateway connection, 2026-02-24):
-- FIXED: OpenClaw adapter now reads OPENCLAW_GATEWAY_PORT and
-  OPENCLAW_GATEWAY_TOKEN from env vars and actually connects to the
-  gateway. Previously hardcoded standalone mode with a stub initialize().
-- ADDED: OPENCLAW_GATEWAY_HOST env var (default 127.0.0.1) for
-  non-loopback gateway deployments.
+- FIXED: OpenClaw adapter connects to gateway via env vars.
+
+Changelog (Transparent Proxy, 2026-02-24):
+- ADDED: POST /v1/chat/completions — the actual proxy endpoint.
+  TID now works as designed: transparent interception, not a
+  recommendation engine. Callers get responses, not model_ids.
+- ADDED: ModelClient for forwarding to Ollama/OpenRouter/Anthropic.
+- ADDED: Translation Shim for model name normalization.
+- ADDED: Auto-retry with fallback chain on model failure.
+- ADDED: GET /v1/models — OpenAI-compatible model listing.
 """
 
 from __future__ import annotations
@@ -92,8 +89,10 @@ from inference_difference.et_module import (
     ModuleRegistry,
 )
 from inference_difference.hardware import HardwareProfile, detect_hardware
+from inference_difference.model_client import ModelClient, ModelResponse
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
+from inference_difference.translation_shim import translate_request
 
 logger = logging.getLogger("inference_difference.app")
 
@@ -102,8 +101,34 @@ logger = logging.getLogger("inference_difference.app")
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible Pydantic models (the real interface)
+# ---------------------------------------------------------------------------
+
+class ChatCompletionRequest(BaseModel):
+    """OpenAI-compatible chat completion request.
+
+    This is TID's primary interface. Callers send this to
+    POST /v1/chat/completions and get back a standard response.
+    """
+    model: str = Field("auto", description="Model name or 'auto' for routing")
+    messages: List[Dict[str, Any]] = Field(
+        ..., description="OpenAI-format messages",
+    )
+    temperature: float = Field(0.7, description="Sampling temperature")
+    max_tokens: Optional[int] = Field(None, description="Max response tokens")
+    stream: bool = Field(False, description="Stream response (not yet supported)")
+    metadata: Optional[Dict[str, Any]] = Field(
+        None, description="Extra context (agent_id, etc.)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Debug/introspection Pydantic models
+# ---------------------------------------------------------------------------
+
 class RouteRequest(BaseModel):
-    """Request body for /route."""
+    """Request body for /route (debug endpoint)."""
     message: str = Field(..., description="The request text to route")
     conversation_history: List[str] = Field(
         default_factory=list,
@@ -178,6 +203,7 @@ class AppState:
     config: InferenceDifferenceConfig
     hardware: HardwareProfile
     engine: RoutingEngine
+    model_client: Optional[ModelClient] = None
     ng_lite: Optional[Any] = None
     catalog_manager: Optional[CatalogManager] = None
     dream_cycle: Optional[DreamCycle] = None
@@ -273,6 +299,9 @@ async def lifespan(app: FastAPI):
         dream_cycle=_state.dream_cycle,
     )
     _state.recent_decisions = {}
+
+    # Create model client for forwarding requests to providers
+    _state.model_client = ModelClient()
 
     # Initialize NG Ecosystem coordinator for cross-module learning
     try:
@@ -469,12 +498,242 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# PRIMARY ENDPOINT: Transparent Proxy
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
+    """OpenAI-compatible chat completions — TID's primary interface.
+
+    Callers send a standard OpenAI request. TID classifies it, routes it
+    to the best model, forwards the request to the actual provider, and
+    returns the response. The caller never knows TID was in the middle.
+
+    The full pipeline runs internally:
+        1. Translation shim (normalize model name)
+        2. pre_route hooks (TrollGuard, OpenClaw)
+        3. Classification + routing (if model is "auto")
+        4. post_route hooks
+        5. Forward to provider
+        6. Auto-retry with fallback chain on failure
+        7. pre_response + quality eval + post_response hooks
+        8. Return OpenAI-format response
+    """
+    request_id = f"req_{int(time.time() * 1000)}"
+
+    # --- Step 1: Translation Shim ---
+    resolved_model, translation_type = translate_request(
+        req.model, req.messages,
+    )
+    # If caller specified an exact model (not auto), we'll try it
+    # but still run hooks for security/compliance
+    caller_chose_model = (
+        resolved_model != "" and translation_type != "auto"
+    )
+
+    # Extract the user's last message for classification
+    user_message = ""
+    for msg in reversed(req.messages):
+        if msg.get("role") == "user":
+            user_message = msg.get("content", "")
+            break
+
+    # Build conversation history from prior messages
+    conversation_history = [
+        msg.get("content", "")
+        for msg in req.messages[:-1]
+        if msg.get("role") == "user"
+    ]
+
+    # --- Step 2: pre_route hooks ---
+    ctx = HookContext(
+        request_id=request_id,
+        message=user_message,
+        conversation_history=conversation_history,
+        metadata=req.metadata or {},
+    )
+
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.PRE_ROUTE, ctx)
+
+    # Check cancellation (TrollGuard blocked, OpenClaw denied, etc.)
+    if ctx.cancelled:
+        # Return a refusal in OpenAI format — caller sees a normal response
+        return JSONResponse(content={
+            "id": f"chatcmpl-tid-{request_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": resolved_model or "tid-gateway",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "I'm unable to process this request. "
+                        f"Reason: {ctx.cancel_reason}"
+                    ),
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        })
+
+    # --- Step 3: Classify + Route ---
+    classification = classify_request(
+        message=user_message,
+        conversation_history=conversation_history,
+        metadata=req.metadata,
+    )
+    ctx.classification = classification
+
+    if caller_chose_model:
+        # Caller specified a model — honor it, but we still classified
+        # for learning purposes
+        selected_model = resolved_model
+        fallback_chain: List[str] = []
+        decision = None
+    else:
+        # Auto-route: TID picks the model
+        consciousness_score = ctx.consciousness_score
+        decision = _state.engine.route(
+            classification=classification,
+            consciousness_score=consciousness_score,
+            request_id=request_id,
+        )
+        ctx.routing_decision = decision
+        selected_model = decision.model_id
+        fallback_chain = decision.fallback_chain
+
+    # --- Step 4: post_route hooks ---
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.POST_ROUTE, ctx)
+
+    # --- Step 5: Forward to provider ---
+    model_response = _state.model_client.call(
+        model_id=selected_model,
+        messages=req.messages,
+        temperature=req.temperature,
+        max_tokens=req.max_tokens,
+    )
+
+    # --- Step 6: Auto-retry with fallback chain ---
+    tried_models = [selected_model]
+    for fallback_id in fallback_chain:
+        if model_response.success:
+            break
+        logger.info(
+            "Model %s failed, trying fallback %s",
+            tried_models[-1], fallback_id,
+        )
+        model_response = _state.model_client.call(
+            model_id=fallback_id,
+            messages=req.messages,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+        )
+        tried_models.append(fallback_id)
+
+    # --- Step 7: Response hooks + learning (all internal) ---
+    ctx.response_text = model_response.content
+
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.PRE_RESPONSE, ctx)
+
+    quality = evaluate_quality(
+        response_text=model_response.content,
+        classification=classification,
+        latency_ms=model_response.latency_ms,
+        latency_budget_ms=_state.config.latency_budget_ms,
+        quality_threshold=_state.config.quality_threshold,
+    )
+    ctx.quality_evaluation = quality
+
+    # Teach NG-Lite from outcome (caller never sees this)
+    if decision is not None:
+        _state.engine.report_outcome(
+            decision=decision,
+            success=model_response.success and quality.is_success,
+            quality_score=quality.overall_score,
+            latency_ms=model_response.latency_ms,
+        )
+
+    if _state.module_registry is not None:
+        _state.module_registry.dispatch(HookPhase.POST_RESPONSE, ctx)
+
+    # --- Step 8: Return OpenAI-format response ---
+    if not model_response.success:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": (
+                        f"All models failed. Last error: "
+                        f"{model_response.error}"
+                    ),
+                    "type": "upstream_error",
+                    "code": "model_error",
+                },
+            },
+        )
+
+    # Add TID routing metadata as an extension field (optional,
+    # callers can ignore it — it's not part of the OpenAI spec)
+    response_dict = model_response.to_openai_dict()
+    response_dict["routing_info"] = {
+        "routed_by": "tid",
+        "model_selected": selected_model,
+        "models_tried": tried_models,
+        "classification": {
+            "domain": classification.primary_domain.value,
+            "complexity": classification.complexity.value,
+        },
+        "quality_score": round(quality.overall_score, 3),
+    }
+
+    return JSONResponse(content=response_dict)
+
+
+@app.get("/v1/models")
+async def openai_models_list() -> JSONResponse:
+    """OpenAI-compatible model listing.
+
+    Returns models in the format OpenAI clients expect.
+    """
+    models = []
+    for model in _state.config.get_enabled_models():
+        models.append({
+            "id": model.model_id,
+            "object": "model",
+            "created": int(_state.start_time),
+            "owned_by": model.model_id.split("/")[0] if "/" in model.model_id else "local",
+        })
+    # Also list "auto" as a virtual model
+    models.append({
+        "id": "auto",
+        "object": "model",
+        "created": int(_state.start_time),
+        "owned_by": "tid",
+    })
+    return JSONResponse(content={
+        "object": "list",
+        "data": models,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Debug/Introspection Endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/route", response_model=RouteResponse)
-async def route_request(req: RouteRequest) -> RouteResponse:
+async def route_request_debug(req: RouteRequest) -> RouteResponse:
     """Route an inference request to the best available model.
+
+    DEBUG ENDPOINT — shows routing decision without forwarding.
+    For normal use, call POST /v1/chat/completions instead.
 
     Runs the full ET module hook lifecycle:
         1. pre_route hooks (TrollGuard, OpenClaw)
