@@ -55,6 +55,13 @@ Changelog (ET Module Integration, 2026-02-23):
 - ADDED: /modules endpoint for module introspection.
 - REFACTORED: /route now runs pre_route and post_route hooks.
 - REFACTORED: /outcome now runs pre_response and post_response hooks.
+
+Changelog (OpenClaw Gateway connection, 2026-02-24):
+- FIXED: OpenClaw adapter now reads OPENCLAW_GATEWAY_PORT and
+  OPENCLAW_GATEWAY_TOKEN from env vars and actually connects to the
+  gateway. Previously hardcoded standalone mode with a stub initialize().
+- ADDED: OPENCLAW_GATEWAY_HOST env var (default 127.0.0.1) for
+  non-loopback gateway deployments.
 """
 
 from __future__ import annotations
@@ -302,7 +309,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("TrollGuard registration failed: %s", e)
 
-    # Register OpenClaw adapter (standalone mode)
+    # Register OpenClaw adapter — connect to gateway if configured
     try:
         from inference_difference.et_module import ETModuleManifest
         from inference_difference.openclaw_adapter import OpenClawAdapter
@@ -314,9 +321,27 @@ async def lifespan(app: FastAPI):
             capabilities=["compliance", "governance"],
             priority=10,
         )
-        openclaw = OpenClawAdapter(openclaw_manifest)
+
+        # Read gateway connection from env
+        _oc_port = os.environ.get("OPENCLAW_GATEWAY_PORT", "")
+        _oc_token = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+        _oc_host = os.environ.get("OPENCLAW_GATEWAY_HOST", "127.0.0.1")
+        _oc_endpoint = (
+            f"http://{_oc_host}:{_oc_port}" if _oc_port else ""
+        )
+
+        openclaw = OpenClawAdapter(
+            openclaw_manifest,
+            openclaw_endpoint=_oc_endpoint,
+            openclaw_token=_oc_token,
+        )
         _state.module_registry.register(openclaw)
-        logger.info("OpenClaw adapter registered (standalone mode)")
+        if _oc_endpoint:
+            logger.info(
+                "OpenClaw adapter registered (endpoint=%s)", _oc_endpoint,
+            )
+        else:
+            logger.info("OpenClaw adapter registered (standalone mode)")
     except Exception as e:
         logger.warning("OpenClaw adapter registration failed: %s", e)
 
