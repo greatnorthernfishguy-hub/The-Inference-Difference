@@ -8,6 +8,10 @@ build/
 .eggs/
 *.db
 
+# NG-Lite runtime state (generated during operation/tests)
+ng_lite_state.json
+inference_difference_ng.json
+
 # In-place install artifacts (created by install.sh)
 venv/
 data/
