@@ -13,3 +13,7 @@ venv/
 data/
 logs/
 config.json
+
+# NG-Lite runtime state
+inference_difference_ng.json
+ng_lite_state.json
