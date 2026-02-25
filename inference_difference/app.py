@@ -96,6 +96,7 @@ from inference_difference.model_client import ModelClient, ModelResponse, Stream
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
 from inference_difference.translation_shim import translate_request
+from inference_difference.responses_endpoint import register_responses_endpoint
 
 logger = logging.getLogger("inference_difference.app")
 
@@ -1163,3 +1164,10 @@ async def classify_endpoint(req: ClassifyRequest) -> Dict[str, Any]:
         "keywords": classification.keywords,
         "confidence": classification.confidence,
     }
+
+
+# ---------------------------------------------------------------------------
+# Register Responses API endpoint (OpenClaw SSE streaming compatibility)
+# ---------------------------------------------------------------------------
+
+register_responses_endpoint(app, chat_completions)
