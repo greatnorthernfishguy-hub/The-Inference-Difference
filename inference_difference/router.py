@@ -210,7 +210,11 @@ class RoutingEngine:
 
         # Build decision
         best_model, best_score, best_breakdown = scored[0]
-        fallbacks = [m.model_id for m, _, _ in scored[1:4]]
+        # Full fallback chain: all scored candidates, not just 3.
+        # TID should exhaust every option before giving up. With 300+
+        # models in the catalog, a 3-model chain means free rate-limited
+        # models block access to hundreds of viable paid alternatives.
+        fallbacks = [m.model_id for m, _, _ in scored[1:]]
 
         consciousness_boosted = (
             consciousness_score is not None
@@ -547,7 +551,7 @@ class RoutingEngine:
             and self.config.enable_consciousness_routing
         ):
             # Boost proportional to model capability (higher priority = more boost)
-            boost = consciousness_score * 0.1 * priority_score
+            boost = consciousness_score * 0.3 * priority_score
             total += boost
             breakdown["consciousness_boost"] = boost
 

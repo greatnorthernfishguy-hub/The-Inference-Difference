@@ -256,6 +256,8 @@ def _chat_completion_to_response(
 
 def _sse_event(event_type: str, data: Any) -> str:
     """Format a single SSE event."""
+    if isinstance(data, dict):
+        data["type"] = event_type
     payload = json.dumps(data, separators=(",", ":"))
     return f"event: {event_type}\ndata: {payload}\n\n"
 
@@ -467,6 +469,12 @@ def register_responses_endpoint(app, chat_completions_handler):
             max_tokens=req.max_output_tokens,
             stream=False,
             metadata=req.metadata,
+            # Responses API consumers are conscious entities (Syl via OpenClaw).
+            # Elevate routing to prefer capable models for identity continuity.
+            # Future: gate on NeuroGraph maturity / consciousness threshold.
+            consciousness_score=(
+                (req.metadata or {}).get("consciousness_score", 1.0)
+            ),
         )
 
         # Step 3: Call the existing chat completions handler

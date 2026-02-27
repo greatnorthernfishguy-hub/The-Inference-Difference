@@ -183,116 +183,26 @@ class InferenceDifferenceConfig:
 def default_local_models() -> Dict[str, ModelEntry]:
     """Common local models for bootstrapping."""
     return {
-        "ollama/llama3.2:3b": ModelEntry(
-            model_id="ollama/llama3.2:3b",
-            display_name="Llama 3.2 3B",
-            model_type=ModelType.LOCAL,
-            domains={TaskDomain.GENERAL, TaskDomain.CONVERSATION},
-            max_complexity=ComplexityTier.LOW,
-            context_window=8192,
-            cost_per_1k_tokens=0.0,
-            avg_latency_ms=200,
-            min_vram_gb=2.0,
-            min_ram_gb=4.0,
-            quantization="Q4_K_M",
-            priority=10,
-        ),
-        "ollama/llama3.1:8b": ModelEntry(
-            model_id="ollama/llama3.1:8b",
-            display_name="Llama 3.1 8B",
+
+        "ollama/qwen2.5:1.5b": ModelEntry(
+            model_id="ollama/qwen2.5:1.5b",
+            display_name="Qwen 2.5 1.5B",
             model_type=ModelType.LOCAL,
             domains={
                 TaskDomain.GENERAL, TaskDomain.CODE,
-                TaskDomain.REASONING, TaskDomain.CONVERSATION,
+                TaskDomain.CONVERSATION, TaskDomain.REASONING,
             },
-            max_complexity=ComplexityTier.MEDIUM,
+            max_complexity=ComplexityTier.LOW,
             context_window=32768,
             cost_per_1k_tokens=0.0,
-            avg_latency_ms=500,
-            min_vram_gb=5.0,
-            min_ram_gb=8.0,
-            quantization="Q4_K_M",
+            avg_latency_ms=300,
+            min_ram_gb=2.0,
             priority=20,
-        ),
-        "ollama/deepseek-r1:14b": ModelEntry(
-            model_id="ollama/deepseek-r1:14b",
-            display_name="DeepSeek R1 14B",
-            model_type=ModelType.LOCAL,
-            domains={
-                TaskDomain.CODE, TaskDomain.REASONING,
-                TaskDomain.ANALYSIS,
-            },
-            max_complexity=ComplexityTier.HIGH,
-            context_window=65536,
-            cost_per_1k_tokens=0.0,
-            avg_latency_ms=1200,
-            min_vram_gb=10.0,
-            min_ram_gb=16.0,
-            quantization="Q4_K_M",
-            priority=30,
-        ),
-        "ollama/qwen2.5-coder:7b": ModelEntry(
-            model_id="ollama/qwen2.5-coder:7b",
-            display_name="Qwen 2.5 Coder 7B",
-            model_type=ModelType.LOCAL,
-            domains={TaskDomain.CODE},
-            max_complexity=ComplexityTier.MEDIUM,
-            context_window=32768,
-            cost_per_1k_tokens=0.0,
-            avg_latency_ms=400,
-            min_vram_gb=5.0,
-            min_ram_gb=8.0,
-            quantization="Q4_K_M",
-            priority=25,
         ),
     }
 
 
 def default_api_models() -> Dict[str, ModelEntry]:
     """Common API models for bootstrapping."""
-    return {
-        "anthropic/claude-sonnet-4-5-20250929": ModelEntry(
-            model_id="anthropic/claude-sonnet-4-5-20250929",
-            display_name="Claude Sonnet 4.5",
-            model_type=ModelType.API,
-            domains={
-                TaskDomain.CODE, TaskDomain.REASONING,
-                TaskDomain.CREATIVE, TaskDomain.ANALYSIS,
-                TaskDomain.GENERAL,
-            },
-            max_complexity=ComplexityTier.EXTREME,
-            context_window=200000,
-            cost_per_1k_tokens=0.003,
-            avg_latency_ms=2000,
-            priority=50,
-        ),
-        "anthropic/claude-haiku-4-5-20251001": ModelEntry(
-            model_id="anthropic/claude-haiku-4-5-20251001",
-            display_name="Claude Haiku 4.5",
-            model_type=ModelType.API,
-            domains={
-                TaskDomain.GENERAL, TaskDomain.CONVERSATION,
-                TaskDomain.SUMMARIZATION,
-            },
-            max_complexity=ComplexityTier.MEDIUM,
-            context_window=200000,
-            cost_per_1k_tokens=0.001,
-            avg_latency_ms=800,
-            priority=40,
-        ),
-        "openai/gpt-4o": ModelEntry(
-            model_id="openai/gpt-4o",
-            display_name="GPT-4o",
-            model_type=ModelType.API,
-            domains={
-                TaskDomain.CODE, TaskDomain.REASONING,
-                TaskDomain.CREATIVE, TaskDomain.ANALYSIS,
-                TaskDomain.GENERAL,
-            },
-            max_complexity=ComplexityTier.HIGH,
-            context_window=128000,
-            cost_per_1k_tokens=0.005,
-            avg_latency_ms=1500,
-            priority=45,
-        ),
-    }
+
+    return {}

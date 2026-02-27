@@ -1,636 +1,663 @@
 """
-NG Ecosystem — NeuroGraph Ecosystem Coordinator.
+NG Ecosystem — E-T Systems Module Integration Standard
 
-Manages NG-Lite instances across co-located ET modules and coordinates
-peer-to-peer learning between them. This is the Tier 2 (peer-pooled)
-implementation described in the NG Ecosystem spec.
+Single vendorable file that gives any E-T Systems module the full
+three-tier learning architecture:
 
-Architecture:
-    Tier 1 — Isolated: Each module has its own NG-Lite. No coordinator.
-    Tier 2 — Peer-pooled: This coordinator connects co-located modules
-             via NGPeerBridge, allowing shared learning without SaaS.
-    Tier 3 — Full SaaS: The coordinator connects all modules to
-             NeuroGraph SaaS via NGSaaSBridge.
+  Tier 1 (Standalone):  NGLite alone.  Local Hebbian learning.
+                        Zero deps beyond ng_lite.py.
+  Tier 2 (Peer-pooled): NGPeerBridge.  Always works.  Co-located
+                        modules share learning events via
+                        ~/.et_modules/shared_learning/.
+                        Auto-connects when the shared dir exists.
+  Tier 3 (Full SNN):    NGSaaSBridge to full NeuroGraph Foundation.
+                        Auto-upgrades when NeuroGraph is detected on
+                        the same host via ETModuleManager.
 
-The ecosystem coordinator:
-    1. Maintains a registry of all NG-Lite instances by module ID
-    2. Creates NGPeerBridge connections between co-located modules
-    3. Provides a unified API for recording outcomes and getting
-       recommendations that routes through the appropriate tier
-    4. Handles transparent tier transitions (1→2→3 and back)
+The ecosystem is "Apple-like" by design:
+  - Every module is independently useful at Tier 1.
+  - Any two co-located modules get a free Tier 2 boost — no config needed.
+  - When NeuroGraph is present, all co-located modules transparently
+    upgrade to Tier 3: full STDP, hyperedges, predictive coding, and
+    CES streaming.
 
-Ethical obligations (per NeuroGraph ETHICS.md):
-    - Transparency: all cross-module learning is logged and queryable
-    - Choice Clause: modules can opt out of shared learning
-    - Type I error bias: when uncertain about sharing, don't share
+The module code doesn't change.  The bridge swaps.
+
+Usage (inside any E-T Systems module):
+
+    from ng_ecosystem import NGEcosystem
+
+    # In your module's __init__ or startup:
+    eco = NGEcosystem.get_instance(
+        module_id="trollguard",
+        state_path="~/.trollguard/ng_lite_state.json",
+    )
+
+    # Use the ecosystem in your module's hot path:
+    embedding = my_embedder(text)
+    eco.record_outcome(embedding, target_id="threat:prompt_injection", success=True)
+    recs = eco.get_recommendations(embedding)
+    novelty = eco.detect_novelty(embedding)
+    ctx = eco.get_context(embedding)
+
+    # Inspect tier at any time:
+    print(eco.tier)        # 1, 2, or 3
+    print(eco.stats())     # full telemetry
+
+    # Periodic save (call on graceful shutdown or on a timer):
+    eco.save()
+
+Framework adapters (optional, load separately):
+  - openclaw_adapter.py — on_message(text)/recall(text)/stats() for OpenClaw skills
 
 Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
 License: AGPL-3.0
 
-Author: Josh + Claude
-Date: February 2026
+# ---- Changelog ----
+# [2026-02-22] Claude (Sonnet 4.6) — Initial creation.
+#   What: NGEcosystem class — singleton wrapper implementing the
+#         standardized E-T Systems optional integration protocol.
+#         Handles Tier 1→2→3 progression, auto-upgrade on NeuroGraph
+#         detection, graceful degradation, and unified telemetry.
+#         Also defines NGEcosystemAdapter ABC for framework adapters.
+#   Why:  Each module was wiring ng_lite + peer bridge + SaaS bridge
+#         independently with no shared contract.  This file is the
+#         single vendorable standard so all modules behave identically
+#         from an integration perspective.
+#   Settings: tier3_upgrade defaults to True (auto-upgrade when NeuroGraph
+#         is found).  upgrade_poll_interval=300s (re-check for NeuroGraph
+#         every 5 minutes — handles cases where NeuroGraph is installed
+#         after the module starts).  peer_sync_interval=100 (balances
+#         freshness vs I/O).
+#   How:  get_instance() creates NGLite, then tries peer bridge, then
+#         queries ETModuleManager for NeuroGraph.  All in try/except so
+#         each tier attempt is fully independent.  A background thread
+#         polls for tier upgrades at upgrade_poll_interval.
+# -------------------
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import threading
 import time
-from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ng_lite import NGBridge, NGLite
-
 logger = logging.getLogger("ng_ecosystem")
 
+__version__ = "1.0.0"
 
-# ---------------------------------------------------------------------------
-# NGPeerBridge — Tier 2 connectivity
-# ---------------------------------------------------------------------------
 
-class NGPeerBridge(NGBridge):
-    """Connects two co-located NG-Lite instances for shared learning.
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
 
-    When modules run together (e.g., TID + TrollGuard on the same host),
-    they pool their pattern knowledge for mutual benefit. The bridge
-    forwards outcomes and recommendations between peers.
+ET_MODULES_ROOT = Path.home() / ".et_modules"
+SHARED_LEARNING_DIR = ET_MODULES_ROOT / "shared_learning"
+REGISTRY_PATH = ET_MODULES_ROOT / "registry.json"
 
-    The module doesn't know or care whether its bridge partner is a
-    sibling module or the full SaaS — both use the same NGBridge
-    interface. Tier transitions are transparent.
+TIER_STANDALONE = 1  # NGLite only
+TIER_PEER = 2        # + NGPeerBridge
+TIER_FULL_SNN = 3    # + NGSaaSBridge (full NeuroGraph)
 
-    Design:
-        - Outcomes are recorded in the local instance AND forwarded
-          to the peer, tagged with the source module_id.
-        - Recommendations merge local and peer suggestions, giving
-          local knowledge a slight priority (it's more relevant).
-        - Novelty detection considers patterns from both instances.
+TIER_NAMES = {
+    TIER_STANDALONE: "Standalone (Tier 1)",
+    TIER_PEER: "Peer-pooled (Tier 2)",
+    TIER_FULL_SNN: "Full SNN (Tier 3)",
+}
 
-    Attributes:
-        peer: The NG-Lite instance on the other side of the bridge.
-        peer_module_id: Module ID of the peer.
-        local_weight: Weight given to local recommendations (0.0-1.0).
-        peer_weight: Weight given to peer recommendations (0.0-1.0).
+
+# --------------------------------------------------------------------------
+# Framework Adapter Interface
+# --------------------------------------------------------------------------
+
+class NGEcosystemAdapter(ABC):
+    """Abstract base for framework-specific adapters over NGEcosystem.
+
+    Implement this to expose the ecosystem to a specific framework.
+    Each adapter is a singleton that wraps the shared NGEcosystem
+    instance — the same ecosystem, different vocabulary.
+
+    Provided implementations:
+      - OpenClawAdapter (openclaw_adapter.py, vendored separately)
+
+    Custom adapters:
+      Subclass NGEcosystemAdapter and implement all abstract methods.
+      Call NGEcosystem.get_instance() inside __init__ to bind the
+      shared ecosystem.  Maintain your own singleton if needed.
+
+    Design contract:
+      - Adapters MUST NOT bypass NGEcosystem internals.
+      - Adapters handle embedding generation; NGEcosystem handles learning.
+      - Adapters are optional and framework-specific.  The core
+        NGEcosystem is framework-agnostic and always the source of truth.
     """
+
+    @abstractmethod
+    def on_message(self, text: str) -> Dict[str, Any]:
+        """Process one unit of framework input (message, request, event).
+
+        Args:
+            text: Raw text to process.
+
+        Returns:
+            Dict with at minimum: {"status": "ingested"|"skipped", "tier": int}
+        """
+        ...
+
+    @abstractmethod
+    def get_context(self, text: str) -> Dict[str, Any]:
+        """Retrieve cross-module context for the given text.
+
+        Args:
+            text: Query text.
+
+        Returns:
+            Dict with recommendations, novelty score, and tier info.
+        """
+        ...
+
+    @abstractmethod
+    def stats(self) -> Dict[str, Any]:
+        """Return framework-specific stats including ecosystem tier."""
+        ...
+
+
+# --------------------------------------------------------------------------
+# NGEcosystem Core
+# --------------------------------------------------------------------------
+
+class NGEcosystem:
+    """Singleton E-T Systems learning ecosystem for a module.
+
+    Manages the full Tier 1→2→3 lifecycle automatically.  Modules
+    call record_outcome(), get_recommendations(), detect_novelty(),
+    and get_context() without knowing or caring which tier is active.
+
+    Thread-safety: All public methods are safe to call from multiple
+    threads.  The tier upgrade loop runs in a daemon thread.
+    """
+
+    _instances: Dict[str, "NGEcosystem"] = {}
+    _lock = threading.Lock()
 
     def __init__(
         self,
-        peer: NGLite,
-        peer_module_id: str = "",
-        local_weight: float = 0.6,
-        peer_weight: float = 0.4,
+        module_id: str,
+        state_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
-        self._peer = peer
-        self._peer_module_id = peer_module_id or peer.module_id
-        self._local_weight = local_weight
-        self._peer_weight = peer_weight
-        self._connected = True
-        self._outcomes_forwarded = 0
-        self._recommendations_served = 0
-
-    def is_connected(self) -> bool:
-        return self._connected
-
-    def connect(self) -> None:
-        """Activate the bridge connection."""
-        self._connected = True
-        logger.info(
-            "NGPeerBridge connected to peer '%s'",
-            self._peer_module_id,
-        )
-
-    def disconnect(self) -> None:
-        """Deactivate the bridge connection."""
-        self._connected = False
-        logger.info(
-            "NGPeerBridge disconnected from peer '%s'",
-            self._peer_module_id,
-        )
-
-    def record_outcome(
-        self,
-        embedding: np.ndarray,
-        target_id: str,
-        success: bool,
-        module_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Forward outcome to peer for cross-module learning.
-
-        The peer learns from this module's experience. The target_id
-        is prefixed with the source module to avoid namespace collisions.
         """
-        if not self._connected:
-            return None
-
-        # Tag the outcome with source module for transparency
-        peer_metadata = dict(metadata or {})
-        peer_metadata["source_module"] = module_id
-        peer_metadata["cross_module"] = True
-
-        try:
-            peer_result = self._peer.record_outcome(
-                embedding=embedding,
-                target_id=target_id,
-                success=success,
-                metadata=peer_metadata,
-            )
-            self._outcomes_forwarded += 1
-            return {
-                "peer_module": self._peer_module_id,
-                "peer_weight": peer_result.get("weight_after", 0.0),
-                "cross_module": True,
-            }
-        except Exception as e:
-            logger.warning(
-                "NGPeerBridge record_outcome to '%s' failed: %s",
-                self._peer_module_id, e,
-            )
-            return None
-
-    def get_recommendations(
-        self,
-        embedding: np.ndarray,
-        module_id: str,
-        top_k: int = 3,
-    ) -> Optional[List[Tuple[str, float, str]]]:
-        """Get recommendations from peer, weighted by peer_weight.
-
-        Returns (target_id, confidence, reasoning) tuples. The
-        confidence is scaled by peer_weight since peer knowledge
-        is less directly relevant than local knowledge.
-        """
-        if not self._connected:
-            return None
-
-        try:
-            peer_recs = self._peer.get_recommendations(
-                embedding=embedding, top_k=top_k,
-            )
-            self._recommendations_served += 1
-
-            return [
-                (
-                    target_id,
-                    weight * self._peer_weight,
-                    f"Peer recommendation from '{self._peer_module_id}'",
-                )
-                for target_id, weight in peer_recs
-            ]
-        except Exception as e:
-            logger.warning(
-                "NGPeerBridge get_recommendations from '%s' failed: %s",
-                self._peer_module_id, e,
-            )
-            return None
-
-    def detect_novelty(
-        self,
-        embedding: np.ndarray,
-        module_id: str,
-    ) -> Optional[float]:
-        """Get novelty score from peer's perspective.
-
-        If the peer has seen this pattern before, the novelty is
-        lower — cross-module pattern recognition.
-        """
-        if not self._connected:
-            return None
-
-        try:
-            return self._peer.detect_novelty(embedding)
-        except Exception as e:
-            logger.warning(
-                "NGPeerBridge detect_novelty from '%s' failed: %s",
-                self._peer_module_id, e,
-            )
-            return None
-
-    def sync_state(
-        self,
-        local_state: Dict[str, Any],
-        module_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Sync is a no-op for peer bridges.
-
-        Peer bridges forward outcomes in real-time. There's no
-        batched state sync needed — unlike SaaS, which might
-        accumulate offline and sync periodically.
-        """
-        return {"synced": True, "peer": self._peer_module_id}
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Bridge statistics for transparency."""
-        return {
-            "type": "peer",
-            "peer_module": self._peer_module_id,
-            "connected": self._connected,
-            "outcomes_forwarded": self._outcomes_forwarded,
-            "recommendations_served": self._recommendations_served,
-            "local_weight": self._local_weight,
-            "peer_weight": self._peer_weight,
-        }
-
-
-# ---------------------------------------------------------------------------
-# NGSaaSBridge — Tier 3 connectivity (stub)
-# ---------------------------------------------------------------------------
-
-class NGSaaSBridge(NGBridge):
-    """Connects to full NeuroGraph SaaS for cross-module intelligence.
-
-    Tier 3 connectivity. When NeuroGraph SaaS is available, this bridge
-    delegates to the full substrate for:
-        - Cross-module STDP (spike-timing dependent plasticity)
-        - Hypergraph capabilities
-        - Predictive coding
-        - Global pattern recognition across all connected modules
-
-    This is a stub implementation that returns None for all operations,
-    causing NG-Lite to fall back to local learning. When NeuroGraph SaaS
-    is built, this bridge will connect to it via HTTP/gRPC.
-    """
-
-    def __init__(self, endpoint: str = "", api_key: str = ""):
-        self._endpoint = endpoint
-        self._api_key = api_key
-        self._connected = False
-
-    def is_connected(self) -> bool:
-        return self._connected
-
-    def record_outcome(
-        self,
-        embedding: np.ndarray,
-        target_id: str,
-        success: bool,
-        module_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Forward outcome to NeuroGraph SaaS. Stub: returns None."""
-        return None
-
-    def get_recommendations(
-        self,
-        embedding: np.ndarray,
-        module_id: str,
-        top_k: int = 3,
-    ) -> Optional[List[Tuple[str, float, str]]]:
-        """Get recommendations from NeuroGraph SaaS. Stub: returns None."""
-        return None
-
-    def detect_novelty(
-        self,
-        embedding: np.ndarray,
-        module_id: str,
-    ) -> Optional[float]:
-        """Get novelty from NeuroGraph SaaS. Stub: returns None."""
-        return None
-
-    def sync_state(
-        self,
-        local_state: Dict[str, Any],
-        module_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        """Sync with NeuroGraph SaaS. Stub: returns None."""
-        return None
-
-
-# ---------------------------------------------------------------------------
-# NG Ecosystem Coordinator
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ModuleNGState:
-    """Tracks NG-Lite state for a single module within the ecosystem."""
-    module_id: str
-    ng_lite: NGLite
-    tier: int = 1  # 1=isolated, 2=peer-pooled, 3=saas
-    peers: List[str] = field(default_factory=list)
-    opt_out_sharing: bool = False
-
-
-class NGEcosystem:
-    """Coordinates NG-Lite instances across co-located ET modules.
-
-    The ecosystem coordinator is a singleton that all modules register
-    with. It manages:
-        1. NG-Lite instance creation and lifecycle
-        2. Peer bridge connections between co-located modules
-        3. Tier transitions (1→2→3 and fallback)
-        4. Unified stats and transparency
-
-    Usage:
-        eco = NGEcosystem()
-
-        # Register modules
-        tid_ng = eco.register_module("inference_difference")
-        tg_ng = eco.register_module("trollguard")
-
-        # Ecosystem auto-connects peers at Tier 2
-        eco.connect_peers()
-
-        # Modules use their NG-Lite instances normally
-        tid_ng.record_outcome(embedding, "model_a", success=True)
-
-        # Get ecosystem-wide stats
-        stats = eco.get_stats()
-    """
-
-    def __init__(self):
-        self._modules: Dict[str, ModuleNGState] = {}
-        self._saas_bridge: Optional[NGSaaSBridge] = None
-
-    def register_module(
-        self,
-        module_id: str,
-        ng_config: Optional[Dict[str, Any]] = None,
-        opt_out_sharing: bool = False,
-    ) -> NGLite:
-        """Register a module and create its NG-Lite instance.
-
         Args:
-            module_id: Unique module identifier.
-            ng_config: NG-Lite config overrides for this module.
-            opt_out_sharing: If True, this module won't participate
-                in peer-to-peer learning (Choice Clause).
-
-        Returns:
-            The module's NG-Lite instance.
+            module_id: Unique module identifier (e.g., "trollguard").
+                       Must match the module_id in et_module.json.
+            state_path: Path to persist NGLite state JSON.
+                        Defaults to ~/.et_modules/{module_id}/ng_lite_state.json
+            config: Optional config overrides.  Keys:
+                    peer_bridge.enabled (bool, default True)
+                    peer_bridge.sync_interval (int, default 100)
+                    tier3_upgrade.enabled (bool, default True)
+                    tier3_upgrade.poll_interval (float, default 300.0)
+                    ng_lite.* (passed through to NGLite)
         """
-        if module_id in self._modules:
-            return self._modules[module_id].ng_lite
+        self.module_id = module_id
 
-        ng = NGLite(module_id=module_id, config=ng_config)
+        self._config = {
+            "peer_bridge": {
+                "enabled": True,
+                "sync_interval": 100,
+            },
+            "tier3_upgrade": {
+                "enabled": True,
+                "poll_interval": 300.0,
+            },
+        }
+        if config:
+            _deep_merge(self._config, config)
 
-        state = ModuleNGState(
-            module_id=module_id,
-            ng_lite=ng,
-            tier=1,
-            opt_out_sharing=opt_out_sharing,
-        )
-        self._modules[module_id] = state
+        # State persistence path
+        if state_path:
+            self._state_path = Path(state_path).expanduser()
+        else:
+            self._state_path = (
+                ET_MODULES_ROOT / module_id / "ng_lite_state.json"
+            )
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Internal state
+        self._tier = TIER_STANDALONE
+        self._ng: Any = None              # NGLite instance
+        self._peer_bridge: Any = None     # NGPeerBridge instance
+        self._saas_bridge: Any = None     # NGSaaSBridge instance
+        self._ng_memory: Any = None       # NeuroGraphMemory (Tier 3)
+        self._upgrade_thread: Optional[threading.Thread] = None
+        self._shutdown_event = threading.Event()
+        self._ops_lock = threading.Lock()
+
+        # Boot sequence
+        self._init_ng_lite()
+        self._init_peer_bridge()
+        self._init_tier3_upgrade()
 
         logger.info(
-            "NG Ecosystem: registered module '%s' at Tier 1%s",
+            "[%s] NGEcosystem ready at %s",
             module_id,
-            " (opt-out sharing)" if opt_out_sharing else "",
+            TIER_NAMES[self._tier],
         )
 
-        return ng
+    # -----------------------------------------------------------------
+    # Singleton factory
+    # -----------------------------------------------------------------
 
-    def unregister_module(self, module_id: str) -> None:
-        """Remove a module from the ecosystem.
+    @classmethod
+    def get_instance(
+        cls,
+        module_id: str,
+        state_path: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> "NGEcosystem":
+        """Return the singleton NGEcosystem for this module_id.
 
-        Disconnects all peer bridges and removes the module's
-        NG-Lite instance.
+        Thread-safe.  Subsequent calls with the same module_id return
+        the existing instance regardless of state_path/config args.
         """
-        if module_id not in self._modules:
+        with cls._lock:
+            if module_id not in cls._instances:
+                cls._instances[module_id] = cls(module_id, state_path, config)
+            return cls._instances[module_id]
+
+    @classmethod
+    def reset_instance(cls, module_id: str) -> None:
+        """Destroy the singleton for module_id (testing only)."""
+        with cls._lock:
+            inst = cls._instances.pop(module_id, None)
+            if inst:
+                inst._shutdown_event.set()
+
+    # -----------------------------------------------------------------
+    # Tier 1: NGLite init
+    # -----------------------------------------------------------------
+
+    def _init_ng_lite(self) -> None:
+        """Initialize local NGLite substrate (always Tier 1)."""
+        try:
+            from ng_lite import NGLite  # vendored alongside this file
+
+            ng_config = self._config.get("ng_lite", {})
+            self._ng = NGLite(module_id=self.module_id, config=ng_config)
+
+            if self._state_path.exists():
+                self._ng.load(str(self._state_path))
+                logger.debug("[%s] NGLite state loaded from %s", self.module_id, self._state_path)
+
+        except Exception as exc:
+            logger.error("[%s] NGLite init failed: %s", self.module_id, exc)
+            self._ng = None
+
+    # -----------------------------------------------------------------
+    # Tier 2: NGPeerBridge init
+    # -----------------------------------------------------------------
+
+    def _init_peer_bridge(self) -> None:
+        """Try to connect NGPeerBridge (Tier 2). Non-blocking."""
+        if not self._config["peer_bridge"]["enabled"]:
+            return
+        if self._ng is None:
+            return
+        try:
+            from ng_peer_bridge import NGPeerBridge  # vendored alongside
+
+            bridge = NGPeerBridge(
+                module_id=self.module_id,
+                shared_dir=str(SHARED_LEARNING_DIR),
+                sync_interval=self._config["peer_bridge"]["sync_interval"],
+            )
+            self._ng.connect_bridge(bridge)
+            self._peer_bridge = bridge
+            self._tier = TIER_PEER
+            logger.info("[%s] NGPeerBridge connected (Tier 2)", self.module_id)
+
+        except Exception as exc:
+            logger.debug("[%s] NGPeerBridge unavailable: %s", self.module_id, exc)
+
+    # -----------------------------------------------------------------
+    # Tier 3: NeuroGraph auto-upgrade
+    # -----------------------------------------------------------------
+
+    def _init_tier3_upgrade(self) -> None:
+        """Start background thread that polls for NeuroGraph availability."""
+        if not self._config["tier3_upgrade"]["enabled"]:
             return
 
-        state = self._modules[module_id]
+        # Try once immediately (NeuroGraph may already be running)
+        self._try_tier3_upgrade()
+        if self._tier == TIER_FULL_SNN:
+            return  # Already upgraded; no need for polling thread
 
-        # Disconnect bridge if connected
-        state.ng_lite.disconnect_bridge()
-        state.peers.clear()
-
-        del self._modules[module_id]
-        logger.info("NG Ecosystem: unregistered module '%s'", module_id)
-
-    def get_ng_lite(self, module_id: str) -> Optional[NGLite]:
-        """Get the NG-Lite instance for a module."""
-        state = self._modules.get(module_id)
-        return state.ng_lite if state else None
-
-    # -------------------------------------------------------------------
-    # Peer Connectivity (Tier 2)
-    # -------------------------------------------------------------------
-
-    def connect_peers(self) -> int:
-        """Connect all eligible co-located modules as peers.
-
-        Creates NGPeerBridge connections between all modules that
-        haven't opted out of sharing. Each module gets a bridge to
-        every other eligible module.
-
-        Returns:
-            Number of peer connections created.
-        """
-        eligible = [
-            s for s in self._modules.values()
-            if not s.opt_out_sharing
-        ]
-
-        if len(eligible) < 2:
-            return 0
-
-        connections = 0
-        for i, state_a in enumerate(eligible):
-            for state_b in eligible[i + 1:]:
-                # Create bidirectional bridges
-                bridge_a_to_b = NGPeerBridge(
-                    peer=state_b.ng_lite,
-                    peer_module_id=state_b.module_id,
-                )
-                bridge_b_to_a = NGPeerBridge(
-                    peer=state_a.ng_lite,
-                    peer_module_id=state_a.module_id,
-                )
-
-                # Connect bridges (last bridge wins — for simplicity,
-                # connect the first peer only. Multi-peer bridging
-                # would require a multi-bridge wrapper.)
-                if not state_a.peers:
-                    state_a.ng_lite.connect_bridge(bridge_a_to_b)
-                if not state_b.peers:
-                    state_b.ng_lite.connect_bridge(bridge_b_to_a)
-
-                state_a.peers.append(state_b.module_id)
-                state_b.peers.append(state_a.module_id)
-                state_a.tier = 2
-                state_b.tier = 2
-                connections += 1
-
-                logger.info(
-                    "NG Ecosystem: peer bridge %s <-> %s",
-                    state_a.module_id, state_b.module_id,
-                )
-
-        return connections
-
-    def disconnect_peers(self) -> None:
-        """Disconnect all peer bridges, falling back to Tier 1."""
-        for state in self._modules.values():
-            if state.tier >= 2:
-                state.ng_lite.disconnect_bridge()
-                state.peers.clear()
-                state.tier = 1
-
-        logger.info("NG Ecosystem: all peer bridges disconnected")
-
-    # -------------------------------------------------------------------
-    # SaaS Connectivity (Tier 3)
-    # -------------------------------------------------------------------
-
-    def connect_saas(
-        self,
-        endpoint: str,
-        api_key: str = "",
-    ) -> bool:
-        """Connect all modules to NeuroGraph SaaS (Tier 3).
-
-        Upgrades from Tier 1 or 2 to Tier 3. The SaaS bridge
-        replaces peer bridges — SaaS provides superset functionality.
-
-        Returns:
-            True if connection succeeded.
-        """
-        self._saas_bridge = NGSaaSBridge(
-            endpoint=endpoint, api_key=api_key,
+        poll_interval = self._config["tier3_upgrade"]["poll_interval"]
+        t = threading.Thread(
+            target=self._upgrade_loop,
+            args=(poll_interval,),
+            daemon=True,
+            name=f"ng_eco_upgrade_{self.module_id}",
         )
+        t.start()
+        self._upgrade_thread = t
 
-        # SaaS bridge is a stub — would connect here in production
-        # For now, always return False (SaaS not yet available)
-        logger.info(
-            "NG Ecosystem: SaaS bridge created (endpoint=%s) — "
-            "stub implementation, falling back to local/peer",
-            endpoint,
-        )
-        return False
+    def _upgrade_loop(self, interval: float) -> None:
+        """Background polling loop for Tier 3 upgrade."""
+        while not self._shutdown_event.wait(timeout=interval):
+            if self._tier == TIER_FULL_SNN:
+                break
+            self._try_tier3_upgrade()
 
-    # -------------------------------------------------------------------
-    # Ecosystem Operations
-    # -------------------------------------------------------------------
+    def _try_tier3_upgrade(self) -> bool:
+        """Detect NeuroGraph on this host and upgrade to Tier 3 if found.
+
+        Detection strategy (in order):
+          1. Check if NeuroGraphMemory is already imported (same process).
+          2. Query ETModuleManager for NeuroGraph's install path.
+          3. Check known install paths directly.
+
+        Returns True if upgrade succeeded.
+        """
+        if self._ng is None:
+            return False
+
+        ng_memory = self._find_neurograph_memory()
+        if ng_memory is None:
+            return False
+
+        try:
+            from ng_bridge import NGSaaSBridge  # vendored from NeuroGraph
+
+            bridge = NGSaaSBridge(ng_memory)
+            with self._ops_lock:
+                self._ng.connect_bridge(bridge)
+                self._saas_bridge = bridge
+                self._ng_memory = ng_memory
+                self._tier = TIER_FULL_SNN
+
+            logger.info(
+                "[%s] Upgraded to NGSaaSBridge -> full NeuroGraph SNN (Tier 3)",
+                self.module_id,
+            )
+            return True
+
+        except Exception as exc:
+            logger.debug("[%s] Tier 3 upgrade attempt failed: %s", self.module_id, exc)
+            return False
+
+    def _find_neurograph_memory(self) -> Optional[Any]:
+        """Return a live NeuroGraphMemory instance if NeuroGraph is available,
+        else None.
+
+        Three-probe strategy, each fully guarded:
+          1. Already-imported singleton (same Python process).
+          2. ETModuleManager registry lookup + dynamic import.
+          3. Direct filesystem probe of known install paths.
+        """
+        # --- Probe 1: same process ---
+        try:
+            from openclaw_hook import NeuroGraphMemory
+            mem = NeuroGraphMemory.get_instance()
+            if mem is not None:
+                logger.debug("[%s] NeuroGraph found in-process", self.module_id)
+                return mem
+        except Exception:
+            pass
+
+        # --- Probe 2: ETModuleManager registry ---
+        try:
+            ng_path = self._neurograph_path_from_registry()
+            if ng_path:
+                return self._import_neurograph_memory(ng_path)
+        except Exception:
+            pass
+
+        # --- Probe 3: Known filesystem paths ---
+        for candidate in _NEUROGRAPH_KNOWN_PATHS:
+            path = Path(candidate).expanduser()
+            if path.exists():
+                mem = self._import_neurograph_memory(str(path))
+                if mem is not None:
+                    return mem
+
+        return None
+
+    def _neurograph_path_from_registry(self) -> Optional[str]:
+        """Read ETModuleManager registry and return NeuroGraph install path."""
+        if not REGISTRY_PATH.exists():
+            return None
+        with open(REGISTRY_PATH) as f:
+            registry = json.load(f)
+        modules = registry.get("modules", {})
+        ng_entry = modules.get("neurograph", {})
+        install_path = ng_entry.get("install_path", "")
+        return install_path if install_path else None
+
+    def _import_neurograph_memory(self, ng_path: str) -> Optional[Any]:
+        """Dynamically import NeuroGraphMemory from ng_path."""
+        import sys
+
+        orig_path = sys.path[:]
+        try:
+            if ng_path not in sys.path:
+                sys.path.insert(0, ng_path)
+            from openclaw_hook import NeuroGraphMemory
+            return NeuroGraphMemory.get_instance()
+        except Exception as exc:
+            logger.debug(
+                "[%s] Dynamic NeuroGraph import from %s failed: %s",
+                self.module_id, ng_path, exc,
+            )
+            return None
+        finally:
+            sys.path[:] = orig_path
+
+    # -----------------------------------------------------------------
+    # Public API (framework-agnostic)
+    # -----------------------------------------------------------------
+
+    @property
+    def tier(self) -> int:
+        """Current learning tier (1, 2, or 3)."""
+        return self._tier
+
+    @property
+    def tier_name(self) -> str:
+        """Human-readable tier name."""
+        return TIER_NAMES.get(self._tier, "Unknown")
 
     def record_outcome(
         self,
-        module_id: str,
         embedding: np.ndarray,
         target_id: str,
         success: bool,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Record an outcome for a module through the ecosystem.
+        """Record a learning outcome.
 
-        Convenience method that routes through the module's NG-Lite
-        instance (which may forward through bridges).
+        The embedding is the semantic representation of the input.
+        The target_id is an opaque string representing what was decided
+        (e.g., "model:llama3", "threat:prompt_injection", "action:search").
 
-        Args:
-            module_id: Which module is recording.
-            embedding: The input pattern embedding.
-            target_id: What was chosen.
-            success: Whether the outcome was successful.
-            metadata: Additional context.
-
-        Returns:
-            Learning result dict, or None if module not found.
+        Returns enriched response from the active bridge (Tier 2/3) or
+        None if only Tier 1 is active.
         """
-        state = self._modules.get(module_id)
-        if not state:
+        if self._ng is None:
             return None
-
-        return state.ng_lite.record_outcome(
-            embedding=embedding,
-            target_id=target_id,
-            success=success,
-            metadata=metadata,
-        )
+        with self._ops_lock:
+            return self._ng.record_outcome(
+                embedding, target_id, success, metadata=metadata
+            )
 
     def get_recommendations(
         self,
-        module_id: str,
         embedding: np.ndarray,
         top_k: int = 3,
-    ) -> List[Tuple[str, float]]:
-        """Get recommendations for a module through the ecosystem.
+    ) -> Optional[List[Tuple[str, float, str]]]:
+        """Get recommendations from the active learning substrate.
 
-        Args:
-            module_id: Which module is asking.
-            embedding: The input pattern embedding.
-            top_k: Maximum recommendations.
+        Returns list of (target_id, confidence, reasoning) or None.
 
-        Returns:
-            List of (target_id, confidence) tuples.
+        At Tier 1, returns local recommendations only.
+        At Tier 2, includes cross-module peer patterns.
+        At Tier 3, includes full SNN recommendations + hyperedge context.
         """
-        state = self._modules.get(module_id)
-        if not state:
-            return []
+        if self._ng is None:
+            return None
+        with self._ops_lock:
+            return self._ng.get_recommendations(embedding, top_k=top_k)
 
-        return state.ng_lite.get_recommendations(
-            embedding=embedding, top_k=top_k,
-        )
+    def detect_novelty(self, embedding: np.ndarray) -> float:
+        """Return novelty score [0.0=routine, 1.0=completely novel].
 
-    # -------------------------------------------------------------------
-    # Persistence
-    # -------------------------------------------------------------------
-
-    def save_all(self, base_dir: str) -> None:
-        """Save all module NG-Lite states to disk.
-
-        Each module's state is saved to {base_dir}/{module_id}_ng.json.
-
-        Args:
-            base_dir: Directory to save state files.
+        At Tier 2+, novelty is cross-module: something novel to this
+        module but known to a peer scores lower than it would at Tier 1.
         """
-        for module_id, state in self._modules.items():
-            filepath = os.path.join(base_dir, f"{module_id}_ng.json")
+        if self._ng is None:
+            return 1.0  # Conservative: unknown = novel
+        with self._ops_lock:
+            result = self._ng.detect_novelty(embedding)
+            return result if result is not None else 1.0
+
+    def get_context(
+        self,
+        embedding: np.ndarray,
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        """Unified context retrieval for prompt enrichment or decision support.
+
+        Returns a dict suitable for injecting into a prompt or logging:
+          tier:            int — current tier
+          tier_name:       str — human-readable tier
+          recommendations: list of (target_id, confidence, reasoning)
+          novelty:         float — novelty score [0.0, 1.0]
+          ng_context:      str|None — Tier 3 SNN surfaced context if available
+        """
+        recs = self.get_recommendations(embedding, top_k=top_k) or []
+        novelty = self.detect_novelty(embedding)
+        ng_context = None
+
+        # Tier 3: ask NeuroGraph for surfaced cognitive context
+        if self._tier == TIER_FULL_SNN and self._ng_memory is not None:
             try:
-                state.ng_lite.save(filepath)
-            except Exception as e:
-                logger.warning(
-                    "Failed to save NG state for '%s': %s",
-                    module_id, e,
-                )
-
-    def load_all(self, base_dir: str) -> None:
-        """Load all module NG-Lite states from disk.
-
-        Each module's state is loaded from {base_dir}/{module_id}_ng.json
-        if the file exists.
-
-        Args:
-            base_dir: Directory containing state files.
-        """
-        for module_id, state in self._modules.items():
-            filepath = os.path.join(base_dir, f"{module_id}_ng.json")
-            if os.path.exists(filepath):
-                try:
-                    state.ng_lite.load(filepath)
-                    logger.info(
-                        "Loaded NG state for '%s' from %s",
-                        module_id, filepath,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Failed to load NG state for '%s': %s",
-                        module_id, e,
-                    )
-
-    # -------------------------------------------------------------------
-    # Stats & Transparency
-    # -------------------------------------------------------------------
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Ecosystem-wide statistics for transparency/Observatory."""
-        module_stats = {}
-        for module_id, state in self._modules.items():
-            module_stats[module_id] = {
-                "tier": state.tier,
-                "peers": state.peers,
-                "opt_out_sharing": state.opt_out_sharing,
-                "ng_stats": state.ng_lite.get_stats(),
-            }
+                ng_context = self._ng_memory.surface_context(embedding)
+            except Exception:
+                pass
 
         return {
-            "total_modules": len(self._modules),
-            "modules": module_stats,
-            "saas_connected": (
-                self._saas_bridge is not None
-                and self._saas_bridge.is_connected()
-            ),
+            "tier": self._tier,
+            "tier_name": self.tier_name,
+            "recommendations": recs,
+            "novelty": novelty,
+            "ng_context": ng_context,
         }
 
+    def save(self) -> None:
+        """Persist NGLite state to disk."""
+        if self._ng is None:
+            return
+        try:
+            with self._ops_lock:
+                self._ng.save(str(self._state_path))
+            logger.debug("[%s] NGLite state saved to %s", self.module_id, self._state_path)
+        except Exception as exc:
+            logger.warning("[%s] Save failed: %s", self.module_id, exc)
 
-# Need os for save/load paths
-import os
+    def stats(self) -> Dict[str, Any]:
+        """Return unified telemetry for logging, dashboards, or skill SKILL.md output."""
+        ng_stats: Dict[str, Any] = {}
+        if self._ng is not None:
+            try:
+                ng_stats = self._ng.get_stats()
+            except Exception:
+                pass
+
+        peer_stats: Dict[str, Any] = {}
+        if self._peer_bridge is not None:
+            try:
+                peer_stats = self._peer_bridge.get_stats()
+            except Exception:
+                pass
+
+        ng_memory_stats: Dict[str, Any] = {}
+        if self._ng_memory is not None:
+            try:
+                ng_memory_stats = self._ng_memory.stats()
+            except Exception:
+                pass
+
+        return {
+            "ecosystem_version": __version__,
+            "module_id": self.module_id,
+            "tier": self._tier,
+            "tier_name": self.tier_name,
+            "ng_lite": ng_stats,
+            "peer_bridge": peer_stats if peer_stats else None,
+            "ng_memory": (
+                {
+                    "connected": True,
+                    "version": ng_memory_stats.get("version", "unknown"),
+                    "nodes": ng_memory_stats.get("graph", {}).get("node_count", "?"),
+                }
+                if ng_memory_stats else None
+            ),
+            "state_path": str(self._state_path),
+        }
+
+    def shutdown(self) -> None:
+        """Graceful shutdown: save state and stop the upgrade thread."""
+        self._shutdown_event.set()
+        self.save()
+        logger.info("[%s] NGEcosystem shutdown complete", self.module_id)
+
+
+# --------------------------------------------------------------------------
+# Known NeuroGraph install paths (Tier 3 auto-detection)
+# --------------------------------------------------------------------------
+
+_NEUROGRAPH_KNOWN_PATHS: List[str] = [
+    "~/NeuroGraph",
+    "~/.openclaw/skills/neurograph",
+    "/opt/neurograph",
+    "~/.et_modules/modules/neurograph",
+]
+
+
+# --------------------------------------------------------------------------
+# Internal helpers
+# --------------------------------------------------------------------------
+
+def _deep_merge(base: dict, override: dict) -> None:
+    """Recursively merge override into base in-place."""
+    for key, val in override.items():
+        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
+            _deep_merge(base[key], val)
+        else:
+            base[key] = val
+
+
+# --------------------------------------------------------------------------
+# Convenience: module-level quick-start
+# --------------------------------------------------------------------------
+
+def init(
+    module_id: str,
+    state_path: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> NGEcosystem:
+    """One-call initialization for simple module integrations.
+
+    Example:
+        import ng_ecosystem
+        eco = ng_ecosystem.init("trollguard")
+    """
+    return NGEcosystem.get_instance(module_id, state_path, config)

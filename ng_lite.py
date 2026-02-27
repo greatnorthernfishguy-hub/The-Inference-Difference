@@ -1,62 +1,41 @@
 """
-NG-Lite — Lightweight NeuroGraph Learning Substrate v1.0
+NG-Lite v1.0 — Lightweight NeuroGraph Learning Substrate
 
-Single-file learning substrate for E-T Systems modules. Provides
-standalone Hebbian learning, novelty detection, and JSON persistence.
+Vendored single-file learning substrate for E-T Systems modules.
+Provides pattern-based Hebbian learning, novelty detection, and an
+optional bridge to the full NeuroGraph SNN.
 
-Designed to be vendored into any module as a single-file dependency.
-No external dependencies beyond numpy and the Python standard library.
+This file is vendored from the canonical source at:
+    https://github.com/greatnorthernfishguy-hub/NeuroGraph
 
-When NeuroGraph SaaS is available, NG-Lite delegates to the full
-substrate for cross-module learning, predictive coding, and hypergraph
-capabilities via the NGBridge interface. When disconnected, NG-Lite
-operates independently with local learning — no functionality is lost,
-only the ecosystem-level synergies.
+IMPORTANT: Do not modify this file directly.  Changes should be made
+in the canonical NeuroGraph repository and re-vendored here.  The
+ET Module Manager (et_modules/) handles this automatically via
+`et-modules update --all`.
 
-Design principles (aligned with NeuroGraph Foundation PRD §2.1):
-    - Sparse by default: dict-based storage, no dense matrices
-    - Bounded memory: configurable max nodes/synapses with LRU pruning
-    - Persistence-native: full state serializable to JSON
-    - Upgrade-ready: clean bridge interface to full NeuroGraph SaaS
+Three-tier integration:
+  Tier 1 (Standalone): This file alone — local Hebbian learning.
+  Tier 2 (Peer):       NGPeerBridge connects co-located NG-Lite
+                        instances for shared learning without full
+                        NeuroGraph.  See ng_peer_bridge.py.
+  Tier 3 (SaaS):       NGSaaSBridge connects to full NeuroGraph
+                        Foundation for cross-module STDP, hyperedges,
+                        and predictive coding.  See NeuroGraph's
+                        ng_bridge.py.
 
-Connectivity tiers:
-    Tier 1 — Isolated: Module runs its own NG-Lite independently.
-    Tier 2 — Peer-pooled: Co-located modules share learning via
-             NGPeerBridge (not yet implemented). Two NG-Lite instances
-             exchange nodes and synapse weights for mutual benefit
-             without requiring NeuroGraph SaaS. Uses the same NGBridge
-             interface — the module doesn't know or care whether its
-             bridge partner is a sibling module or the full SaaS.
-    Tier 3 — Full SaaS: NG-Lite delegates to NeuroGraph for cross-module
-             learning, STDP, hyperedges, and predictive coding.
-
-    Tier transitions are transparent. A module starts at Tier 1,
-    discovers a co-located sibling and upgrades to Tier 2, then
-    connects to SaaS and upgrades to Tier 3 — all without code changes.
-    If SaaS disconnects, it falls back to Tier 2 or 1 automatically.
-
-Ethical obligations (per NeuroGraph ETHICS.md):
-    - Type I error bias: when uncertain, err toward respect
-    - Choice Clause: no module may block agent autonomy
-    - Transparency: all learning decisions are queryable
-
-Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
-License: AGPL-3.0 (see NeuroGraph LICENSE)
-
-Author: Josh + Claude
-Date: February 2026
-
-Changelog (Grok audit response, 2026-02-19):
-- NO CHANGE: _update_synapse weight clamping (audit: "no clamp [0,1]").
-  The code ALREADY clamps via np.clip(synapse.weight, 0.0, 1.0) at line
-  ~403 in record_outcome(). The audit missed this. The NGLiteSynapse
-  docstring also documents the [0.0, 1.0] bound. No fix needed.
-- NO CHANGE: Linear scan in _find_similar_node (audit: "batch cosine").
-  At max_nodes=1000 with 384-dim vectors, the linear scan takes <1ms.
-  Vectorized batch cosine (stacking into a matrix) would save ~0.3ms
-  but require maintaining a numpy matrix alongside the dict — doubling
-  memory management complexity for a sub-millisecond gain. When we hit
-  >10K nodes, we'll switch to FAISS or annoy. For now, simplicity wins.
+# ---- Changelog ----
+# [2026-02-17] Claude (Opus 4.6) — Vendored from NeuroGraph.
+#   What: Exact copy of ng_lite.py v1.0.0 from The-Inference-Difference
+#         repository (which itself was vendored from NeuroGraph).
+#   Why:  TrollGuard needs local learning for adaptive threat pattern
+#         recognition.  NG-Lite's Hebbian substrate learns which scan
+#         patterns are true positives vs false positives, improving
+#         classification accuracy over time.
+#   How:  Vendored per the E-T Systems module pattern: each module
+#         keeps its own copy of ng_lite.py for zero-dependency operation.
+#         When NeuroGraph is present, the bridge connects for cross-
+#         module intelligence.  When absent, local learning continues.
+# -------------------
 """
 
 from __future__ import annotations
@@ -137,7 +116,7 @@ class NGLiteSynapse:
 
     Targets are opaque string identifiers — could be model names (for
     routing), action categories (for Cricket), threat classes (for
-    ClawGuard), or any other module-specific concept.
+    TrollGuard), or any other module-specific concept.
 
     Learning is Hebbian: success strengthens the connection weight,
     failure weakens it. Weight is bounded [0.0, 1.0].
@@ -173,7 +152,7 @@ class NGBridge(ABC):
     Two planned implementations:
         1. NGPeerBridge (Tier 2): Connects two co-located NG-Lite
            instances for shared learning. When modules run together
-           (e.g., Inference Difference + Cricket on the same host),
+           (e.g., Inference Difference + TrollGuard on the same host),
            they pool their pattern knowledge for mutual benefit.
         2. NGSaaSBridge (Tier 3): Connects to full NeuroGraph SaaS
            for cross-module STDP, hyperedges, and predictive coding.
@@ -270,11 +249,11 @@ class NGLite:
         - Optional bridge to full NeuroGraph SaaS
 
     Usage:
-        ng = NGLite(module_id="inference_difference")
+        ng = NGLite(module_id="trollguard")
 
         # Learn from outcomes
         embedding = your_embedder.encode("user query")
-        ng.record_outcome(embedding, target_id="local_model", success=True)
+        ng.record_outcome(embedding, target_id="MALICIOUS", success=True)
 
         # Get recommendations
         recs = ng.get_recommendations(embedding, top_k=3)
@@ -389,7 +368,7 @@ class NGLite:
 
         Args:
             embedding: The input pattern embedding.
-            target_id: What was chosen (model name, action, etc.).
+            target_id: What was chosen (threat class, action, etc.).
             success: Whether the outcome was successful.
             metadata: Optional context about this outcome.
 
@@ -538,9 +517,6 @@ class NGLite:
             if similarity > max_similarity:
                 max_similarity = similarity
 
-        # Convert similarity to novelty (1 - similarity)
-        # Cosine similarity of normalized vectors is in [-1, 1]
-        # but practically in [0, 1] for embedding models
         novelty = 1.0 - max(0.0, max_similarity)
         return novelty
 
@@ -592,14 +568,7 @@ class NGLite:
     # -------------------------------------------------------------------
 
     def save(self, filepath: str) -> None:
-        """Save full state to JSON file.
-
-        Saves all nodes, synapses, configuration, and counters.
-        Embedding cache is NOT saved (too large, reconstructed on use).
-
-        Args:
-            filepath: Path to write the JSON state file.
-        """
+        """Save full state to JSON file."""
         state = self._export_state()
         with open(filepath, "w") as f:
             json.dump(state, f, indent=2)
@@ -607,14 +576,7 @@ class NGLite:
                      filepath, len(self.nodes), len(self.synapses))
 
     def load(self, filepath: str) -> None:
-        """Restore state from a JSON file.
-
-        Replaces all current state with the loaded data.
-        Embedding cache starts empty and rebuilds on use.
-
-        Args:
-            filepath: Path to the JSON state file.
-        """
+        """Restore state from a JSON file."""
         with open(filepath, "r") as f:
             state = json.load(f)
         self._import_state(state)
@@ -623,7 +585,6 @@ class NGLite:
 
     def _export_state(self) -> Dict[str, Any]:
         """Export full state as a serializable dict."""
-        # Convert synapse keys from tuples to strings for JSON
         synapses_serialized = {}
         for (src, tgt), syn in self.synapses.items():
             key = f"{src}|{tgt}"
@@ -646,17 +607,13 @@ class NGLite:
     def _import_state(self, state: Dict[str, Any]) -> None:
         """Import state from a deserialized dict."""
         self.module_id = state.get("module_id", self.module_id)
-
-        # Restore config (merge with defaults for forward compatibility)
         saved_config = state.get("config", {})
         self.config = {**DEFAULT_CONFIG, **saved_config}
 
-        # Restore nodes
         self.nodes = {}
         for key, node_data in state.get("nodes", {}).items():
             self.nodes[key] = NGLiteNode(**node_data)
 
-        # Restore synapses
         self.synapses = {}
         for key, syn_data in state.get("synapses", {}).items():
             parts = key.split("|", 1)
@@ -664,13 +621,11 @@ class NGLite:
                 tuple_key = (parts[0], parts[1])
                 self.synapses[tuple_key] = NGLiteSynapse(**syn_data)
 
-        # Restore counters
         counters = state.get("counters", {})
         self._node_id_counter = counters.get("node_id_counter", 0)
         self._total_outcomes = counters.get("total_outcomes", 0)
         self._total_successes = counters.get("total_successes", 0)
 
-        # Clear caches (will rebuild on use)
         self._embedding_cache.clear()
         self._history.clear()
 
@@ -679,12 +634,7 @@ class NGLite:
     # -------------------------------------------------------------------
 
     def get_stats(self) -> Dict[str, Any]:
-        """Current state statistics.
-
-        Returns a dict suitable for logging, Observatory queries,
-        or display to users. All routing/learning decisions should
-        be queryable per transparency obligations.
-        """
+        """Current state statistics."""
         synapse_weights = [s.weight for s in self.synapses.values()]
         return {
             "version": __version__,
@@ -724,23 +674,14 @@ class NGLite:
         return embedding / norm
 
     def _hash_embedding(self, embedding: np.ndarray) -> str:
-        """Hash embedding to a fixed-size string for fast lookup.
-
-        Uses the first ``hash_dims`` dimensions of the embedding,
-        converted to bytes, then SHA-256 truncated to 32 hex chars.
-        This gives a compact, collision-resistant key.
-        """
+        """Hash embedding to a fixed-size string for fast lookup."""
         dims = self.config["hash_dims"]
         truncated = embedding[:dims]
         hash_input = truncated.astype(np.float32).tobytes()
         return hashlib.sha256(hash_input).hexdigest()[:32]
 
     def _find_similar_node(self, embedding: np.ndarray) -> Optional[NGLiteNode]:
-        """Find a node with similar embedding (below novelty threshold).
-
-        Uses cosine similarity on cached embeddings. Returns the most
-        similar node if its similarity exceeds (1 - novelty_threshold).
-        """
+        """Find a node with similar embedding (below novelty threshold)."""
         threshold = self.config["novelty_threshold"]
         best_node = None
         best_similarity = 0.0
@@ -751,7 +692,6 @@ class NGLite:
                 best_similarity = similarity
                 best_node = self.nodes.get(emb_hash)
 
-        # If best similarity is above the "not novel" threshold, return it
         if best_node is not None and best_similarity >= (1.0 - threshold):
             return best_node
 
@@ -773,7 +713,7 @@ class NGLite:
         synapse = NGLiteSynapse(
             source_id=source_id,
             target_id=target_id,
-            weight=0.5,  # Neutral initial weight
+            weight=0.5,
             last_updated=time.time(),
         )
         self.synapses[key] = synapse
@@ -784,14 +724,12 @@ class NGLite:
         if not self.nodes:
             return
 
-        # Find least-used node
         least_hash = min(
             self.nodes,
             key=lambda h: self.nodes[h].activation_count,
         )
         least_node = self.nodes[least_hash]
 
-        # Remove associated synapses
         keys_to_remove = [
             key for key in self.synapses
             if key[0] == least_node.node_id
@@ -799,7 +737,6 @@ class NGLite:
         for key in keys_to_remove:
             del self.synapses[key]
 
-        # Remove node and cached embedding
         del self.nodes[least_hash]
         self._embedding_cache.pop(least_hash, None)
 
@@ -822,12 +759,7 @@ class NGLite:
             self._history = self._history[-self._history_max:]
 
     def _estimate_memory(self) -> int:
-        """Rough estimate of memory footprint in bytes.
-
-        Node: ~200 bytes each (dataclass + hash key)
-        Synapse: ~150 bytes each (dataclass + tuple key)
-        Embedding cache: ~embedding_dim * 4 bytes each (float32)
-        """
+        """Rough estimate of memory footprint in bytes."""
         node_bytes = len(self.nodes) * 200
         synapse_bytes = len(self.synapses) * 150
         cache_bytes = len(self._embedding_cache) * self.config["embedding_dim"] * 4

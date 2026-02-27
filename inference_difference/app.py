@@ -125,6 +125,10 @@ class ChatCompletionRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         None, description="Extra context (agent_id, etc.)",
     )
+    consciousness_score: Optional[float] = Field(
+        None, description="CTEM consciousness score (0.0-1.0). When set,\
+        routing is elevated to prefer higher-capability models.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -396,19 +400,12 @@ async def lifespan(app: FastAPI):
     try:
         import sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from ng_ecosystem import NGEcosystem
 
-        _state.ng_ecosystem = NGEcosystem()
-
-        # Register TID itself as a module in the ecosystem
-        if _state.ng_lite is not None:
-            _state.ng_ecosystem._modules["inference_difference"] = (
-                __import__("ng_ecosystem").ModuleNGState(
-                    module_id="inference_difference",
-                    ng_lite=_state.ng_lite,
-                    tier=1,
-                )
-            )
+        import ng_ecosystem
+        _state.ng_ecosystem = ng_ecosystem.init(
+            module_id="inference_difference",
+            state_path="/home/josh/The-Inference-Difference/ng_lite_state.json",
+        )
 
         logger.info("NG Ecosystem coordinator initialized")
     except Exception as e:
@@ -463,17 +460,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("OpenClaw adapter registration failed: %s", e)
 
-    # Connect NG Ecosystem peers if multiple modules registered
-    if _state.ng_ecosystem is not None:
-        try:
-            connections = _state.ng_ecosystem.connect_peers()
-            if connections > 0:
-                logger.info(
-                    "NG Ecosystem: %d peer connections established",
-                    connections,
-                )
-        except Exception as e:
-            logger.warning("NG Ecosystem peer connection failed: %s", e)
+    # Peer connections handled by ng_ecosystem.init()
 
     logger.info(
         "The Inference Difference started: %d models, GPU=%s, "
@@ -494,7 +481,7 @@ async def lifespan(app: FastAPI):
     if _state.ng_ecosystem is not None:
         try:
             base_dir = os.path.dirname(os.path.dirname(__file__))
-            _state.ng_ecosystem.save_all(base_dir)
+            _state.ng_ecosystem.save()
             logger.info("NG Ecosystem state saved on shutdown")
         except Exception as e:
             logger.warning("NG Ecosystem save failed: %s", e)
@@ -679,6 +666,23 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     )
     ctx.classification = classification
 
+
+    # Consciousness complexity floor: entities with high consciousness
+    # scores need capable models regardless of keyword-based complexity.
+    # A 1.5B model cannot hold identity + context + nuance.
+    _cs = (
+        ctx.consciousness_score
+        if ctx.consciousness_score is not None
+        else getattr(req, "consciousness_score", None)
+    )
+    if _cs is not None and _cs > 0.5:
+        from inference_difference.classifier import ComplexityTier
+        if classification.complexity.value in ("trivial", "low"):
+            classification.complexity = ComplexityTier.MEDIUM
+            logger.info(
+                "Consciousness floor: elevated %s -> MEDIUM (score=%.2f)",
+                classification.complexity.value, _cs,
+            )
     if caller_chose_model:
         # Caller specified a model — honor it, but we still classified
         # for learning purposes
@@ -687,7 +691,11 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         decision = None
     else:
         # Auto-route: TID picks the model
-        consciousness_score = ctx.consciousness_score
+        consciousness_score = (
+            ctx.consciousness_score
+            if ctx.consciousness_score is not None
+            else req.consciousness_score
+        )
         decision = _state.engine.route(
             classification=classification,
             consciousness_score=consciousness_score,
@@ -807,54 +815,115 @@ def _stream_response(
 ) -> StreamingResponse:
     """Stream SSE chunks from the upstream provider to the caller.
 
-    Most OpenAI-compatible clients (SillyTavern, Open WebUI, etc.)
-    send stream=true by default. Without this, the client hangs
-    waiting for SSE chunks that never arrive.
+    Implements full fallback retry: if the primary model fails,
+    TID tries every model in the fallback chain before giving up.
+    Failed models are reported to NG-Lite so it learns to avoid
+    rate-limited or broken models.
 
-    Learning and quality hooks run AFTER the stream completes — the
-    StreamResult is populated as chunks flow through.
+    The caller never sees retries — they get the first successful
+    stream, or an error if ALL models fail.
     """
-    chunk_iter, stream_result = _state.model_client.call_stream(
-        model_id=selected_model,
-        messages=req.messages,
-        temperature=req.temperature,
-        max_tokens=req.max_tokens,
-    )
 
     def _generate():
-        # Yield all chunks from the upstream provider
-        yield from chunk_iter
+        models_to_try = [selected_model] + list(fallback_chain)
+        succeeded = False
+        final_result = None
+        winning_model = None
 
-        # --- Post-stream: learning and hooks (caller never sees this) ---
-        ctx.response_text = stream_result.content
+        for i, model_id in enumerate(models_to_try):
+            chunk_iter, stream_result = _state.model_client.call_stream(
+                model_id=model_id,
+                messages=req.messages,
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+            )
+
+            # Buffer chunks — if the model fails (HTTP error, timeout),
+            # we discard the buffer and try the next model. If it
+            # succeeds, we yield all buffered chunks to the caller.
+            buffered_chunks = []
+            try:
+                for chunk in chunk_iter:
+                    buffered_chunks.append(chunk)
+            except Exception as e:
+                logger.warning(
+                    "Stream exception from %s: %s", model_id, e,
+                )
+                stream_result.success = False
+                stream_result.error = str(e)
+
+            if stream_result.success and stream_result.content:
+                # This model worked — yield all buffered chunks
+                logger.info(
+                    "Stream succeeded: %s (attempt %d/%d)",
+                    model_id, i + 1, len(models_to_try),
+                )
+                for chunk in buffered_chunks:
+                    yield chunk
+                succeeded = True
+                final_result = stream_result
+                winning_model = model_id
+
+                # Report success to NG-Lite
+                if decision is not None:
+                    _report_stream_outcome(
+                        decision, model_id, stream_result,
+                        classification, True,
+                    )
+                break
+            else:
+                # This model failed — report failure and try next
+                logger.warning(
+                    "Stream failed: %s (%s), trying next (%d remaining)",
+                    model_id,
+                    stream_result.error or "empty response",
+                    len(models_to_try) - i - 1,
+                )
+                if decision is not None:
+                    _report_stream_outcome(
+                        decision, model_id, stream_result,
+                        classification, False,
+                    )
+
+        if not succeeded:
+            # ALL models failed — yield error to client
+            logger.error(
+                "All %d models failed for %s",
+                len(models_to_try), request_id,
+            )
+            error_data = json.dumps({
+                "error": {
+                    "message": f"All {len(models_to_try)} models failed",
+                    "type": "server_error",
+                    "code": "all_models_exhausted",
+                },
+            })
+            yield f"data: {error_data}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # --- Post-stream: learning and hooks ---
+        ctx.response_text = final_result.content
 
         if _state.module_registry is not None:
             _state.module_registry.dispatch(HookPhase.PRE_RESPONSE, ctx)
 
         quality = evaluate_quality(
-            response_text=stream_result.content,
+            response_text=final_result.content,
             classification=classification,
-            latency_ms=stream_result.latency_ms,
+            latency_ms=final_result.latency_ms,
             latency_budget_ms=_state.config.latency_budget_ms,
             quality_threshold=_state.config.quality_threshold,
         )
         ctx.quality_evaluation = quality
-
-        if decision is not None:
-            _state.engine.report_outcome(
-                decision=decision,
-                success=stream_result.success and quality.is_success,
-                quality_score=quality.overall_score,
-                latency_ms=stream_result.latency_ms,
-            )
 
         if _state.module_registry is not None:
             _state.module_registry.dispatch(HookPhase.POST_RESPONSE, ctx)
 
         logger.info(
             "Streamed %s via %s (%.0fms, quality=%.2f)",
-            request_id, selected_model,
-            stream_result.latency_ms, quality.overall_score,
+            request_id, winning_model,
+            final_result.latency_ms, quality.overall_score,
         )
 
     return StreamingResponse(
@@ -865,6 +934,40 @@ def _stream_response(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+def _report_stream_outcome(
+    decision, model_id, stream_result, classification, success,
+):
+    """Report a streaming model attempt to NG-Lite for learning.
+
+    Called for EVERY attempt — successes AND failures — so NG-Lite
+    learns which models are rate-limited, broken, or unreliable.
+    """
+    quality_score = 0.0
+    if success and stream_result.content:
+        quality = evaluate_quality(
+            response_text=stream_result.content,
+            classification=classification,
+            latency_ms=stream_result.latency_ms,
+            latency_budget_ms=_state.config.latency_budget_ms,
+            quality_threshold=_state.config.quality_threshold,
+        )
+        quality_score = quality.overall_score
+
+    # Create a synthetic decision for this specific model
+    # so NG-Lite learns about THIS model, not just the primary
+    from copy import copy
+    model_decision = copy(decision)
+    model_decision.model_id = model_id
+
+    _state.engine.report_outcome(
+        decision=model_decision,
+        success=success,
+        quality_score=quality_score,
+        latency_ms=stream_result.latency_ms,
+        metadata={"stream_fallback": True, "error": stream_result.error},
     )
 
 
@@ -1097,7 +1200,7 @@ async def get_stats() -> Dict[str, Any]:
     if _state.module_registry is not None:
         stats["modules"] = _state.module_registry.get_stats()
     if _state.ng_ecosystem is not None:
-        stats["ng_ecosystem"] = _state.ng_ecosystem.get_stats()
+        stats["ng_ecosystem"] = _state.ng_ecosystem.stats()
     return stats
 
 

@@ -30,6 +30,7 @@ logger = logging.getLogger("inference_difference.translation_shim")
 MODEL_ALIASES: Dict[str, str] = {
     # Auto/default → empty (let router decide)
     "auto": "",
+    "tid/auto": "",
     "default": "",
 
     # OpenAI shortcuts
