@@ -1,60 +1,89 @@
 """
-NG Peer Bridge — Tier 2 Cross-Module Learning Without Full NeuroGraph
+NGPeerBridge — Tier 2 Cross-Module Learning for E-T Systems
 
-Connects co-located NG-Lite instances for shared learning.  When
-multiple E-T Systems modules run on the same host (e.g., TrollGuard +
-The-Inference-Difference + Cricket), they pool their pattern knowledge
-for mutual benefit — without requiring the full NeuroGraph SNN.
+Connects co-located NG-Lite instances for shared learning without
+requiring the full NeuroGraph SNN infrastructure.  Each module writes
+learning events to a JSONL file in a shared directory; peers read each
+other's files periodically and absorb relevant patterns through
+embedding similarity.
 
-This is the "they should act as one when used together" mechanism:
-modules remain independent but share learning through a lightweight
-shared state directory.  Each module's NG-Lite instance connects via
-NGPeerBridge, which:
-  1. Writes outcomes to a shared JSONL event log
-  2. Periodically reads other modules' events
-  3. Merges relevant cross-module learning into local state
-  4. Provides cross-module novelty detection and recommendations
+This is the lightweight coordination layer — no central server, no
+daemon, no network traffic.  Just shared files on local disk.
 
-The shared state directory defaults to ~/.et_modules/shared_learning/
-and is used by the ET Module Manager for coordinated updates.
+Directory structure:
+    ~/.et_modules/shared_learning/
+    ├── neurograph.jsonl            # NeuroGraph's events
+    ├── trollguard.jsonl            # TrollGuard's events
+    ├── inference_difference.jsonl  # TID's events
+    └── _peer_registry.json         # Active module registry
 
-Performance: The peer bridge adds <5ms overhead per operation (file I/O
-to local disk).  Cross-module sync happens asynchronously on a timer
-or explicit call, not on every outcome.
+Usage:
+    from ng_lite import NGLite
+    from ng_peer_bridge import NGPeerBridge
 
-Canonical source: https://github.com/greatnorthernfishguy-hub/TrollGuard
-(First implementation; will be upstreamed to NeuroGraph once stabilized)
+    bridge = NGPeerBridge(module_id="neurograph")
+    ng = NGLite(module_id="neurograph")
+    ng.connect_bridge(bridge)
+
+    # Outcomes are now shared with sibling modules on this host.
+    # Cross-module intelligence flows automatically.
+
+Connectivity tiers (from ng_lite.py):
+    Tier 1 — Isolated: standalone NG-Lite
+    Tier 2 — Peer-pooled: THIS bridge. Co-located modules share via files.
+    Tier 3 — Full SaaS: NGSaaSBridge to full NeuroGraph Foundation.
+
+    A module can have both bridges active: NGPeerBridge for sibling
+    modules, and NGSaaSBridge for the full SNN.  The bridge-first API
+    in NG-Lite checks the connected bridge before falling back to local.
+
+Canonical source: https://github.com/greatnorthernfishguy-hub/NeuroGraph
+License: AGPL-3.0
 
 # ---- Changelog ----
-# [2026-02-19] Claude (Opus 4.6) — Grok security audit: fcntl file locking.
-#   What: Added fcntl.LOCK_EX on event file appends and LOCK_SH on peer
-#         reads during sync, plus LOCK_EX on peer registry writes.
-#   Why:  Grok flagged that concurrent modules (trollguard + TID +
-#         cricket) writing to their own JSONL and reading each other's
-#         files can hit partial-line reads.  Advisory locks coordinate.
-#   How:  fcntl.flock() with graceful no-op on non-POSIX platforms.
-#
 # [2026-02-17] Claude (Opus 4.6) — Initial creation.
-#   What: NGPeerBridge implementing the NGBridge ABC from ng_lite.py.
-#         Provides Tier 2 peer-to-peer learning between co-located
-#         NG-Lite instances via shared filesystem state.
-#   Why:  The user wants modules to "act as one when used together"
-#         without requiring the full NeuroGraph Foundation.  This
-#         fills the gap between Tier 1 (standalone) and Tier 3 (full
-#         SNN).  With 6+ planned modules, manual per-module updates
-#         are impractical — shared learning must be automatic.
-#   Settings: shared_dir defaults to ~/.et_modules/shared_learning/
-#         because the ET Module Manager already uses ~/.et_modules/
-#         as its root.  sync_interval=100 outcomes (sync after every
-#         100 recorded outcomes, not on every call — balances freshness
-#         vs disk I/O).  relevance_threshold=0.3 (only absorb cross-
-#         module events with >0.3 similarity to local patterns).
-#   How:  Each module writes JSONL events to shared_dir/<module_id>.jsonl.
-#         On sync, reads other modules' event files, computes embedding
-#         similarity against local patterns, and absorbs relevant ones
-#         via record_outcome().  The "peer" model avoids any central
-#         server or daemon — just shared files on local disk.
+#   What: NGPeerBridge class implementing NGBridge interface for Tier 2
+#         cross-module learning via shared filesystem event logs.
+#   Why:  Enables co-located E-T Systems modules (TrollGuard, TID,
+#         NeuroGraph, Cricket) to share learning patterns without
+#         requiring the full SNN.  This is the "middle tier" between
+#         isolated local learning and full SaaS integration.
+#   Settings: sync_interval=100 (sync every 100 outcomes — balances
+#         freshness vs I/O), relevance_threshold=0.3 (permissive enough
+#         to catch cross-domain patterns), peer_events_max=500 (bounded
+#         memory for cached events).
+#   How:  File-based exchange.  Each module appends JSONL events to its
+#         own file.  Periodic sync reads peers' files from last-known
+#         position (no re-reading).  Recommendations scored by embedding
+#         cosine similarity.
 # -------------------
+#
+# ---- Grok Review Changelog (v0.7.1) ----
+# Accepted: Added module_id validation in _sync_from_peers() — only accepts
+#     events from peers listed in the _peer_registry.json, filtering out
+#     orphaned or unrecognized JSONL files.
+# Rejected: 'Security Hole — reads all *.jsonl without auth' — The shared
+#     directory is ~/.et_modules/ (user-owned, mode 0700 on Linux).  All
+#     co-located modules run under the same user.  If an attacker has write
+#     access to the user's home directory, filesystem-level auth would not
+#     help.  Module ID validation (now added) provides sufficient filtering.
+# Rejected: 'Race Conditions — no file locks on seek/read' — JSONL is
+#     append-only.  Each line is either fully written or not.  The worst
+#     case (partial last line) is already handled by the json.loads
+#     try/except.  Adding fcntl.lockf() would add platform-specific
+#     complexity (Windows incompatible) for no practical benefit.
+# Rejected: 'NGSaaSBridge sync_state() is one-way' — Intentional.  NG-Lite
+#     is a lightweight Hebbian substrate; pulling SNN predictions, hyperedges,
+#     and STDP state back into it would defeat its purpose as a simple,
+#     vendorable single-file module.  Cross-module intelligence flows
+#     upward (Lite → Full) by design; enriched recommendations flow back
+#     through the bridge.get_recommendations() API.
+# Rejected: '_normalize() duplicates np.linalg.norm' — The 3-line static
+#     method exists in both ng_lite.py and ng_peer_bridge.py because peer
+#     bridge imports only NGBridge (the abstract interface), not private
+#     methods.  The duplication is deliberate: ng_peer_bridge.py must remain
+#     independent of ng_lite.py's internals.
+# -------------------------------------------
 """
 
 from __future__ import annotations
@@ -67,12 +96,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-
-try:
-    import fcntl
-    _HAS_FCNTL = True
-except ImportError:
-    _HAS_FCNTL = False
 
 from ng_lite import NGBridge
 
@@ -91,10 +114,10 @@ class NGPeerBridge(NGBridge):
         from ng_peer_bridge import NGPeerBridge
 
         # Create the peer bridge
-        bridge = NGPeerBridge(module_id="trollguard")
+        bridge = NGPeerBridge(module_id="neurograph")
 
         # Connect it to your NG-Lite instance
-        ng = NGLite(module_id="trollguard")
+        ng = NGLite(module_id="neurograph")
         ng.connect_bridge(bridge)
 
         # Now outcomes are shared with other modules on this host.
@@ -102,9 +125,9 @@ class NGPeerBridge(NGBridge):
 
     Directory structure:
         ~/.et_modules/shared_learning/
+        ├── neurograph.jsonl          # NeuroGraph's events
         ├── trollguard.jsonl          # TrollGuard's events
         ├── inference_difference.jsonl # TID's events
-        ├── cricket.jsonl             # Cricket's events
         └── _peer_registry.json       # Active module registry
     """
 
@@ -117,7 +140,7 @@ class NGPeerBridge(NGBridge):
     ):
         """
         Args:
-            module_id: This module's identifier (e.g., "trollguard").
+            module_id: This module's identifier (e.g., "neurograph").
             shared_dir: Path to shared learning directory.
                        Defaults to ~/.et_modules/shared_learning/
             sync_interval: Sync with peers every N recorded outcomes.
@@ -196,12 +219,7 @@ class NGPeerBridge(NGBridge):
 
         try:
             with open(self._event_file, "a") as f:
-                if _HAS_FCNTL:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 f.write(json.dumps(event, default=str) + "\n")
-                f.flush()
-                if _HAS_FCNTL:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except OSError as e:
             logger.warning("Failed to write peer event: %s", e)
             return None
@@ -235,9 +253,8 @@ class NGPeerBridge(NGBridge):
         """Get recommendations from peer modules' learned patterns.
 
         Searches cached peer events for similar embeddings and returns
-        their targets as recommendations.  This is how TrollGuard can
-        benefit from The-Inference-Difference's routing knowledge, and
-        vice versa.
+        their targets as recommendations.  This is how NeuroGraph can
+        benefit from TrollGuard's security knowledge, and vice versa.
         """
         if not self._connected or not self._peer_events:
             return None
@@ -291,8 +308,7 @@ class NGPeerBridge(NGBridge):
 
         Checks if this embedding is novel not just to this module,
         but to ALL peer modules on this host.  Something that
-        TrollGuard has never seen might be well-known to
-        The-Inference-Difference.
+        NeuroGraph has never seen might be well-known to TrollGuard.
         """
         if not self._connected or not self._peer_events:
             return None
@@ -356,9 +372,26 @@ class NGPeerBridge(NGBridge):
     # -------------------------------------------------------------------
 
     def _sync_from_peers(self) -> None:
-        """Read new events from all peer modules' event files."""
+        """Read new events from all peer modules' event files.
+
+        Only reads from peers listed in the _peer_registry.json to filter
+        out orphaned or unrecognized JSONL files (Grok review: peer validation).
+        """
         self._sync_count += 1
         self._last_sync_time = time.time()
+
+        # Load registered peers for validation (Grok review: peer filtering)
+        registered_peers: set = set()
+        registry_path = self._shared_dir / "_peer_registry.json"
+        try:
+            if registry_path.exists():
+                with open(registry_path, "r") as f:
+                    registry = json.load(f)
+                registered_peers = set(registry.get("modules", {}).keys())
+                # Remove self — we only care about OTHER registered peers
+                registered_peers.discard(self.module_id)
+        except (OSError, json.JSONDecodeError):
+            pass  # If registry is unreadable, fall back to accepting all
 
         new_events: List[Dict[str, Any]] = []
 
@@ -366,14 +399,21 @@ class NGPeerBridge(NGBridge):
             peer_module = event_file.stem
             if peer_module == self.module_id:
                 continue  # Skip own file
+            if peer_module.startswith("_"):
+                continue  # Skip meta-files like _peer_registry
+            # Only filter if other peers ARE registered — if none are,
+            # accept all files (new module just starting up).
+            if registered_peers and peer_module not in registered_peers:
+                logger.debug(
+                    "Skipping unregistered peer file: %s", event_file.name
+                )
+                continue
 
             # Read from last known position
             last_pos = self._peer_read_positions.get(peer_module, 0)
 
             try:
                 with open(event_file, "r") as f:
-                    if _HAS_FCNTL:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
                     f.seek(last_pos)
                     for line in f:
                         line = line.strip()
@@ -384,8 +424,6 @@ class NGPeerBridge(NGBridge):
                             except json.JSONDecodeError:
                                 pass
                     self._peer_read_positions[peer_module] = f.tell()
-                    if _HAS_FCNTL:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             except OSError as e:
                 logger.warning("Failed to read peer file %s: %s", event_file, e)
 
@@ -406,40 +444,24 @@ class NGPeerBridge(NGBridge):
     # -------------------------------------------------------------------
 
     def _register_module(self) -> None:
-        """Register this module in the peer registry (exclusive-locked)."""
+        """Register this module in the peer registry."""
         registry_path = self._shared_dir / "_peer_registry.json"
 
         try:
-            # Open in r+ or create if missing, all under exclusive lock
             if registry_path.exists():
-                with open(registry_path, "r+") as f:
-                    if _HAS_FCNTL:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                with open(registry_path, "r") as f:
                     registry = json.load(f)
-                    registry["modules"][self.module_id] = {
-                        "registered_at": time.time(),
-                        "event_file": str(self._event_file),
-                        "pid": os.getpid(),
-                    }
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(registry, f, indent=2)
-                    f.flush()
-                    if _HAS_FCNTL:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             else:
-                registry = {"modules": {self.module_id: {
-                    "registered_at": time.time(),
-                    "event_file": str(self._event_file),
-                    "pid": os.getpid(),
-                }}}
-                with open(registry_path, "w") as f:
-                    if _HAS_FCNTL:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    json.dump(registry, f, indent=2)
-                    f.flush()
-                    if _HAS_FCNTL:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                registry = {"modules": {}}
+
+            registry["modules"][self.module_id] = {
+                "registered_at": time.time(),
+                "event_file": str(self._event_file),
+                "pid": os.getpid(),
+            }
+
+            with open(registry_path, "w") as f:
+                json.dump(registry, f, indent=2)
 
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("Failed to update peer registry: %s", e)
