@@ -127,6 +127,7 @@ DEFAULT_SCORING_WEIGHTS = {
     "cost_efficiency": 0.15,
     "latency_fit": 0.10,
     "priority_bonus": 0.10,
+    "conversational_quality": 0.0,
 }
 
 
@@ -194,6 +195,23 @@ class RoutingEngine:
         # Get candidate models
         candidates = self._filter_candidates(classification)
 
+        _interactive_active = getattr(classification, 'is_interactive', False)
+        _original_weights = None
+        if _interactive_active:
+            floor = self.config.interactive_priority_floor
+            interactive_candidates = [
+                m for m in candidates if m.priority >= floor
+            ]
+            if interactive_candidates:
+                candidates = interactive_candidates
+            _original_weights = dict(self._weights)
+            self._weights["conversational_quality"] = (
+                self.config.interactive_quality_weight
+            )
+            self._weights["cost_efficiency"] = max(
+                _original_weights.get("cost_efficiency", 0.15) - 0.05, 0.05
+            )
+
         if not candidates:
             return self._no_candidates_decision(rid, classification)
 
@@ -207,6 +225,17 @@ class RoutingEngine:
 
         # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)
+
+        if _interactive_active and len(scored) >= 2:
+            best_score_val = scored[0][1]
+            second_score_val = scored[1][1]
+            margin = getattr(self.config, 'interactive_type1_bias', 0.05)
+            if best_score_val - second_score_val < margin:
+                if scored[1][0].priority > scored[0][0].priority:
+                    scored[0], scored[1] = scored[1], scored[0]
+
+        if _interactive_active and _original_weights is not None:
+            self._weights = _original_weights
 
         # Build decision
         best_model, best_score, best_breakdown = scored[0]
@@ -537,6 +566,9 @@ class RoutingEngine:
         priority_score = min(model.priority / 100.0, 1.0)
         breakdown["priority_bonus"] = priority_score
 
+        conv_quality = getattr(model, 'conversational_quality', 0.5)
+        breakdown["conversational_quality"] = conv_quality
+
         # Weighted sum
         total = sum(
             breakdown[k] * self._weights.get(k, 0.0)
@@ -679,6 +711,7 @@ class RoutingEngine:
             classification.confidence,
             float(classification.is_multi_turn),
             float(classification.is_time_sensitive),
+            float(getattr(classification, 'is_interactive', False)),
         ])
 
         # Concatenate and pad to embedding_dim

@@ -58,6 +58,7 @@ class RequestClassification:
     requires_context_window: int = 4096
     is_multi_turn: bool = False
     is_time_sensitive: bool = False
+    is_interactive: bool = False
     keywords: List[str] = field(default_factory=list)
     confidence: float = 0.5
 
@@ -227,6 +228,18 @@ def classify_request(
         len(re.findall(p, lower)) for p in URGENCY_PATTERNS
     )
     result.is_time_sensitive = urgency_hits > 0
+
+    result.is_interactive = (
+        result.primary_domain == TaskDomain.CONVERSATION
+        or result.is_multi_turn
+        or result.primary_domain == TaskDomain.CREATIVE
+    )
+    if result.is_interactive:
+        tiers = list(ComplexityTier)
+        current_idx = tiers.index(result.complexity)
+        floor_idx = tiers.index(ComplexityTier.MEDIUM)
+        if current_idx < floor_idx:
+            result.complexity = ComplexityTier.MEDIUM
 
     return result
 
