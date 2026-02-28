@@ -402,6 +402,16 @@ class RoutingEngine:
                 metadata=metadata,
             )
 
+        if (
+            getattr(decision.classification, 'is_interactive', False)
+            and decision.model_entry is not None
+        ):
+            model = decision.model_entry
+            alpha = 0.1
+            current_cq = getattr(model, 'conversational_quality', 0.5)
+            new_cq = current_cq * (1 - alpha) + quality_score * alpha
+            model.conversational_quality = max(0.0, min(1.0, new_cq))
+
         # Forward to Dream Cycle for model property correlation analysis
         if self._dream_cycle is not None:
             try:
