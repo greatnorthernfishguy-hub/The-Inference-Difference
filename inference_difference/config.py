@@ -95,6 +95,7 @@ class ModelEntry:
     min_ram_gb: float = 0.0
     quantization: str = ""
     priority: int = 0
+    conversational_quality: float = 0.5
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -124,6 +125,11 @@ class ModelEntry:
             raise ValueError(
                 f"ModelEntry '{self.model_id}': min_ram_gb "
                 f"cannot be negative ({self.min_ram_gb})"
+            )
+        if not (0.0 <= self.conversational_quality <= 1.0):
+            raise ValueError(
+                f"ModelEntry '{self.model_id}': conversational_quality "
+                f"must be 0.0-1.0 ({self.conversational_quality})"
             )
 
     def can_handle(self, domain: TaskDomain, complexity: ComplexityTier) -> bool:
@@ -166,6 +172,9 @@ class InferenceDifferenceConfig:
     ng_lite_state_path: str = "ng_lite_state.json"
     enable_learning: bool = True
     enable_consciousness_routing: bool = True
+    interactive_priority_floor: int = 30
+    interactive_quality_weight: float = 0.20
+    interactive_type1_bias: float = 0.05
 
     def get_enabled_models(self) -> List[ModelEntry]:
         """All currently enabled models."""
@@ -198,6 +207,7 @@ def default_local_models() -> Dict[str, ModelEntry]:
             avg_latency_ms=300,
             min_ram_gb=2.0,
             priority=20,
+            conversational_quality=0.2,
         ),
     }
 
