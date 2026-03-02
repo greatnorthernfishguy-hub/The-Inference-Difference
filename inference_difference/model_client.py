@@ -250,6 +250,20 @@ class ModelClient:
         if extra_params:
             body.update(extra_params)
 
+
+        # --- Venice-specific parameters ---
+        if "venice.ai" in base_url:
+            body["venice_parameters"] = {
+                "include_venice_system_prompt": False,
+                "disable_thinking": False,
+                "strip_thinking_response": False,
+                "enable_web_scraping": True,
+                "enable_web_search": "auto",
+                "enable_web_citations": True,
+            }
+            body.setdefault("prompt_cache_key", "sylphrena")
+            body.setdefault("prompt_cache_retention", "24h")
+            body.setdefault("reasoning_effort", "medium")
         data = json.dumps(body).encode("utf-8")
 
         req = urllib.request.Request(url, data=data, method="POST")
