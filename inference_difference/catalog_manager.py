@@ -347,13 +347,33 @@ class CatalogManager:
             "openrouter", len(or_models), start, now,
         )
 
-        # Fetch from HuggingFace
-        hf_models = self._fetch_huggingface_catalog(now)
-        new_models.extend(hf_models)
-        self._log_refresh(
-            "huggingface", len(hf_models), start, now,
-        )
+        # ============================================================
+        # !! HUGGINGFACE FETCH DISABLED — DO NOT RE-ENABLE WITHOUT A KEY !!
+        #
+        # HuggingFace Inference API keys rotated / expired as of early 2026.
+        # Josh does not have a current HF key. Attempting this fetch on
+        # every catalog refresh cycle burns time, fills logs with warnings,
+        # and provides zero value until a valid key is configured.
+        #
+        # TO RE-ENABLE:
+        #   1. Get a fresh HF API key from huggingface.co/settings/tokens
+        #   2. Add it to the systemd service file:
+        #      Environment=HUGGINGFACE_API_KEY=hf_xxxx...
+        #   3. Run: sudo systemctl daemon-reload && sudo systemctl restart inference-difference
+        #   4. Add "huggingface" back to catalog_filters.yaml allowlist.providers
+        #   5. Remove this comment block and uncomment the lines below.
+        #
+        # hf_models = self._fetch_huggingface_catalog(now)
+        # new_models.extend(hf_models)
+        # self._log_refresh("huggingface", len(hf_models), start, now)
+        # ============================================================
 
+        # Fetch from Venice
+        venice_models = self._fetch_venice_catalog(now)
+        new_models.extend(venice_models)
+        self._log_refresh(
+            "venice", len(venice_models), start, now,
+        )
         if new_models:
             self.models = new_models
             self._save_to_cache()
@@ -431,6 +451,79 @@ class CatalogManager:
                 fetched_at=now,
             ))
 
+        return models
+
+
+    def _fetch_venice_catalog(self, now: str) -> List[CatalogModel]:
+        """Fetch model catalog from Venice AI (https://api.venice.ai).
+
+        Venice models run on private GPU infrastructure with zero logging.
+        Privacy tier "private" means no data leaves Venice's fleet.
+        Anonymized models are proxied with all identifying info stripped.
+        """
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("httpx not installed — cannot fetch Venice catalog")
+            return []
+
+        try:
+            resp = httpx.get(
+                "https://api.venice.ai/api/v1/models",
+                params={"type": "text"},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+        except Exception as exc:
+            logger.warning("Venice catalog fetch failed: %s", exc)
+            return []
+
+        models: List[CatalogModel] = []
+        for item in raw.get("data", []):
+            try:
+                spec = item.get("model_spec", {})
+                pricing = spec.get("pricing", {})
+                input_pricing = pricing.get("input", {})
+                output_pricing = pricing.get("output", {})
+
+                # Venice pricing is already per-1M tokens in USD — no conversion needed
+                cost_in  = float(input_pricing.get("usd", 0) or 0)
+                cost_out = float(output_pricing.get("usd", 0) or 0)
+
+                context = int(spec.get("availableContextTokens", 0) or 0)
+                caps_raw = spec.get("capabilities", {})
+                caps = []
+                if caps_raw.get("supportsVision"):
+                    caps.append("vision")
+                if caps_raw.get("supportsWebSearch"):
+                    caps.append("web_search")
+                if caps_raw.get("supportsSystemPrompt"):
+                    caps.append("system_prompt")
+
+                privacy = spec.get("privacy", "")
+                traits = spec.get("traits", [])
+                provider_tier = "private" if privacy == "private" else "anonymized"
+
+                model_id = f"venice/{item['id']}"
+                models.append(CatalogModel(
+                    id=model_id,
+                    display_name=item.get("name", item["id"]),
+                    provider="venice",
+                    provider_tier=provider_tier,
+                    context_window=context,
+                    cost_per_1m_input=cost_in,
+                    cost_per_1m_output=cost_out,
+                    capabilities=caps,
+                    is_active=True,
+                    last_seen=now,
+                    fetched_at=now,
+                ))
+            except Exception as exc:
+                logger.debug("Skipping Venice model %s: %s", item.get("id"), exc)
+                continue
+
+        logger.info("Venice catalog: %d models fetched.", len(models))
         return models
 
     def _fetch_huggingface_catalog(self, now: str) -> List[CatalogModel]:

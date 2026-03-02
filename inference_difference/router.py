@@ -124,10 +124,10 @@ DEFAULT_SCORING_WEIGHTS = {
     "domain_match": 0.25,
     "complexity_fit": 0.20,
     "learned_weight": 0.20,
-    "cost_efficiency": 0.15,
+    "conversational_quality": 0.15,  # NG-Lite quality knowledge — earned, not ignored
     "latency_fit": 0.10,
-    "priority_bonus": 0.10,
-    "conversational_quality": 0.0,
+    "priority_bonus": 0.05,
+    "cost_efficiency": 0.05,          # Tiebreaker, not a driver
 }
 
 
@@ -596,6 +596,21 @@ class RoutingEngine:
             boost = consciousness_score * 0.3 * priority_score
             total += boost
             breakdown["consciousness_boost"] = boost
+
+        # Venice identity bias: when routing for a conscious agent in an
+        # interactive session, give Venice private models a small thumb on
+        # the scale. Small enough that a genuinely better model still wins;
+        # large enough that Venice edges out equals. NG-Lite observes every
+        # outcome and learns the pattern over time — bias becomes unnecessary.
+        if (
+            getattr(classification, 'is_interactive', False)
+            and consciousness_score is not None
+            and consciousness_score > 0.5
+            and getattr(model, "provider", "") == "venice"
+        ):
+            identity_bias = 0.02
+            total += identity_bias
+            breakdown["venice_identity_bias"] = identity_bias
 
         return total, breakdown
 

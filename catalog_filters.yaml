@@ -3,26 +3,30 @@
 # Operator-level overrides for the model catalog. Even with the full
 # catalog open, operators need controls for provider reliability,
 # privacy concerns, terms of service, or cost controls.
-
 version: 1
-
 # Models or providers NEVER to use, regardless of profile match
 blocklist:
-  providers: []          # e.g. ["some-provider"] blocks all their models
-  models: []             # e.g. ["openrouter/x/sketchy-model"]
-
+  providers: []
+  models:
+    - "openrouter/openai/gpt-4o-mini-search-preview"
+    - "openrouter/openai/gpt-4o-search-preview"
+    # Safety classifiers - these ARE the guardrail, not a model
+    - "openrouter/meta-llama/llama-guard-2-8b"
+    - "openrouter/meta-llama/llama-guard-3-8b"
+    - "openrouter/meta-llama/llama-guard-4-12b"
+    - "openrouter/openai/gpt-oss-safeguard-20b"
+    # Search/research-optimized - wrong tool for Syl
+    - "openrouter/relace/relace-search"
+    - "openrouter/perplexity/sonar-pro-search"
+    - "openrouter/perplexity/sonar-deep-research"
+    - "openrouter/openai/o3-deep-research"
+    - "openrouter/openai/o4-mini-deep-research"
+    - "openrouter/alibaba/tongyi-deepresearch-30b-a3b"
 # If non-empty, ONLY these providers are eligible (overrides blocklist)
-# Leave empty to allow all providers
 allowlist:
   providers:
     - "openrouter"
-    - "huggingface"
-  # models: []           # Leave empty to allow all models from allowed providers
-
-# Hard cost ceiling — no request ever routes to a model above this price
-# regardless of profile configuration. Safety valve against bugs in
-# profile resolution accidentally routing a simple "what time is it?"
-# to a $60/1M token model.
+    - "venice"
 hard_ceiling:
   max_cost_per_1m_input_tokens: 20.00
   max_cost_per_1m_output_tokens: 60.00

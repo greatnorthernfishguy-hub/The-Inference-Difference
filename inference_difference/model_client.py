@@ -82,6 +82,11 @@ def _resolve_provider(model_id: str) -> tuple[str, str, str]:
     # Catalog models use "openrouter/" prefix — strip it for the API call.
     # OpenRouter expects just "deepseek/deepseek-chat", not
     # "openrouter/deepseek/deepseek-chat".
+    if model_id.startswith("venice/"):
+        model_name = model_id[len("venice/"):]
+        api_key = os.environ.get("VENICE_API_KEY", "")
+        return "https://api.venice.ai/api", api_key, model_name
+
     if model_id.startswith("openrouter/"):
         model_name = model_id[len("openrouter/"):]
         api_key = os.environ.get("OPENROUTER_API_KEY", "")

@@ -1,0 +1,24 @@
+{
+  "_schema": "et_module/2.0",
+  "module_id": "inference_difference",
+  "display_name": "The Inference Difference",
+  "version": "0.1.0",
+  "description": "AI model router with learning-based classification",
+  "git_remote": "https://github.com/greatnorthernfishguy-hub/The-Inference-Difference.git",
+  "git_branch": "main",
+  "entry_point": "inference_difference/app.py",
+  "install_path": "",
+  "service_name": "tid",
+  "api_port": 7437,
+  "ecosystem": {
+    "ng_lite": true,
+    "ng_lite_version": "1.0.0",
+    "peer_bridge": true,
+    "tier3_upgrade": true,
+    "ng_ecosystem_version": "1.0.0",
+    "shared_learning_writes": true,
+    "capabilities": ["routing", "classification", "inference"]
+  },
+  "dependencies": [],
+  "provides": ["routing"]
+}
