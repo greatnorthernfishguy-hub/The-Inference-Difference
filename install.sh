@@ -168,7 +168,7 @@ if (major, minor) < (3, 10):
     fi
 
     # Check for existing NeuroGraph
-    if [ -d "$HOME/.openclaw/neurograph" ] || [ -d "/home/$SUDO_USER/.openclaw/neurograph" ] 2>/dev/null; then
+    if [ -d "$HOME/NeuroGraph/data" ] || [ -d "/home/$SUDO_USER/NeuroGraph/data" ] 2>/dev/null; then
         info "NeuroGraph installation detected"
     fi
 
