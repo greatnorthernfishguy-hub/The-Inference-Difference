@@ -21,3 +21,4 @@ config.json
 *.bak-*
 gateway.db-shm
 gateway.db-wal
+*.bak.*

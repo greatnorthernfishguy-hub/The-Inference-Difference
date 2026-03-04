@@ -662,6 +662,8 @@ class RoutingEngine:
 
         embedding = self._classification_to_embedding(classification)
         recs = self._ng_lite.get_recommendations(embedding, top_k=20)
+        if recs is None:
+            return 0.5  # Substrate has no opinion
 
         for target_id, weight in recs:
             if target_id == model.model_id:

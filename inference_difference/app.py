@@ -328,22 +328,34 @@ async def lifespan(app: FastAPI):
     else:
         _state.config.default_model = "anthropic/claude-haiku-4-5-20251001"
 
-    # Initialize NG-Lite for learning
+    # Initialize NG Ecosystem as uni-bridge substrate (River audit Phase 3)
+    # Single instance serves both router learning AND peer bridge writes.
+    # Eliminates prior dual-instance pattern where learned nodes were
+    # trapped locally, never reaching shared_learning/ JSONL.
     try:
         import sys
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from ng_lite import NGLite
 
-        _state.ng_lite = NGLite(module_id="inference_difference")
-
-        # Load persisted state if available
-        state_path = _state.config.ng_lite_state_path
-        if os.path.exists(state_path):
-            _state.ng_lite.load(state_path)
-            logger.info("NG-Lite state restored from %s", state_path)
+        import ng_ecosystem
+        _state.ng_ecosystem = ng_ecosystem.init(
+            module_id="inference_difference",
+            state_path="/home/josh/The-Inference-Difference/ng_lite_state.json",
+        )
+        _state.ng_lite = _state.ng_ecosystem  # uni-bridge: router uses ecosystem directly
+        logger.info("NG Ecosystem uni-bridge initialized — learning flows to shared_learning/")
     except Exception as e:
-        logger.warning("NG-Lite initialization failed: %s", e)
-        _state.ng_lite = None
+        logger.warning("NG Ecosystem init failed, falling back to bare NGLite: %s", e)
+        _state.ng_ecosystem = None
+        try:
+            from ng_lite import NGLite
+            _state.ng_lite = NGLite(module_id="inference_difference")
+            state_path = _state.config.ng_lite_state_path
+            if os.path.exists(state_path):
+                _state.ng_lite.load(state_path)
+                logger.info("NG-Lite bare fallback loaded from %s", state_path)
+        except Exception as e2:
+            logger.warning("NGLite fallback also failed: %s", e2)
+            _state.ng_lite = None
 
     # Initialize CatalogManager for dynamic model selection (§4.5)
     try:
@@ -396,21 +408,7 @@ async def lifespan(app: FastAPI):
     # Create model client for forwarding requests to providers
     _state.model_client = ModelClient()
 
-    # Initialize NG Ecosystem coordinator for cross-module learning
-    try:
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-        import ng_ecosystem
-        _state.ng_ecosystem = ng_ecosystem.init(
-            module_id="inference_difference",
-            state_path="/home/josh/The-Inference-Difference/ng_lite_state.json",
-        )
-
-        logger.info("NG Ecosystem coordinator initialized")
-    except Exception as e:
-        logger.warning("NG Ecosystem initialization failed: %s", e)
-        _state.ng_ecosystem = None
+    # NG Ecosystem already initialized above (uni-bridge pattern)
 
     # Initialize ET Module Registry and register built-in modules
     _state.module_registry = ModuleRegistry()
@@ -494,13 +492,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("CatalogManager close failed: %s", e)
 
-    # Persist NG-Lite state on shutdown
-    if _state.ng_lite is not None:
-        try:
-            _state.ng_lite.save(_state.config.ng_lite_state_path)
-            logger.info("NG-Lite state saved on shutdown")
-        except Exception as e:
-            logger.warning("NG-Lite save failed: %s", e)
+    # NG-Lite state saved by NG Ecosystem above (uni-bridge)
 
 
 # ---------------------------------------------------------------------------
