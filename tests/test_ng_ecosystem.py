@@ -1,3 +1,10 @@
+# WARNING: This entire test file is DEAD CODE.
+# Written against an older NGEcosystem API (multi-module registry pattern).
+# The current vendored NGEcosystem is a single-module coordinator.
+# Every test in this file references methods that no longer exist.
+# Must be rewritten from scratch against the current API.
+# See punch list item #59.
+
 """
 Tests for NG Ecosystem — NeuroGraph Ecosystem Coordinator.
 
@@ -13,12 +20,9 @@ import numpy as np
 import pytest
 
 from ng_lite import NGLite
-from ng_ecosystem import (
-    ModuleNGState,
-    NGEcosystem,
-    NGPeerBridge,
-    NGSaaSBridge,
-)
+from ng_ecosystem import NGEcosystem
+from ng_peer_bridge import NGPeerBridge
+from ng_bridge import NGSaaSBridge
 
 
 # ---------------------------------------------------------------------------

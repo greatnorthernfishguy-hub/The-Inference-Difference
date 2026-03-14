@@ -1,0 +1,52 @@
+# Quality Seeds for TID Model Routing
+#
+# Differentiated starting values for conversational_quality, derived from
+# Arena ELO ratings (LMSYS Chatbot Arena, verified March 2026) normalized
+# to [0,1]. These are STARTING VALUES — Elmer-tunable, not permanent.
+# TID learns from here through experience.
+#
+# Punch list #35: replaces flat 0.5 across the entire catalog.
+#
+# Models not listed here get the default_quality score (0.4 — below average
+# but not rejected, genuinely untested).
+#
+# Model IDs use flexible matching: if the seed key appears as a substring
+# of the model ID, the score applies. This handles provider prefixes
+# (openrouter/, venice/, ollama/) without duplicating entries.
+#
+# ---- Changelog ----
+# [2026-03-14] Claude (CC) — Initial seed file
+# What: Created quality_seeds.yaml with benchmark-derived quality scores.
+# Why: Punch list #35 — all models started at 0.5 (conversational_quality),
+#   giving no signal to the router about which models are actually capable.
+# How: Arena ELO ratings normalized to [0,1]. Loaded by _apply_quality_seeds()
+#   in app.py after catalog model registration.
+# -------------------
+
+default_quality: 0.4
+
+seeds:
+  # --- Frontier tier (ELO 1470+) ---
+  "claude-opus-4":           0.95   # ELO 1504, #1 overall
+  "gemini-3.1-pro":          0.93   # ELO 1500, best value ratio
+  "claude-sonnet-4":         0.92   # ELO 1490, strong value
+  "grok-4.20-beta":          0.91   # ELO 1491
+  "gpt-5.4":                 0.90   # ELO 1479
+  "gpt-5.2":                 0.88   # ELO 1479
+  "gemini-3-flash":          0.88   # ELO 1473
+  "grok-4.1":                0.88   # ELO 1473
+
+  # --- High tier (ELO 1430-1470) ---
+  "glm-5":                   0.85   # ELO 1451
+  "kimi-k2.5":               0.84   # ELO 1447
+  "glm-4.7":                 0.83   # ELO 1445
+  "claude-haiku-4":          0.82   # ELO 1429
+  "gemini-3.1-flash-lite":   0.80   # ELO 1432
+
+  # --- Strong benchmarks, no Arena ELO ---
+  "qwen-3.5-397b":           0.78   # GPQA 88.4%, MMLU-Pro 87.8%
+  "minimax-m2.5":            0.77   # SWE-bench 80.2%
+
+  # --- Free tier, limited benchmarks ---
+  "nemotron-3-super":        0.65   # AA Intel 36, free tier
+  "step-3.5-flash":          0.55   # No ELO, no benchmarks, free tier

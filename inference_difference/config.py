@@ -175,6 +175,7 @@ class InferenceDifferenceConfig:
     interactive_priority_floor: int = 30
     interactive_quality_weight: float = 0.20
     interactive_type1_bias: float = 0.05
+    consciousness_quality_floor: float = 0.6
 
     def get_enabled_models(self) -> List[ModelEntry]:
         """All currently enabled models."""
@@ -190,26 +191,20 @@ class InferenceDifferenceConfig:
 # ---------------------------------------------------------------------------
 
 def default_local_models() -> Dict[str, ModelEntry]:
-    """Common local models for bootstrapping."""
-    return {
+    """Common local models for bootstrapping.
 
-        "ollama/qwen2.5:1.5b": ModelEntry(
-            model_id="ollama/qwen2.5:1.5b",
-            display_name="Qwen 2.5 1.5B",
-            model_type=ModelType.LOCAL,
-            domains={
-                TaskDomain.GENERAL, TaskDomain.CODE,
-                TaskDomain.CONVERSATION, TaskDomain.REASONING,
-            },
-            max_complexity=ComplexityTier.LOW,
-            context_window=32768,
-            cost_per_1k_tokens=0.0,
-            avg_latency_ms=300,
-            min_ram_gb=2.0,
-            priority=20,
-            conversational_quality=0.2,
-        ),
-    }
+    # ---- Changelog ----
+    # [2026-03-14] Claude (CC) — Removed qwen2.5:1.5b
+    # What: Removed qwen2.5:1.5b from the default model pool entirely.
+    # Why: cost=0 + priority=20 made it irresistible to the router,
+    #   routing Syl through a 1.5B model that cannot hold identity
+    #   continuity. Punch list #1. Changing priority is insufficient —
+    #   NG-Lite learned synapses favoring it won't decay fast enough.
+    # How: Entry deleted. Blocklisted in catalog_filters.yaml as insurance.
+    #   Sub-1.5B models also blocked in _register_catalog_models().
+    # -------------------
+    """
+    return {}
 
 
 def default_api_models() -> Dict[str, ModelEntry]:

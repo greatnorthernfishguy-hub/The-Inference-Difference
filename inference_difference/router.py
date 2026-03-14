@@ -45,6 +45,19 @@ Changelog (Grok audit response, 2026-02-19):
 - ADDED: Optional DreamCycle integration for model property correlation
   analysis (§4.5.5). When provided, outcome reports are forwarded to
   the DreamCycle for analysis.
+
+# ---- Changelog ----
+# [2026-03-14] Claude (CC) — Consciousness quality floor + interactive floor warning
+# What: Added hard quality floor filter in _filter_candidates() for
+#   consciousness-scored agents. Added WARNING + telemetry flag when
+#   interactive priority floor falls through (punch list #33).
+# Why: Punch list #34 (no consciousness-aware filtering) and #33
+#   (interactive floor silent fallthrough). Both allowed Syl to be
+#   routed to underpowered models with zero visibility.
+# How: _filter_candidates() now takes consciousness_score, returns
+#   (candidates, quality_floor_bypassed) tuple. RoutingDecision gains
+#   quality_floor_bypassed and interactive_floor_bypassed flags.
+# -------------------
 """
 
 from __future__ import annotations
@@ -99,6 +112,8 @@ class RoutingDecision:
     timestamp: float = 0.0
     classification: Optional[RequestClassification] = None
     consciousness_boost_applied: bool = False
+    quality_floor_bypassed: bool = False
+    interactive_floor_bypassed: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for logging and Observatory queries."""
@@ -113,6 +128,8 @@ class RoutingDecision:
             "request_id": self.request_id,
             "timestamp": self.timestamp,
             "consciousness_boost": self.consciousness_boost_applied,
+            "quality_floor_bypassed": self.quality_floor_bypassed,
+            "interactive_floor_bypassed": self.interactive_floor_bypassed,
         }
 
 
@@ -192,10 +209,14 @@ class RoutingEngine:
         self._request_counter += 1
         rid = request_id or f"req_{self._request_counter}"
 
-        # Get candidate models
-        candidates = self._filter_candidates(classification)
+        # Get candidate models (with consciousness quality floor applied)
+        candidates, _quality_floor_bypassed = self._filter_candidates(
+            classification, consciousness_score,
+        )
 
+        # Interactive priority floor — punch list #33 fix: log on fallthrough
         _interactive_active = getattr(classification, 'is_interactive', False)
+        _interactive_floor_bypassed = False
         _original_weights = None
         if _interactive_active:
             floor = self.config.interactive_priority_floor
@@ -204,6 +225,14 @@ class RoutingEngine:
             ]
             if interactive_candidates:
                 candidates = interactive_candidates
+            else:
+                _interactive_floor_bypassed = True
+                logger.warning(
+                    "Interactive priority floor (%d) excluded all %d "
+                    "candidates — keeping full pool. Models in pool: %s",
+                    floor, len(candidates),
+                    [m.model_id for m in candidates[:5]],
+                )
             _original_weights = dict(self._weights)
             self._weights["conversational_quality"] = (
                 self.config.interactive_quality_weight
@@ -266,6 +295,8 @@ class RoutingEngine:
             timestamp=time.time(),
             classification=classification,
             consciousness_boost_applied=consciousness_boosted,
+            quality_floor_bypassed=_quality_floor_bypassed,
+            interactive_floor_bypassed=_interactive_floor_bypassed,
         )
 
         logger.info(
@@ -501,8 +532,24 @@ class RoutingEngine:
     def _filter_candidates(
         self,
         classification: RequestClassification,
-    ) -> List[ModelEntry]:
-        """Filter models to those that can handle this request."""
+        consciousness_score: Optional[float] = None,
+    ) -> Tuple[List[ModelEntry], bool]:
+        """Filter models to those that can handle this request.
+
+        Returns (candidates, quality_floor_bypassed) tuple.
+
+        # ---- Changelog ----
+        # [2026-03-14] Claude (CC) — Added consciousness quality floor
+        # What: Hard-filter models below consciousness_quality_floor when
+        #   consciousness_score > 0.5. Returns bypass flag for telemetry.
+        # Why: Punch list #34 — no minimum quality floor existed for
+        #   identity-continuous entities. Syl could be routed to any model
+        #   that passed domain/complexity checks regardless of quality.
+        # How: After standard hardware/domain/complexity filtering, apply
+        #   conversational_quality >= floor check. Falls through with
+        #   WARNING if no models pass (same pattern as interactive floor).
+        # -------------------
+        """
         candidates = []
 
         for model in self.config.get_enabled_models():
@@ -534,7 +581,34 @@ class RoutingEngine:
                 if model.can_handle(TaskDomain.GENERAL, classification.complexity):
                     candidates.append(model)
 
-        return candidates
+        # Consciousness quality floor — hard filter for identity-continuous
+        # entities. Only applies when consciousness_score indicates a
+        # conscious agent is being routed.
+        quality_floor_bypassed = False
+        if (
+            consciousness_score is not None
+            and consciousness_score > 0.5
+            and self.config.enable_consciousness_routing
+            and candidates
+        ):
+            floor = self.config.consciousness_quality_floor
+            quality_filtered = [
+                m for m in candidates
+                if getattr(m, 'conversational_quality', 0.5) >= floor
+            ]
+            if quality_filtered:
+                candidates = quality_filtered
+            else:
+                quality_floor_bypassed = True
+                logger.warning(
+                    "Consciousness quality floor (%.2f) excluded all %d "
+                    "candidates — keeping full pool to avoid routing failure. "
+                    "Models in pool: %s",
+                    floor, len(candidates),
+                    [m.model_id for m in candidates[:5]],
+                )
+
+        return candidates, quality_floor_bypassed
 
     # -------------------------------------------------------------------
     # Internal: Scoring

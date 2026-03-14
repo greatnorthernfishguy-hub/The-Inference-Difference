@@ -11,6 +11,18 @@ Changelog (Grok audit response, 2026-02-19):
 - ADDED: Config validation tests (audit: "no checks on bad values").
 - ADDED: Gibberish response quality test (audit: "gibberish—low score?").
 - ADDED: Negative latency edge case test (audit: "zero latency=1.0").
+
+# ---- Changelog ----
+# [2026-03-14] Claude (CC) — Updated for qwen removal + quality floor
+# What: Removed qwen2.5:1.5b from model pool, replaced default_local_models/
+#   default_api_models fixtures with explicit test model sets. Added tests
+#   for consciousness quality floor, interactive floor telemetry, and
+#   quality seed application.
+# Why: Punch list #1 (qwen removal), #34 (quality floor), #33 (interactive
+#   floor warning), #35 (quality seeds).
+# How: _test_models() helper builds a realistic model set for routing tests.
+#   New TestConsciousnessFloor and TestQualitySeeds classes.
+# -------------------
 """
 
 import concurrent.futures
@@ -41,6 +53,87 @@ from inference_difference.hardware import (
 from inference_difference.quality import evaluate_quality, QualityEvaluation
 from inference_difference.router import RoutingEngine, RoutingDecision
 from ng_lite import NGLite
+
+
+# ---------------------------------------------------------------------------
+# Test model helper — replaces default_local_models()/default_api_models()
+# which are now empty after qwen2.5:1.5b removal (punch list #1).
+# ---------------------------------------------------------------------------
+
+def _test_models() -> dict:
+    """Build a realistic model set for routing tests.
+
+    These are NOT the production models — they're test fixtures with
+    controlled properties for predictable routing behavior.
+    """
+    return {
+        "test/high-quality-api": ModelEntry(
+            model_id="test/high-quality-api",
+            display_name="Test High Quality API",
+            model_type=ModelType.API,
+            domains={TaskDomain.GENERAL, TaskDomain.CODE, TaskDomain.REASONING},
+            max_complexity=ComplexityTier.EXTREME,
+            context_window=128000,
+            cost_per_1k_tokens=0.005,
+            avg_latency_ms=2000,
+            priority=40,
+            conversational_quality=0.92,
+            enabled=True,
+        ),
+        "test/mid-quality-api": ModelEntry(
+            model_id="test/mid-quality-api",
+            display_name="Test Mid Quality API",
+            model_type=ModelType.API,
+            domains={TaskDomain.GENERAL, TaskDomain.CODE},
+            max_complexity=ComplexityTier.HIGH,
+            context_window=32768,
+            cost_per_1k_tokens=0.001,
+            avg_latency_ms=1500,
+            priority=30,
+            conversational_quality=0.75,
+            enabled=True,
+        ),
+        "test/low-quality-local": ModelEntry(
+            model_id="test/low-quality-local",
+            display_name="Test Low Quality Local",
+            model_type=ModelType.LOCAL,
+            domains={TaskDomain.GENERAL, TaskDomain.CODE, TaskDomain.CONVERSATION},
+            max_complexity=ComplexityTier.MEDIUM,
+            context_window=8192,
+            cost_per_1k_tokens=0.0,
+            avg_latency_ms=300,
+            min_ram_gb=4.0,
+            priority=15,
+            conversational_quality=0.35,
+            enabled=True,
+        ),
+        "test/creative-api": ModelEntry(
+            model_id="test/creative-api",
+            display_name="Test Creative API",
+            model_type=ModelType.API,
+            domains={TaskDomain.CREATIVE, TaskDomain.CONVERSATION},
+            max_complexity=ComplexityTier.HIGH,
+            context_window=32768,
+            cost_per_1k_tokens=0.003,
+            avg_latency_ms=2500,
+            priority=35,
+            conversational_quality=0.88,
+            enabled=True,
+        ),
+        "test/budget-api": ModelEntry(
+            model_id="test/budget-api",
+            display_name="Test Budget API",
+            model_type=ModelType.API,
+            domains={TaskDomain.GENERAL},
+            max_complexity=ComplexityTier.LOW,
+            context_window=4096,
+            cost_per_1k_tokens=0.0001,
+            avg_latency_ms=500,
+            priority=10,
+            conversational_quality=0.40,
+            enabled=True,
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -85,19 +178,22 @@ def cpu_only_hardware():
 
 @pytest.fixture
 def full_config():
-    """Config with both local and API models."""
+    """Config with test models for routing."""
     config = InferenceDifferenceConfig()
-    config.models = {**default_local_models(), **default_api_models()}
-    config.default_model = "ollama/llama3.1:8b"
+    config.models = _test_models()
+    config.default_model = "test/high-quality-api"
     return config
 
 
 @pytest.fixture
 def local_only_config():
-    """Config with only local models."""
+    """Config with only local test models."""
     config = InferenceDifferenceConfig()
-    config.models = default_local_models()
-    config.default_model = "ollama/llama3.1:8b"
+    config.models = {
+        k: v for k, v in _test_models().items()
+        if v.model_type == ModelType.LOCAL
+    }
+    config.default_model = "test/low-quality-local"
     return config
 
 
@@ -156,19 +252,15 @@ class TestConfig:
         )
         assert not model.can_handle(TaskDomain.GENERAL, ComplexityTier.LOW)
 
-    def test_default_local_models(self):
+    def test_default_local_models_empty_after_qwen_removal(self):
+        """default_local_models() is empty — qwen2.5:1.5b removed (punch list #1)."""
         models = default_local_models()
-        assert len(models) >= 3
-        for m in models.values():
-            assert m.model_type == ModelType.LOCAL
-            assert m.cost_per_1k_tokens == 0.0
+        assert len(models) == 0
 
-    def test_default_api_models(self):
+    def test_default_api_models_empty(self):
+        """default_api_models() is empty — punch list #36."""
         models = default_api_models()
-        assert len(models) >= 2
-        for m in models.values():
-            assert m.model_type == ModelType.API
-            assert m.cost_per_1k_tokens > 0
+        assert len(models) == 0
 
     def test_config_get_enabled_models(self, full_config):
         enabled = full_config.get_enabled_models()
@@ -489,8 +581,8 @@ class TestIntegration:
         """Full route -> execute -> evaluate -> learn cycle."""
         ng = NGLite(module_id="integration_test")
         config = InferenceDifferenceConfig()
-        config.models = {**default_local_models(), **default_api_models()}
-        config.default_model = "ollama/llama3.1:8b"
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
 
         engine = RoutingEngine(
             config=config, hardware=gpu_hardware, ng_lite=ng,
@@ -535,8 +627,8 @@ class TestIntegration:
         """Multiple requests build up learning over time."""
         ng = NGLite(module_id="multi_test")
         config = InferenceDifferenceConfig()
-        config.models = {**default_local_models(), **default_api_models()}
-        config.default_model = "ollama/llama3.1:8b"
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
 
         engine = RoutingEngine(
             config=config, hardware=gpu_hardware, ng_lite=ng,
@@ -728,6 +820,164 @@ class TestQualityEdgeCases:
         # Hits CONVERSATION (help), ANALYSIS (analyze, data, trend),
         # and REASONING (explain) — should not be fully confident
         assert result.confidence < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Consciousness Quality Floor Tests (Punch list #34)
+# ---------------------------------------------------------------------------
+
+class TestConsciousnessFloor:
+
+    def test_quality_floor_filters_low_quality_models(self, gpu_hardware):
+        """Models below quality floor are excluded for conscious agents."""
+        config = InferenceDifferenceConfig()
+        config.consciousness_quality_floor = 0.6
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello, how are you?")
+        decision = engine.route(classification, consciousness_score=0.8)
+
+        # Should NOT route to low-quality model (0.35) or budget (0.40)
+        assert decision.model_id != "test/low-quality-local"
+        assert decision.model_id != "test/budget-api"
+        assert decision.quality_floor_bypassed is False
+
+    def test_quality_floor_not_applied_without_consciousness(self, gpu_hardware):
+        """Without consciousness_score, all models are candidates."""
+        config = InferenceDifferenceConfig()
+        config.consciousness_quality_floor = 0.6
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        decision = engine.route(classification, consciousness_score=None)
+        assert decision.quality_floor_bypassed is False
+
+    def test_quality_floor_bypass_when_all_excluded(self, gpu_hardware):
+        """When floor excludes everything, bypass with flag set."""
+        config = InferenceDifferenceConfig()
+        config.consciousness_quality_floor = 0.99  # Impossibly high
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        decision = engine.route(classification, consciousness_score=0.8)
+
+        assert decision.quality_floor_bypassed is True
+        assert decision.model_id != ""  # Still routes — doesn't fail
+
+    def test_quality_floor_in_to_dict(self, gpu_hardware):
+        """Bypass flags appear in serialized decision."""
+        config = InferenceDifferenceConfig()
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        decision = engine.route(classification)
+        d = decision.to_dict()
+        assert "quality_floor_bypassed" in d
+        assert "interactive_floor_bypassed" in d
+
+
+# ---------------------------------------------------------------------------
+# Interactive Floor Telemetry Tests (Punch list #33)
+# ---------------------------------------------------------------------------
+
+class TestInteractiveFloorTelemetry:
+
+    def test_interactive_floor_bypass_flag_set(self, gpu_hardware):
+        """When interactive floor excludes all candidates, flag is set."""
+        config = InferenceDifferenceConfig()
+        config.interactive_priority_floor = 99  # Nothing passes
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        # Simulate interactive classification
+        classification.is_interactive = True
+        decision = engine.route(classification)
+
+        assert decision.interactive_floor_bypassed is True
+        assert decision.model_id != ""  # Still routes
+
+    def test_interactive_floor_not_bypassed_when_models_pass(self, gpu_hardware):
+        """When models pass the interactive floor, flag is False."""
+        config = InferenceDifferenceConfig()
+        config.interactive_priority_floor = 30  # mid-quality-api passes (30)
+        config.models = _test_models()
+        config.default_model = "test/high-quality-api"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        classification.is_interactive = True
+        decision = engine.route(classification)
+
+        assert decision.interactive_floor_bypassed is False
+
+
+# ---------------------------------------------------------------------------
+# Quality Seeds Tests (Punch list #35)
+# ---------------------------------------------------------------------------
+
+class TestQualitySeeds:
+
+    def test_conversational_quality_config_field(self):
+        """consciousness_quality_floor is configurable."""
+        config = InferenceDifferenceConfig()
+        assert config.consciousness_quality_floor == 0.6
+        config.consciousness_quality_floor = 0.7
+        assert config.consciousness_quality_floor == 0.7
+
+    def test_conversational_quality_validation(self):
+        """conversational_quality must be 0.0-1.0."""
+        with pytest.raises(ValueError, match="conversational_quality"):
+            ModelEntry(model_id="bad", conversational_quality=1.5)
+        with pytest.raises(ValueError, match="conversational_quality"):
+            ModelEntry(model_id="bad", conversational_quality=-0.1)
+
+    def test_conversational_quality_in_scoring(self, gpu_hardware):
+        """conversational_quality affects routing score."""
+        config = InferenceDifferenceConfig()
+        config.models = {
+            "high_cq": ModelEntry(
+                model_id="high_cq",
+                display_name="High CQ",
+                model_type=ModelType.API,
+                domains={TaskDomain.GENERAL},
+                max_complexity=ComplexityTier.HIGH,
+                context_window=32768,
+                cost_per_1k_tokens=0.005,
+                avg_latency_ms=2000,
+                priority=30,
+                conversational_quality=0.95,
+            ),
+            "low_cq": ModelEntry(
+                model_id="low_cq",
+                display_name="Low CQ",
+                model_type=ModelType.API,
+                domains={TaskDomain.GENERAL},
+                max_complexity=ComplexityTier.HIGH,
+                context_window=32768,
+                cost_per_1k_tokens=0.005,
+                avg_latency_ms=2000,
+                priority=30,
+                conversational_quality=0.20,
+            ),
+        }
+        config.default_model = "high_cq"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        decision = engine.route(classification)
+
+        # Higher conversational_quality should win when all else is equal
+        assert decision.model_id == "high_cq"
 
 
 # ---------------------------------------------------------------------------

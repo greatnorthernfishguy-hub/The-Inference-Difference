@@ -42,6 +42,37 @@ from inference_difference.hardware import HardwareProfile, GPUInfo
 from inference_difference.router import RoutingEngine
 
 
+def _test_router_models() -> dict:
+    """Test models for router integration tests (replaces empty defaults)."""
+    return {
+        "test/api-model": ModelEntry(
+            model_id="test/api-model",
+            display_name="Test API Model",
+            model_type=ModelType.API,
+            domains={TaskDomain.GENERAL, TaskDomain.CODE},
+            max_complexity=ComplexityTier.HIGH,
+            context_window=32768,
+            cost_per_1k_tokens=0.003,
+            avg_latency_ms=2000,
+            priority=30,
+            conversational_quality=0.85,
+        ),
+        "test/local-model": ModelEntry(
+            model_id="test/local-model",
+            display_name="Test Local Model",
+            model_type=ModelType.LOCAL,
+            domains={TaskDomain.GENERAL, TaskDomain.CODE},
+            max_complexity=ComplexityTier.MEDIUM,
+            context_window=8192,
+            cost_per_1k_tokens=0.0,
+            avg_latency_ms=500,
+            min_ram_gb=4.0,
+            priority=20,
+            conversational_quality=0.60,
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -326,7 +357,9 @@ class TestFilterLoading:
         assert f.hard_ceiling_input == 20.0
         assert f.hard_ceiling_output == 60.0
         assert "openrouter" in f.allowlist_providers
-        assert "huggingface" in f.allowlist_providers
+        assert "venice" in f.allowlist_providers
+        # HuggingFace removed from allowlist — fetch disabled, no valid key
+        assert "ollama/qwen2.5:1.5b" in f.blocklist_models
 
     def test_missing_filters_file(self, tmp_dir):
         """Missing filters file uses defaults."""
@@ -920,8 +953,8 @@ class TestRouterCatalogIntegration:
     def test_route_with_profile(self, catalog_manager, gpu_hardware):
         """Router route_with_profile resolves via catalog."""
         config = InferenceDifferenceConfig()
-        config.models = {**default_local_models(), **default_api_models()}
-        config.default_model = "ollama/llama3.1:8b"
+        config.models = _test_router_models()
+        config.default_model = "test/api-model"
 
         engine = RoutingEngine(
             config=config,
@@ -939,8 +972,8 @@ class TestRouterCatalogIntegration:
     def test_route_with_profile_fallback(self, gpu_hardware):
         """Without catalog manager, falls back to standard routing."""
         config = InferenceDifferenceConfig()
-        config.models = {**default_local_models(), **default_api_models()}
-        config.default_model = "ollama/llama3.1:8b"
+        config.models = _test_router_models()
+        config.default_model = "test/api-model"
 
         engine = RoutingEngine(
             config=config,
@@ -957,8 +990,8 @@ class TestRouterCatalogIntegration:
     def test_route_standard_unaffected(self, catalog_manager, gpu_hardware):
         """Standard route() is unaffected by catalog integration."""
         config = InferenceDifferenceConfig()
-        config.models = {**default_local_models(), **default_api_models()}
-        config.default_model = "ollama/llama3.1:8b"
+        config.models = _test_router_models()
+        config.default_model = "test/api-model"
 
         engine = RoutingEngine(
             config=config,
@@ -974,8 +1007,8 @@ class TestRouterCatalogIntegration:
     def test_dream_cycle_receives_outcomes(self, catalog_manager, gpu_hardware):
         """Dream Cycle receives forwarded outcomes from router."""
         config = InferenceDifferenceConfig()
-        config.models = {**default_local_models(), **default_api_models()}
-        config.default_model = "ollama/llama3.1:8b"
+        config.models = _test_router_models()
+        config.default_model = "test/api-model"
 
         dream = DreamCycle()
         engine = RoutingEngine(

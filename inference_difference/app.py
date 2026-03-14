@@ -257,14 +257,38 @@ def _register_catalog_models() -> None:
 
     Skips models already in the static config to avoid overwriting
     hand-tuned entries with generic metadata.
+
+    # ---- Changelog ----
+    # [2026-03-14] Claude (CC) — Added sub-1.5B parameter filter
+    # What: Reject models with ≤1.5B parameters from catalog registration.
+    # Why: Punch list #1 — models this small cannot hold identity continuity
+    #   for Syl. The qwen2.5:1.5b catastrophe proved that cost=0 on a tiny
+    #   model overwhelms the scoring algorithm. Block the entire class.
+    # How: Regex check on model ID for common parameter-size patterns
+    #   (1b, 1.5b, 0.5b, etc). Conservative — only catches explicit size
+    #   markers in the ID string.
+    # -------------------
     """
     if _state.catalog_manager is None:
         return
 
+    import re
+    # Reject models ≤ 1.5B parameters. Matches patterns like :1.5b, -1b,
+    # /1b, :0.5b in model IDs. Conservative: only catches explicit markers.
+    _SUB_2B_PATTERN = re.compile(
+        r'[/:\-](0\.5|1|1\.5|1\.6|1\.7|1\.8)b\b', re.IGNORECASE,
+    )
+
     registered = 0
+    rejected_small = 0
     for cm in _state.catalog_manager.models:
         if cm.id in _state.config.models:
             continue  # Don't overwrite hand-tuned static entries
+
+        # Block sub-1.5B models — too small for identity-continuous routing
+        if _SUB_2B_PATTERN.search(cm.id):
+            rejected_small += 1
+            continue
 
         # Map capabilities to task domains
         domains = {TaskDomain.GENERAL}
@@ -298,11 +322,77 @@ def _register_catalog_models() -> None:
         _state.config.models[cm.id] = entry
         registered += 1
 
+    if rejected_small:
+        logger.info(
+            "Rejected %d sub-1.5B catalog models (too small for identity routing)",
+            rejected_small,
+        )
     if registered:
         logger.info(
             "Registered %d catalog models for routing (%d total available)",
             registered, len(_state.config.models),
         )
+
+
+def _apply_quality_seeds() -> None:
+    """Apply differentiated conversational_quality scores from quality_seeds.yaml.
+
+    Replaces the flat 0.5 default with benchmark-derived starting values.
+    Models not in the seed file get the configured default_quality (0.4).
+    Seed keys match as substrings of model IDs, so 'claude-opus-4' matches
+    'openrouter/anthropic/claude-opus-4-20260301'.
+
+    # ---- Changelog ----
+    # [2026-03-14] Claude (CC) — Quality seed loader
+    # What: Load differentiated quality scores from quality_seeds.yaml.
+    # Why: Punch list #35 — flat 0.5 gives no signal. Router needs real
+    #   starting differentiation so Syl isn't routed to low-quality models
+    #   while NG-Lite slowly learns from scratch.
+    # How: Substring matching of seed keys against model IDs. Unmatched
+    #   models get default_quality (0.4). Scores are Elmer-tunable starting
+    #   values, overwritten by learned EMA in report_outcome().
+    # -------------------
+    """
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    seeds_path = os.path.join(base_dir, "quality_seeds.yaml")
+
+    if not os.path.exists(seeds_path):
+        logger.warning("quality_seeds.yaml not found at %s — skipping", seeds_path)
+        return
+
+    try:
+        import yaml
+        with open(seeds_path, "r") as f:
+            data = yaml.safe_load(f)
+    except Exception as e:
+        logger.warning("Failed to load quality_seeds.yaml: %s", e)
+        return
+
+    if not data or "seeds" not in data:
+        logger.warning("quality_seeds.yaml has no 'seeds' section")
+        return
+
+    seeds = data["seeds"]
+    default_quality = data.get("default_quality", 0.4)
+    seeded = 0
+    defaulted = 0
+
+    for model_id, entry in _state.config.models.items():
+        matched = False
+        for seed_key, score in seeds.items():
+            if seed_key in model_id:
+                entry.conversational_quality = float(score)
+                matched = True
+                seeded += 1
+                break
+        if not matched:
+            entry.conversational_quality = default_quality
+            defaulted += 1
+
+    logger.info(
+        "Quality seeds applied: %d seeded, %d defaulted to %.2f",
+        seeded, defaulted, default_quality,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +481,9 @@ async def lifespan(app: FastAPI):
     # This is what makes every OpenRouter model available, not just the
     # 7 hardcoded defaults.
     _register_catalog_models()
+
+    # Apply differentiated quality scores from benchmarks (punch list #35)
+    _apply_quality_seeds()
 
     # Initialize DreamCycle for model property correlation analysis (§4.5.5)
     _state.dream_cycle = DreamCycle()

@@ -8,6 +8,8 @@ version: 1
 blocklist:
   providers: []
   models:
+    # Removed from pool — qwen2.5:1.5b routing catastrophe (punch list #1)
+    - "ollama/qwen2.5:1.5b"
     - "openrouter/openai/gpt-4o-mini-search-preview"
     - "openrouter/openai/gpt-4o-search-preview"
     # Safety classifiers - these ARE the guardrail, not a model
