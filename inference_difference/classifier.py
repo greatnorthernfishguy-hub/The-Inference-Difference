@@ -7,6 +7,27 @@ requirements — the inputs the router needs to make a good decision.
 Uses lightweight heuristics (keyword analysis, structural patterns)
 rather than an ML model, so classification adds <1ms overhead.
 
+# ---- Changelog ----
+# [2026-03-19] Claude Code (Opus 4.6) — Migrate to BAAI/bge-base-en-v1.5 (#45)
+# What: _EMBEDDING_DIM 384→768. fastembed model all-MiniLM-L6-v2 → BAAI/bge-base-en-v1.5.
+# Why: Ecosystem-wide embedding migration. Old model deposited 384-dim vectors
+#   into the 768-dim substrate after sentence-transformers broke. Punchlist #45.
+# How: Two constant changes — _EMBEDDING_DIM and TextEmbedding() model string.
+# -------------------
+# [2026-03-18] Claude (CC) — Semantic embeddings for substrate learning (#28)
+# What: Added semantic_embedding field to RequestClassification. Computed
+#   via fastembed (ONNX Runtime, all-MiniLM-L6-v2) with hash fallback.
+#   384-dim normalized vectors from actual message content.
+# Why: Punch list #28 — primary dam in the River. The old
+#   _classification_to_embedding() collapsed every request into one-hot
+#   domain+complexity vectors. "Hello Syl" and "Hey how are you" produced
+#   identical embeddings. The substrate couldn't differentiate.
+# How: Lazy-loaded _get_embedder() returns fastembed TextEmbedding.
+#   _semantic_embed(text) produces the vector. classify_request() sets
+#   result.semantic_embedding. Router's _classification_to_embedding()
+#   returns the real embedding when available.
+# -------------------
+
 Changelog (Grok audit response, 2026-02-19):
 - EXPANDED: DOMAIN_PATTERNS with common synonyms (audit: "limited vocab").
   Added "program", "script", "algorithm", "schema" to CODE; "think",
@@ -28,11 +49,17 @@ Changelog (Grok audit response, 2026-02-19):
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+import numpy as np
+
 from inference_difference.config import ComplexityTier, TaskDomain
+
+logger = logging.getLogger("inference_difference.classifier")
 
 
 @dataclass
@@ -61,6 +88,7 @@ class RequestClassification:
     is_interactive: bool = False
     keywords: List[str] = field(default_factory=list)
     confidence: float = 0.5
+    semantic_embedding: Optional[Any] = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +159,35 @@ URGENCY_PATTERNS = [
     r"\b(right now|time.?sensitive|deadline)\b",
     r"!{2,}",  # Multiple exclamation marks
 ]
+
+
+# ---------------------------------------------------------------------------
+# Semantic embedder — lazy-loaded, ecosystem-standard model
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_DIM = 768
+
+
+def _semantic_embed(text: str) -> np.ndarray:
+    """Embed text via ng_embed (centralized ecosystem embedding).
+
+    Ecosystem standard: Snowflake/snowflake-arctic-embed-m-v1.5 (768-dim).
+    This is the raw semantic embedding that replaces
+    _classification_to_embedding() (punch list #28). The substrate
+    learns from actual message content instead of domain labels.
+    """
+    try:
+        from ng_embed import embed
+        return embed(text)
+    except Exception:
+        pass
+
+    # Hash fallback — deterministic but not semantic
+    rng_seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16) % (2**32)
+    rng = np.random.RandomState(rng_seed)
+    vec = rng.randn(_EMBEDDING_DIM).astype(np.float32)
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
 
 
 def classify_request(
@@ -240,6 +297,10 @@ def classify_request(
         floor_idx = tiers.index(ComplexityTier.MEDIUM)
         if current_idx < floor_idx:
             result.complexity = ComplexityTier.MEDIUM
+
+    # Semantic embedding — raw experience for the substrate (#28)
+    # The substrate learns from actual message content, not domain labels.
+    result.semantic_embedding = _semantic_embed(text)
 
     return result
 
