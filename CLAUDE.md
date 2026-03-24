@@ -6,6 +6,18 @@
 **This document adds TID-specific rules on top of those Laws.**
 
 ---
+## Vault Context
+For full ecosystem context, read these from the Obsidian vault (`~/docs/`):
+- **Module page:** `~/docs/modules/TID.md`
+- **PRD:** `~/docs/prd/tid-studentgraph-curriculum-v0.1.md`
+- **Concepts:** `~/docs/concepts/Confidence Thresholds.md`, `~/docs/concepts/The River.md`, `~/docs/concepts/Vendored Files.md`
+- **Systems:** `~/docs/systems/NG-Lite.md`, `~/docs/systems/NG Peer Bridge.md`
+- **Audit:** `~/docs/audits/ecosystem-test-suite-audit-2026-03-23.md`
+
+Each vault page has a Context Map at the top linking to related docs. Follow those links for ripple effects and dependencies.
+
+---
+
 
 ## What This Repo Is
 
