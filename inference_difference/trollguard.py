@@ -161,6 +161,7 @@ class TrollGuard(ETModule):
         self._block_threshold = ng_config.get("block_threshold", 0.9)
         self._scan_responses = ng_config.get("scan_responses", True)
         self._learn_from_threats = ng_config.get("learn_from_threats", True)
+        self._history_discount = ng_config.get("history_discount", 0.7)
 
         # Stats
         self._requests_scanned = 0
@@ -197,7 +198,7 @@ class TrollGuard(ETModule):
                 # Escalate to worst threat found in history
                 assessment.threat_score = max(
                     assessment.threat_score,
-                    history_assessment.threat_score * 0.7,  # Discount history
+                    history_assessment.threat_score * self._history_discount,
                 )
                 assessment.threat_types.extend(history_assessment.threat_types)
                 assessment.details.extend(history_assessment.details)

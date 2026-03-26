@@ -54,7 +54,7 @@ from inference_difference.et_module import (
     HookContext,
 )
 
-logger = logging.getLogger("inference_difference.openclaw_adapter")
+logger = logging.getLogger("inference_difference.compliance_adapter")
 
 # Gateway HTTP timeout for compliance checks (seconds).
 _GATEWAY_TIMEOUT = 5

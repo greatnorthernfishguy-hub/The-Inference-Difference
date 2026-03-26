@@ -195,9 +195,10 @@ TID routes to multiple LLM providers. Configuration lives in environment variabl
 | Provider | How TID Reaches It | Key Config |
 |----------|--------------------|------------|
 | Ollama | Direct HTTP to localhost | Models detected via hardware.py |
-| OpenRouter | HTTPS API | API key in env vars |
-| Anthropic | HTTPS API | API key in env vars |
-| Venice AI | HTTPS API | API key in env vars, dual privacy tiers |
+| OpenRouter | HTTPS API | `OPENROUTER_API_KEY` env var |
+| HuggingFace | HTTPS API (OpenAI-compatible) | `HF_TOKEN` env var. Model prefix: `huggingface/` or `hf/` |
+| Venice AI | HTTPS API | `VENICE_API_KEY` env var, dual privacy tiers |
+| Anthropic | HTTPS API | `ANTHROPIC_API_KEY` env var |
 
 ### API Key Safety
 

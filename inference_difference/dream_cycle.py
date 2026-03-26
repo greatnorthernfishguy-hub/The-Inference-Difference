@@ -1,6 +1,30 @@
 """
 Dream Cycle Enhancement for Dynamic Model Catalog Selection (§4.5.5).
 
+# ---- Changelog ----
+# [2026-03-25] Claude (Opus 4.6) — Wire insights to substrate (punchlist #17)
+#   What: DreamCycle now teaches the substrate when it discovers insights.
+#     After analyze_model_property_correlations(), each high-confidence
+#     insight is fed to ng_ecosystem.record_outcome() so the substrate
+#     learns what DreamCycle discovers.
+#   Why:  Punchlist #17: "DreamCycle outside substrate — discovers
+#     correlations but insights disconnected."  The River should carry
+#     DreamCycle's learned correlations to all peer modules.
+#   How:  Constructor accepts optional ng_ecosystem + embed_fn references.
+#     analyze_model_property_correlations() calls _teach_substrate()
+#     after discovering insights.  Each insight is embedded and recorded
+#     as a substrate outcome with target_id = "dreamcycle:{property}:{route}".
+# -------------------
+# [2026-03-25] Claude (Opus 4.6) — Analysis thresholds as constructor params (SVG Phase 3)
+#   What: Moved 10 hardcoded correlation analysis thresholds to constructor
+#     parameters with bootstrap defaults: context significance, tier thresholds,
+#     cost significance, capability thresholds.
+#   Why:  Static Value Graduation — DreamCycle's correlation calibration is the
+#     substrate's concern. Named params are configurable at instantiation.
+#   How:  Constructor accepts params, methods read self.* instead of literals.
+#     Zero behavioral change at default values.
+# -------------------
+
 With dynamic catalog selection, the Dream Cycle gains additional learning
 capability beyond tier assignment. It analyzes which model properties
 correlate with routing success for each semantic route, and tightens
@@ -20,7 +44,9 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger("inference_difference.dream_cycle")
 
@@ -80,10 +106,38 @@ class DreamCycle:
         min_sample_size: int = 10,
         confidence_threshold: float = 0.6,
         max_outcomes: int = 5000,
+        # Substrate integration (#17) — optional, degrades gracefully
+        ng_ecosystem: Optional[Any] = None,
+        embed_fn: Optional[Callable[[str], np.ndarray]] = None,
+        # Analysis thresholds — SVG Phase 3 bootstrap scaffolding
+        context_significance: float = 1.5,     # Success models need >Nx context vs failures
+        context_recommendation_factor: float = 0.8,  # Recommend Nx of success avg
+        tier_fail_threshold: float = 0.5,      # Fail rate above = problematic
+        tier_success_floor: float = 0.2,       # Success rate below = problematic
+        tier_success_threshold: float = 0.5,   # Success rate above = good tier
+        tier_fail_floor: float = 0.2,          # Fail rate below = good tier
+        cost_significance: float = 2.0,        # Success costs >Nx failure costs
+        cost_floor_factor: float = 1.5,        # Min viable = failure avg * N
+        capability_success_threshold: float = 0.7,  # Capability present in >N% success
+        capability_fail_floor: float = 0.3,    # Capability present in <N% failures
     ):
         self.min_sample_size = min_sample_size
         self.confidence_threshold = confidence_threshold
         self.max_outcomes = max_outcomes
+        self.context_significance = context_significance
+        self.context_recommendation_factor = context_recommendation_factor
+        self.tier_fail_threshold = tier_fail_threshold
+        self.tier_success_floor = tier_success_floor
+        self.tier_success_threshold = tier_success_threshold
+        self.tier_fail_floor = tier_fail_floor
+        self.cost_significance = cost_significance
+        self.cost_floor_factor = cost_floor_factor
+        self.capability_success_threshold = capability_success_threshold
+        self.capability_fail_floor = capability_fail_floor
+
+        self._ng_ecosystem = ng_ecosystem
+        self._embed_fn = embed_fn
+        self._substrate_teach_count = 0
 
         self._outcomes: List[RoutingOutcome] = []
         self._insights: Dict[str, List[PropertyInsight]] = {}
@@ -155,6 +209,10 @@ class DreamCycle:
                     )
 
         self._insights = all_insights
+
+        # Teach the substrate what DreamCycle discovered (#17)
+        self._teach_substrate(all_insights)
+
         return all_insights
 
     def get_insights(self) -> Dict[str, List[PropertyInsight]]:
@@ -179,7 +237,63 @@ class DreamCycle:
                 route: len(insights)
                 for route, insights in self._insights.items()
             },
+            "substrate_teach_count": self._substrate_teach_count,
         }
+
+    # -------------------------------------------------------------------
+    # Substrate teaching (#17)
+    # -------------------------------------------------------------------
+
+    def _teach_substrate(
+        self, insights: Dict[str, List[PropertyInsight]],
+    ) -> None:
+        """Feed discovered insights into the substrate via record_outcome().
+
+        Each high-confidence insight becomes a substrate learning event.
+        The embedding is the insight's observation text (semantic content).
+        The target_id encodes the property and route so the substrate
+        can learn "this kind of insight is valid for this route."
+
+        Degrades gracefully: if ng_ecosystem or embed_fn is not set,
+        insights are still discovered and stored locally — they just
+        don't reach the River.
+        """
+        if self._ng_ecosystem is None or self._embed_fn is None:
+            return
+
+        for route, route_insights in insights.items():
+            for insight in route_insights:
+                if insight.confidence < self.confidence_threshold:
+                    continue
+
+                try:
+                    # Embed the insight's observation (the semantic content)
+                    embedding = self._embed_fn(insight.observation)
+                    if embedding is None:
+                        continue
+
+                    # Record to substrate — the insight IS the experience
+                    target_id = f"dreamcycle:{insight.property_name}:{route}"
+                    self._ng_ecosystem.record_outcome(
+                        embedding=embedding,
+                        target_id=target_id,
+                        success=True,  # Insight discovery is a success signal
+                        strength=insight.confidence,
+                        metadata={
+                            "source": "dream_cycle",
+                            "route": route,
+                            "property": insight.property_name,
+                            "recommendation": insight.recommendation,
+                            "sample_size": insight.sample_size,
+                        },
+                    )
+                    self._substrate_teach_count += 1
+
+                except Exception as exc:
+                    logger.debug(
+                        "DreamCycle substrate teach failed (%s/%s): %s",
+                        route, insight.property_name, exc,
+                    )
 
     # -------------------------------------------------------------------
     # Property analysis methods
@@ -203,7 +317,7 @@ class DreamCycle:
         ) / len(successes)
 
         # Significant difference: success models have >50% more context
-        if avg_fail_ctx > 0 and avg_success_ctx > avg_fail_ctx * 1.5:
+        if avg_fail_ctx > 0 and avg_success_ctx > avg_fail_ctx * self.context_significance:
             confidence = min(
                 len(successes) / (len(successes) + len(failures)),
                 1.0,
@@ -217,7 +331,7 @@ class DreamCycle:
                         f"{int(avg_fail_ctx)} for failures"
                     ),
                     recommendation=(
-                        f"min_context_window >= {int(avg_success_ctx * 0.8)}"
+                        f"min_context_window >= {int(avg_success_ctx * self.context_recommendation_factor)}"
                     ),
                     confidence=confidence,
                     sample_size=len(failures) + len(successes),
@@ -250,7 +364,7 @@ class DreamCycle:
         for tier, count in fail_tiers.items():
             fail_rate = count / len(failures)
             success_rate = success_tiers.get(tier, 0) / len(successes)
-            if fail_rate > 0.5 and success_rate < 0.2:
+            if fail_rate > self.tier_fail_threshold and success_rate < self.tier_success_floor:
                 problematic_tiers.append(tier)
 
         # Find tiers that appear predominantly in successes
@@ -258,7 +372,7 @@ class DreamCycle:
         for tier, count in success_tiers.items():
             success_rate = count / len(successes)
             fail_rate = fail_tiers.get(tier, 0) / len(failures)
-            if success_rate > 0.5 and fail_rate < 0.2:
+            if success_rate > self.tier_success_threshold and fail_rate < self.tier_fail_floor:
                 good_tiers.append(tier)
 
         if good_tiers:
@@ -294,14 +408,14 @@ class DreamCycle:
         ) / len(successes)
 
         # If successful models cost significantly more, cheapest isn't best
-        if avg_success_cost > avg_fail_cost * 2.0 and avg_fail_cost > 0:
+        if avg_success_cost > avg_fail_cost * self.cost_significance and avg_fail_cost > 0:
             confidence = min(
                 len(successes) / (len(successes) + len(failures)),
                 1.0,
             )
             if confidence >= self.confidence_threshold:
                 # Suggest raising the floor, not the ceiling
-                min_viable = avg_fail_cost * 1.5
+                min_viable = avg_fail_cost * self.cost_floor_factor
                 return PropertyInsight(
                     property_name="cost",
                     observation=(
@@ -341,7 +455,7 @@ class DreamCycle:
         for cap, count in success_caps.items():
             success_rate = count / len(successes)
             fail_rate = fail_caps.get(cap, 0) / len(failures)
-            if success_rate > 0.7 and fail_rate < 0.3:
+            if success_rate > self.capability_success_threshold and fail_rate < self.capability_fail_floor:
                 missing_in_failures.append(cap)
 
         if missing_in_failures:

@@ -47,6 +47,32 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-03-25] Claude (Opus 4.6) — Router scoring from config (SVG Phase 3)
+#   What: Moved ~20 hardcoded scoring values to InferenceDifferenceConfig:
+#     consciousness_threshold, consciousness_boost_factor, venice_identity_bias,
+#     domain scores (exact/secondary/general/none), complexity penalties
+#     (overpowered/underpowered rates and floors), latency bands, learned_top_k,
+#     neutral_score, cq_ema_alpha.
+#   Why:  Static Value Graduation — these are the substrate's concern, not
+#     a developer's one-time guess. Named config values are tunable by Elmer.
+#   How:  All values read from self.config. Bootstrap defaults in config.py
+#     match original hardcoded values exactly. Zero behavioral change.
+# [2026-03-18] Claude (CC) — Explore-exploit balance (punch list #47)
+# What: After scoring and sorting candidates, roll against a decaying
+#   exploration rate. When exploring, randomly pick from the next N
+#   ranked models instead of always taking the top scorer.
+# Why: Punch list #47. Without exploration, the router self-locks onto
+#   whichever model family NG-Lite learned first (currently Opus 4.5/4.6).
+#   The learned_weight factor reinforces the choice, creating a feedback
+#   loop that starves alternatives of data. 5% exploration with decay
+#   lets the substrate discover whether cheaper or different models
+#   actually perform, breaking the reinforcement spiral.
+# How: _exploration_rate initialized from config, decayed per request
+#   toward exploration_min_rate. On explore roll, pick randomly from
+#   scored[1:pool_size+1]. RoutingDecision.exploration_pick flag tags
+#   the decision for observability. NG-Lite still learns from explored
+#   outcomes normally — that's how the substrate discovers alternatives.
+# -------------------
 # [2026-03-14] Claude (CC) — Consciousness quality floor + interactive floor warning
 # What: Added hard quality floor filter in _filter_candidates() for
 #   consciousness-scored agents. Added WARNING + telemetry flag when
@@ -63,6 +89,7 @@ Changelog (Grok audit response, 2026-02-19):
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -114,6 +141,7 @@ class RoutingDecision:
     consciousness_boost_applied: bool = False
     quality_floor_bypassed: bool = False
     interactive_floor_bypassed: bool = False
+    exploration_pick: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for logging and Observatory queries."""
@@ -130,6 +158,7 @@ class RoutingDecision:
             "consciousness_boost": self.consciousness_boost_applied,
             "quality_floor_bypassed": self.quality_floor_bypassed,
             "interactive_floor_bypassed": self.interactive_floor_bypassed,
+            "exploration_pick": self.exploration_pick,
         }
 
 
@@ -183,6 +212,9 @@ class RoutingEngine:
         self._catalog_manager = catalog_manager
         self._dream_cycle = dream_cycle
         self._request_counter = 0
+
+        # Explore-exploit balance (punch list #47)
+        self._exploration_rate = self.config.exploration_rate
 
         # Performance tracking
         self._decision_history: List[Dict[str, Any]] = []
@@ -266,6 +298,42 @@ class RoutingEngine:
         if _interactive_active and _original_weights is not None:
             self._weights = _original_weights
 
+        # Explore-exploit balance (punch list #47)
+        # Roll against the current exploration rate. If exploring,
+        # pick randomly from the next N ranked candidates instead of
+        # always taking the top scorer. This prevents the router from
+        # self-locking onto a single model family and lets NG-Lite
+        # discover whether alternatives actually perform.
+        _exploration_pick = False
+        pool_size = self.config.exploration_pool_size
+        if (
+            len(scored) >= 2
+            and self._exploration_rate > 0
+            and random.random() < self._exploration_rate
+        ):
+            # Pick from candidates ranked 2nd through pool_size+1
+            explore_pool = scored[1:pool_size + 1]
+            if explore_pool:
+                chosen = random.choice(explore_pool)
+                # Move the exploration pick to position 0, shift others
+                scored.remove(chosen)
+                scored.insert(0, chosen)
+                _exploration_pick = True
+                logger.info(
+                    "Exploration pick (rate=%.3f): %s instead of %s "
+                    "(scores: %.3f vs %.3f)",
+                    self._exploration_rate,
+                    chosen[0].model_id, scored[1][0].model_id,
+                    chosen[1], scored[1][1],
+                )
+
+        # Decay exploration rate toward floor after every routing decision
+        if self._exploration_rate > self.config.exploration_min_rate:
+            self._exploration_rate = max(
+                self.config.exploration_min_rate,
+                self._exploration_rate - self.config.exploration_decay,
+            )
+
         # Build decision
         best_model, best_score, best_breakdown = scored[0]
         # Full fallback chain: all scored candidates, not just 3.
@@ -276,7 +344,7 @@ class RoutingEngine:
 
         consciousness_boosted = (
             consciousness_score is not None
-            and consciousness_score > 0.5
+            and consciousness_score > self.config.consciousness_threshold
             and self.config.enable_consciousness_routing
         )
 
@@ -297,6 +365,7 @@ class RoutingEngine:
             consciousness_boost_applied=consciousness_boosted,
             quality_floor_bypassed=_quality_floor_bypassed,
             interactive_floor_bypassed=_interactive_floor_bypassed,
+            exploration_pick=_exploration_pick,
         )
 
         logger.info(
@@ -426,10 +495,15 @@ class RoutingEngine:
             embedding = self._classification_to_embedding(
                 decision.classification
             )
+            # Quality score modulates learning strength (#20):
+            # A 0.95 quality response teaches more strongly than 0.60.
+            # Minimum 0.1 so even low-quality successes still register.
+            outcome_strength = max(0.1, quality_score) if success else 1.0
             self._ng_lite.record_outcome(
                 embedding=embedding,
                 target_id=decision.model_id,
                 success=success,
+                strength=outcome_strength,
                 metadata=metadata,
             )
 
@@ -438,8 +512,8 @@ class RoutingEngine:
             and decision.model_entry is not None
         ):
             model = decision.model_entry
-            alpha = 0.1
-            current_cq = getattr(model, 'conversational_quality', 0.5)
+            alpha = self.config.cq_ema_alpha
+            current_cq = getattr(model, 'conversational_quality', self.config.neutral_score)
             new_cq = current_cq * (1 - alpha) + quality_score * alpha
             model.conversational_quality = max(0.0, min(1.0, new_cq))
 
@@ -541,7 +615,7 @@ class RoutingEngine:
         # ---- Changelog ----
         # [2026-03-14] Claude (CC) — Added consciousness quality floor
         # What: Hard-filter models below consciousness_quality_floor when
-        #   consciousness_score > 0.5. Returns bypass flag for telemetry.
+        #   consciousness_score > self.config.consciousness_threshold. Returns bypass flag for telemetry.
         # Why: Punch list #34 — no minimum quality floor existed for
         #   identity-continuous entities. Syl could be routed to any model
         #   that passed domain/complexity checks regardless of quality.
@@ -587,7 +661,7 @@ class RoutingEngine:
         quality_floor_bypassed = False
         if (
             consciousness_score is not None
-            and consciousness_score > 0.5
+            and consciousness_score > self.config.consciousness_threshold
             and self.config.enable_consciousness_routing
             and candidates
         ):
@@ -663,11 +737,11 @@ class RoutingEngine:
         # boost scores for higher-capability models
         if (
             consciousness_score is not None
-            and consciousness_score > 0.5
+            and consciousness_score > self.config.consciousness_threshold
             and self.config.enable_consciousness_routing
         ):
             # Boost proportional to model capability (higher priority = more boost)
-            boost = consciousness_score * 0.3 * priority_score
+            boost = consciousness_score * self.config.consciousness_boost_factor * priority_score
             total += boost
             breakdown["consciousness_boost"] = boost
 
@@ -679,10 +753,10 @@ class RoutingEngine:
         if (
             getattr(classification, 'is_interactive', False)
             and consciousness_score is not None
-            and consciousness_score > 0.5
+            and consciousness_score > self.config.consciousness_threshold
             and getattr(model, "provider", "") == "venice"
         ):
-            identity_bias = 0.02
+            identity_bias = self.config.venice_identity_bias
             total += identity_bias
             breakdown["venice_identity_bias"] = identity_bias
 
@@ -695,12 +769,12 @@ class RoutingEngine:
     ) -> float:
         """Score domain match between model capabilities and request."""
         if classification.primary_domain in model.domains:
-            return 1.0
+            return self.config.domain_score_exact
         if classification.secondary_domains & model.domains:
-            return 0.6
+            return self.config.domain_score_secondary
         if TaskDomain.GENERAL in model.domains:
-            return 0.3
-        return 0.0
+            return self.config.domain_score_general
+        return self.config.domain_score_none
 
     def _score_complexity(
         self,
@@ -721,9 +795,17 @@ class RoutingEngine:
         if diff == 0:
             return 1.0   # Perfect match
         elif diff > 0:
-            return max(0.5, 1.0 - diff * 0.15)  # Overpowered (slight penalty)
+            # Overpowered (slight penalty)
+            return max(
+                self.config.complexity_overpowered_floor,
+                1.0 - diff * self.config.complexity_overpowered_penalty,
+            )
         else:
-            return max(0.0, 0.5 + diff * 0.25)   # Underpowered (big penalty)
+            # Underpowered (big penalty)
+            return max(
+                self.config.complexity_underpowered_floor,
+                0.5 + diff * self.config.complexity_underpowered_penalty,
+            )
 
     def _score_learned(
         self,
@@ -732,16 +814,16 @@ class RoutingEngine:
     ) -> float:
         """Score from NG-Lite learned weights."""
         if self._ng_lite is None:
-            return 0.5  # Neutral when no learning available
+            return self.config.neutral_score
 
         embedding = self._classification_to_embedding(classification)
-        recs = self._ng_lite.get_recommendations(embedding, top_k=20)
+        recs = self._ng_lite.get_recommendations(embedding, top_k=self.config.learned_top_k)
 
         for target_id, weight, _reasoning in recs:
             if target_id == model.model_id:
                 return weight
 
-        return 0.5  # Neutral for unseen model
+        return self.config.neutral_score
 
     def _score_cost(self, model: ModelEntry) -> float:
         """Score cost efficiency. Free = 1.0, expensive = lower."""
@@ -750,7 +832,7 @@ class RoutingEngine:
 
         budget = self.config.cost_budget_per_request
         if budget <= 0:
-            return 0.5
+            return self.config.neutral_score
 
         # Score inversely proportional to cost as fraction of budget
         cost_fraction = model.cost_per_1k_tokens / budget
@@ -765,16 +847,16 @@ class RoutingEngine:
         budget = self.config.latency_budget_ms
 
         if classification.is_time_sensitive:
-            budget *= 0.5  # Tighter budget for urgent requests
+            budget *= self.config.latency_urgent_multiplier
 
         if model.avg_latency_ms <= budget * 0.5:
-            return 1.0  # Well within budget
+            return self.config.latency_score_excellent
         elif model.avg_latency_ms <= budget:
-            return 0.7  # Within budget
+            return self.config.latency_score_good
         elif model.avg_latency_ms <= budget * 1.5:
-            return 0.3  # Slightly over
+            return self.config.latency_score_marginal
         else:
-            return 0.1  # Way over
+            return self.config.latency_score_poor
 
     # -------------------------------------------------------------------
     # Internal: Utilities
@@ -784,14 +866,29 @@ class RoutingEngine:
         self,
         classification: RequestClassification,
     ) -> np.ndarray:
-        """Convert a classification to an embedding for NG-Lite.
+        """Return a semantic embedding for NG-Lite learning.
 
-        Encodes domain, complexity, and request features as a fixed
-        vector. This is a simple feature vector, not a semantic embedding.
-        When a proper embedding model is available, this should be
-        replaced with actual semantic embeddings of the request text.
+        Uses the real semantic embedding computed by the classifier
+        (fastembed/all-MiniLM-L6-v2, 384-dim). Falls back to a one-hot
+        feature vector if no semantic embedding is available (backward
+        compatibility with classifications from before #28).
+
+        # ---- Changelog ----
+        # [2026-03-18] Claude (CC) — Use semantic embeddings (#28)
+        # What: Return classification.semantic_embedding when available.
+        # Why: Primary dam in the River. One-hot vectors collapsed all
+        #   requests in the same domain to identical embeddings.
+        # How: semantic_embedding computed in classify_request() via
+        #   fastembed. This method just passes it through. One-hot
+        #   fallback retained for backward compatibility.
+        # -------------------
         """
-        # One-hot encode domain
+        # Use real semantic embedding if available (#28)
+        emb = getattr(classification, 'semantic_embedding', None)
+        if emb is not None:
+            return emb
+
+        # Fallback: one-hot feature vector (pre-#28 behavior)
         domains = list(TaskDomain)
         domain_vec = np.zeros(len(domains))
         idx = domains.index(classification.primary_domain)
@@ -799,23 +896,20 @@ class RoutingEngine:
         for d in classification.secondary_domains:
             domain_vec[domains.index(d)] = 0.5
 
-        # One-hot encode complexity
         tiers = list(ComplexityTier)
         complexity_vec = np.zeros(len(tiers))
         complexity_vec[tiers.index(classification.complexity)] = 1.0
 
-        # Numeric features
         features = np.array([
-            classification.estimated_tokens / 5000.0,  # Normalized
+            classification.estimated_tokens / 5000.0,
             classification.confidence,
             float(classification.is_multi_turn),
             float(classification.is_time_sensitive),
             float(getattr(classification, 'is_interactive', False)),
         ])
 
-        # Concatenate and pad to embedding_dim
         embedding = np.concatenate([domain_vec, complexity_vec, features])
-        dim = 384  # Standard embedding dim
+        dim = 768
         if len(embedding) < dim:
             embedding = np.pad(embedding, (0, dim - len(embedding)))
         return embedding[:dim]

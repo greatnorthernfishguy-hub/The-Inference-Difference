@@ -92,14 +92,19 @@ PADDING_PATTERNS = [
     r"(hope this helps|let me know if|feel free to)",
 ]
 
-# Quality scoring weights
-QUALITY_WEIGHTS = {
+# Quality scoring weights — bootstrap defaults.
+# SVG Phase 3: These are the substrate's concern. Pass overrides via
+# quality_weights parameter to evaluate_quality() (config-driven).
+DEFAULT_QUALITY_WEIGHTS = {
     "completion": 0.30,
     "coherence": 0.25,
     "length": 0.15,
     "error_free": 0.20,
     "latency": 0.10,
 }
+
+# Back-compat alias
+QUALITY_WEIGHTS = DEFAULT_QUALITY_WEIGHTS
 
 
 def evaluate_quality(
@@ -108,6 +113,8 @@ def evaluate_quality(
     latency_ms: float = 0.0,
     latency_budget_ms: float = 5000.0,
     quality_threshold: float = 0.7,
+    quality_weights: Optional[Dict[str, float]] = None,
+    config: Optional[Any] = None,
 ) -> QualityEvaluation:
     """Evaluate the quality of a model response.
 
@@ -126,34 +133,41 @@ def evaluate_quality(
     text = response_text or ""
     lower = text.lower()
 
+    # Issue thresholds — from config or bootstrap defaults
+    t_completion = getattr(config, 'quality_issue_completion', 0.5) if config else 0.5
+    t_coherence = getattr(config, 'quality_issue_coherence', 0.5) if config else 0.5
+    t_length = getattr(config, 'quality_issue_length', 0.4) if config else 0.4
+    t_error = getattr(config, 'quality_issue_error', 0.7) if config else 0.7
+    t_latency = getattr(config, 'quality_issue_latency', 0.5) if config else 0.5
+
     # --- Completion score ---
     completion = _score_completion(text, lower, classification)
     evaluation.completion_score = completion
-    if completion < 0.5:
+    if completion < t_completion:
         issues.append("Response may be incomplete or non-responsive")
 
     # --- Coherence score ---
     coherence = _score_coherence(text)
     evaluation.coherence_score = coherence
-    if coherence < 0.5:
+    if coherence < t_coherence:
         issues.append("Response may lack coherence")
 
     # --- Length appropriateness ---
     length = _score_length(text, classification)
     evaluation.length_score = length
-    if length < 0.4:
+    if length < t_length:
         issues.append("Response length inappropriate for request complexity")
 
     # --- Error indicators ---
     error_free = _score_error_free(lower)
     evaluation.error_score = error_free
-    if error_free < 0.7:
+    if error_free < t_error:
         issues.append("Response contains error/refusal indicators")
 
     # --- Latency ---
     latency = _score_latency(latency_ms, latency_budget_ms)
     evaluation.latency_score = latency
-    if latency < 0.5:
+    if latency < t_latency:
         issues.append(
             f"Latency ({latency_ms:.0f}ms) exceeded budget "
             f"({latency_budget_ms:.0f}ms)"
@@ -168,9 +182,10 @@ def evaluate_quality(
         "latency": latency,
     }
 
+    weights = quality_weights or DEFAULT_QUALITY_WEIGHTS
     overall = sum(
-        evaluation.breakdown[k] * QUALITY_WEIGHTS[k]
-        for k in QUALITY_WEIGHTS
+        evaluation.breakdown[k] * weights[k]
+        for k in weights
     )
     evaluation.overall_score = overall
     evaluation.is_success = overall >= quality_threshold

@@ -8,6 +8,14 @@ Uses lightweight heuristics (keyword analysis, structural patterns)
 rather than an ML model, so classification adds <1ms overhead.
 
 # ---- Changelog ----
+# [2026-03-25] Claude (Opus 4.6) — Classifier thresholds from config (SVG Phase 3)
+#   What: Token multipliers, word count breakpoints, context window estimation,
+#     and confidence fallback now read from optional config parameter.
+#   Why:  Static Value Graduation — classification calibration is the substrate's
+#     concern. Named config values are tunable by Elmer.
+#   How:  classify_request() accepts optional config param. _estimate_complexity()
+#     reads breakpoints from config. All fallback to original hardcoded defaults
+#     when config is None. Zero behavioral change at bootstrap.
 # [2026-03-19] Claude Code (Opus 4.6) — Migrate to BAAI/bge-base-en-v1.5 (#45)
 # What: _EMBEDDING_DIM 384→768. fastembed model all-MiniLM-L6-v2 → BAAI/bge-base-en-v1.5.
 # Why: Ecosystem-wide embedding migration. Old model deposited 384-dim vectors
@@ -194,6 +202,7 @@ def classify_request(
     message: str,
     conversation_history: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    config: Optional[Any] = None,
 ) -> RequestClassification:
     """Classify a request for routing.
 
@@ -252,30 +261,35 @@ def classify_request(
         )
     else:
         result.primary_domain = TaskDomain.GENERAL
-        result.confidence = 0.3
+        result.confidence = getattr(config, 'no_domain_confidence', 0.3) if config else 0.3
 
     # Complexity estimation
-    result.complexity = _estimate_complexity(text, lower)
+    result.complexity = _estimate_complexity(text, lower, config)
 
     # Token estimation (rough: 1.5x input length for simple, 5x for complex)
     word_count = len(text.split())
     complexity_multipliers = {
-        ComplexityTier.TRIVIAL: 0.5,
-        ComplexityTier.LOW: 1.5,
-        ComplexityTier.MEDIUM: 3.0,
-        ComplexityTier.HIGH: 5.0,
-        ComplexityTier.EXTREME: 8.0,
+        ComplexityTier.TRIVIAL: getattr(config, 'token_mult_trivial', 0.5) if config else 0.5,
+        ComplexityTier.LOW: getattr(config, 'token_mult_low', 1.5) if config else 1.5,
+        ComplexityTier.MEDIUM: getattr(config, 'token_mult_medium', 3.0) if config else 3.0,
+        ComplexityTier.HIGH: getattr(config, 'token_mult_high', 5.0) if config else 5.0,
+        ComplexityTier.EXTREME: getattr(config, 'token_mult_extreme', 8.0) if config else 8.0,
     }
-    multiplier = complexity_multipliers.get(result.complexity, 3.0)
-    result.estimated_tokens = max(50, int(word_count * multiplier))
+    fallback_mult = getattr(config, 'token_mult_fallback', 3.0) if config else 3.0
+    min_tokens = getattr(config, 'min_estimated_tokens', 50) if config else 50
+    multiplier = complexity_multipliers.get(result.complexity, fallback_mult)
+    result.estimated_tokens = max(min_tokens, int(word_count * multiplier))
 
     # Context window requirements
     history = conversation_history or []
-    history_tokens = sum(len(h.split()) for h in history) * 1.3  # Rough
+    hist_mult = getattr(config, 'history_token_multiplier', 1.3) if config else 1.3
+    ctx_safety = getattr(config, 'context_window_safety', 1.5) if config else 1.5
+    min_ctx = getattr(config, 'min_context_window', 2048) if config else 2048
+    history_tokens = sum(len(h.split()) for h in history) * hist_mult
     result.requires_context_window = int(
-        (history_tokens + result.estimated_tokens + word_count) * 1.5
+        (history_tokens + result.estimated_tokens + word_count) * ctx_safety
     )
-    result.requires_context_window = max(result.requires_context_window, 2048)
+    result.requires_context_window = max(result.requires_context_window, min_ctx)
 
     # Multi-turn detection
     result.is_multi_turn = len(history) > 0
@@ -305,7 +319,7 @@ def classify_request(
     return result
 
 
-def _estimate_complexity(text: str, lower: str) -> ComplexityTier:
+def _estimate_complexity(text: str, lower: str, config: Optional[Any] = None) -> ComplexityTier:
     """Estimate request complexity from text features."""
     word_count = len(text.split())
 
@@ -318,14 +332,19 @@ def _estimate_complexity(text: str, lower: str) -> ComplexityTier:
         len(re.findall(p, lower)) for p in LOW_COMPLEXITY_PATTERNS
     )
 
-    # Length-based baseline
-    if word_count < 10:
+    # Length-based baseline — breakpoints from config (bootstrap defaults inline)
+    w_trivial = getattr(config, 'complexity_words_trivial', 10) if config else 10
+    w_low = getattr(config, 'complexity_words_low', 30) if config else 30
+    w_medium = getattr(config, 'complexity_words_medium', 100) if config else 100
+    w_high = getattr(config, 'complexity_words_high', 300) if config else 300
+
+    if word_count < w_trivial:
         base = ComplexityTier.TRIVIAL
-    elif word_count < 30:
+    elif word_count < w_low:
         base = ComplexityTier.LOW
-    elif word_count < 100:
+    elif word_count < w_medium:
         base = ComplexityTier.MEDIUM
-    elif word_count < 300:
+    elif word_count < w_high:
         base = ComplexityTier.HIGH
     else:
         base = ComplexityTier.EXTREME

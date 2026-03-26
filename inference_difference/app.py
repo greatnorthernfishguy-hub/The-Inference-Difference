@@ -59,9 +59,41 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: Translation Shim for model name normalization.
 - ADDED: Auto-retry with fallback chain on model failure.
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
+
+# ---- Changelog ----
+# [2026-03-25] Claude (CC) — Handle list-type message content
+# What: Extract text from OpenAI list-format content blocks before
+#   passing to hooks and classifier. content can be a string OR a
+#   list of {type, text/image_url} blocks (vision, tool use, multimodal).
+# Why: TrollGuard._assess_threat() calls .lower() and classifier calls
+#   .strip() on the content — both crash with AttributeError when
+#   content is a list. This broke Discord<->OpenClaw this morning when
+#   a multimodal payload hit TID.
+# How: Helper _extract_text_content() joins text blocks from list
+#   content, applied at the extraction point (Law 4 — fix at source).
+# -------------------
+# ---- Changelog ----
+# [2026-03-18] Claude (CC) — Retry chain experience (#19)
+# What: Record each failed model attempt to the substrate before
+#   retrying with the next fallback. Previously only the final
+#   outcome was recorded — all intermediate failures vanished.
+# Why: Punch list #19. The substrate couldn't learn which models
+#   fail for which patterns because failure signals were lost.
+#   With explore-exploit (#47) now active, this is critical —
+#   the substrate needs to learn from exploration failures.
+# How: report_outcome(success=False) called inside the fallback
+#   loop before each retry. Metadata includes retry_chain=True,
+#   failed_model, fallback_to, and error summary.
+# -------------------
 """
 
 from __future__ import annotations
+
+# Auto-update on startup — pull latest code + sync vendored files
+try:
+    from ng_updater import auto_update; auto_update()
+except Exception:
+    pass  # Never prevent module startup
 
 import logging
 import os
@@ -239,12 +271,14 @@ _TIER_TO_COMPLEXITY = {
 }
 
 # Maps OpenRouter provider_tier → ModelEntry.priority
+# Bootstrap defaults — SVG Phase 3: substrate's concern
 _TIER_TO_PRIORITY = {
     "frontier": 40,
     "performance": 30,
     "standard": 20,
     "budget": 10,
 }
+_DEFAULT_TIER_PRIORITY = 20  # Fallback for unknown tiers
 
 
 def _register_catalog_models() -> None:
@@ -312,7 +346,7 @@ def _register_catalog_models() -> None:
                 context_window=max(cm.context_window, 4096),
                 cost_per_1k_tokens=cost_per_1k,
                 avg_latency_ms=2000.0,  # Sensible default for cloud APIs
-                priority=_TIER_TO_PRIORITY.get(cm.provider_tier, 20),
+                priority=_TIER_TO_PRIORITY.get(cm.provider_tier, _DEFAULT_TIER_PRIORITY),
                 enabled=cm.is_active,
             )
         except (ValueError, TypeError) as e:
@@ -412,11 +446,12 @@ async def lifespan(app: FastAPI):
     _state.config = InferenceDifferenceConfig()
     _state.config.models = {**default_local_models(), **default_api_models()}
 
-    # Set default model (prefer local if available)
-    if _state.hardware.has_gpu:
+    # Set default model — Venice DeepSeek V3.2 as provider-independent
+    # fallback. Works even if OpenRouter is completely down. (#36/#9)
+    if _state.hardware.has_gpu and "ollama/llama3.1:8b" in _state.config.models:
         _state.config.default_model = "ollama/llama3.1:8b"
     else:
-        _state.config.default_model = "anthropic/claude-haiku-4-5-20251001"
+        _state.config.default_model = "venice/deepseek-v3.2"
 
     # Initialize NG Ecosystem as uni-bridge substrate (River audit Phase 3)
     # Single instance serves both router learning AND peer bridge writes.
@@ -486,7 +521,17 @@ async def lifespan(app: FastAPI):
     _apply_quality_seeds()
 
     # Initialize DreamCycle for model property correlation analysis (§4.5.5)
-    _state.dream_cycle = DreamCycle()
+    # Wire to substrate (#17) so insights reach the River
+    _dc_embed_fn = None
+    try:
+        from ng_embed import embed as _ng_embed
+        _dc_embed_fn = _ng_embed
+    except ImportError:
+        pass
+    _state.dream_cycle = DreamCycle(
+        ng_ecosystem=_state.ng_ecosystem,
+        embed_fn=_dc_embed_fn,
+    )
 
     # Create routing engine
     _state.engine = RoutingEngine(
@@ -518,7 +563,7 @@ async def lifespan(app: FastAPI):
     # Register OpenClaw adapter — connect to gateway if configured
     try:
         from inference_difference.et_module import ETModuleManifest
-        from inference_difference.openclaw_adapter import OpenClawAdapter
+        from inference_difference.compliance_adapter import OpenClawAdapter
         openclaw_manifest = ETModuleManifest(
             name="openclaw",
             version="1.0.0",
@@ -658,6 +703,26 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+def _extract_text_content(content) -> str:
+    """Extract text from OpenAI message content (string or list of blocks).
+
+    OpenAI content can be a plain string or a list like:
+        [{"type": "text", "text": "hello"}, {"type": "image_url", ...}]
+    This returns the concatenated text parts, or "" if content is falsy.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(parts)
+    return str(content) if content else ""
+
+
 # ---------------------------------------------------------------------------
 # PRIMARY ENDPOINT: Transparent Proxy
 # ---------------------------------------------------------------------------
@@ -696,12 +761,12 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     user_message = ""
     for msg in reversed(req.messages):
         if msg.get("role") == "user":
-            user_message = msg.get("content", "")
+            user_message = _extract_text_content(msg.get("content", ""))
             break
 
     # Build conversation history from prior messages
     conversation_history = [
-        msg.get("content", "")
+        _extract_text_content(msg.get("content", ""))
         for msg in req.messages[:-1]
         if msg.get("role") == "user"
     ]
@@ -813,10 +878,29 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     )
 
     # --- Step 6: Auto-retry with fallback chain ---
+    # Record EVERY failure to the substrate, not just the final outcome.
+    # The substrate needs to learn which models fail for which patterns,
+    # not just which model eventually succeeded. (#19)
     tried_models = [selected_model]
     for fallback_id in fallback_chain:
         if model_response.success:
             break
+
+        # Record the failure BEFORE moving on (#19 — retry chain experience)
+        if decision is not None and _state.engine is not None:
+            _state.engine.report_outcome(
+                decision=decision,
+                success=False,
+                quality_score=0.0,
+                latency_ms=model_response.latency_ms,
+                metadata={
+                    "retry_chain": True,
+                    "failed_model": tried_models[-1],
+                    "fallback_to": fallback_id,
+                    "error": str(model_response.error)[:200],
+                },
+            )
+
         logger.info(
             "Model %s failed, trying fallback %s",
             tried_models[-1], fallback_id,
@@ -885,6 +969,50 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         },
         "quality_score": round(quality.overall_score, 3),
     }
+
+    # --- Token estimation substrate learning ---
+    # Feed estimation data to NeuroGraph so the substrate learns
+    # the mapping between word counts and actual token usage.
+    if _state.ng_ecosystem is not None and classification is not None:
+        try:
+            usage = model_response.usage
+            was_estimated = usage.get("estimated", False)
+            embedding = _state.engine._classification_to_embedding(
+                classification,
+            )
+            # Record with metadata so the substrate sees the numbers
+            _state.ng_ecosystem.record_outcome(
+                embedding=embedding,
+                target_id=f"token_est:{selected_model}",
+                success=not was_estimated,  # real data = success
+                strength=0.3,  # moderate learning signal
+                metadata={
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                    "estimated": was_estimated,
+                    "model": selected_model,
+                },
+            )
+        except Exception as e:
+            logger.debug("Token estimation learning failed: %s", e)
+
+    # --- Sidecar: write last usage for OC session patcher ---
+    # OpenClaw's openai-responses parser drops usage from TID's SSE
+    # stream. This file lets the oc-usage-shim patch the zeros.
+    try:
+        import json as _json
+        _usage_sidecar = {
+            "prompt_tokens": model_response.usage.get("prompt_tokens", 0),
+            "completion_tokens": model_response.usage.get("completion_tokens", 0),
+            "total_tokens": model_response.usage.get("total_tokens", 0),
+            "estimated": model_response.usage.get("estimated", False),
+            "timestamp": time.time(),
+        }
+        with open("/tmp/tid_last_usage.json", "w") as _f:
+            _json.dump(_usage_sidecar, _f)
+    except Exception:
+        pass  # best-effort, don't break the response
 
     return JSONResponse(content=response_dict)
 

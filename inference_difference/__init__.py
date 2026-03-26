@@ -27,7 +27,7 @@ from inference_difference.et_module import (
 )
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.classifier import RequestClassification, classify_request
-from inference_difference.openclaw_adapter import OpenClawAdapter
+from inference_difference.compliance_adapter import OpenClawAdapter
 from inference_difference.router import RoutingEngine, RoutingDecision
 from inference_difference.quality import QualityEvaluation, evaluate_quality
 from inference_difference.trollguard import TrollGuard, create_trollguard

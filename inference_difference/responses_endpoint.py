@@ -393,6 +393,10 @@ async def _generate_sse_stream(
     })
 
     # --- Event 9: response.completed ---
+    # The OpenAI SDK expects response.completed events to nest the
+    # response object under a "response" key. Without this, the SDK
+    # puts fields flat on the event and OpenClaw's parser can't find
+    # event.response.usage — causing zero token tracking.
     final_response = _build_response_object(
         content=content,
         model=model,
@@ -402,7 +406,7 @@ async def _generate_sse_stream(
         routing_info=routing_info,
         status="completed",
     )
-    yield _sse_event("response.completed", final_response)
+    yield _sse_event("response.completed", {"response": final_response})
 
     # --- Event 10: [DONE] ---
     yield _sse_done()

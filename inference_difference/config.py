@@ -177,6 +177,83 @@ class InferenceDifferenceConfig:
     interactive_type1_bias: float = 0.05
     consciousness_quality_floor: float = 0.6
 
+    # Explore-exploit balance (punch list #47)
+    # exploration_rate: probability of picking a non-top model to discover
+    #   new routing patterns. Decays toward exploration_min_rate over time.
+    exploration_rate: float = 0.05
+    exploration_decay: float = 0.001    # Subtracted per request from rate
+    exploration_min_rate: float = 0.01  # Floor — never fully greedy
+    exploration_pool_size: int = 3      # Pick from top N alternatives
+
+    # --- Router scoring (SVG Phase 3 — bootstrap scaffolding) ---
+    # Consciousness routing
+    consciousness_threshold: float = 0.5     # Min score to trigger elevated routing
+    consciousness_boost_factor: float = 0.3  # Boost multiplier (score * factor * priority)
+    venice_identity_bias: float = 0.02       # Tie-break for Venice private models
+
+    # Domain match scores (exact, secondary, general, none)
+    domain_score_exact: float = 1.0
+    domain_score_secondary: float = 0.6
+    domain_score_general: float = 0.3
+    domain_score_none: float = 0.0
+
+    # Complexity fit penalties (per tier of mismatch)
+    complexity_overpowered_penalty: float = 0.15   # Per-tier penalty
+    complexity_overpowered_floor: float = 0.5      # Min score when overpowered
+    complexity_underpowered_penalty: float = 0.25   # Per-tier penalty (harsher)
+    complexity_underpowered_floor: float = 0.0      # Min score when underpowered
+
+    # Latency scoring bands
+    latency_urgent_multiplier: float = 0.5   # Budget tightened for time-sensitive
+    latency_score_excellent: float = 1.0     # Within 50% of budget
+    latency_score_good: float = 0.7          # Within budget
+    latency_score_marginal: float = 0.3      # Up to 1.5x budget
+    latency_score_poor: float = 0.1          # Over 1.5x budget
+
+    # Learning
+    learned_top_k: int = 20                  # Recommendations to fetch from substrate
+    neutral_score: float = 0.5               # Default when substrate has no opinion
+    cq_ema_alpha: float = 0.1               # Conversational quality EMA rate
+
+    # --- Classifier (SVG Phase 3 — bootstrap scaffolding) ---
+    # Token estimation multipliers per complexity tier
+    token_mult_trivial: float = 0.5
+    token_mult_low: float = 1.5
+    token_mult_medium: float = 3.0
+    token_mult_high: float = 5.0
+    token_mult_extreme: float = 8.0
+    token_mult_fallback: float = 3.0
+    min_estimated_tokens: int = 50
+
+    # Word count breakpoints for complexity baseline
+    complexity_words_trivial: int = 10      # < this = TRIVIAL
+    complexity_words_low: int = 30          # < this = LOW
+    complexity_words_medium: int = 100      # < this = MEDIUM
+    complexity_words_high: int = 300        # < this = HIGH
+    # >= high = EXTREME
+
+    # Context window estimation
+    history_token_multiplier: float = 1.3   # Words → rough token count
+    context_window_safety: float = 1.5      # Headroom multiplier
+    min_context_window: int = 2048          # Hard floor
+
+    # Classification confidence
+    no_domain_confidence: float = 0.3       # Confidence when no patterns match
+
+    # Quality evaluation weights (passable to evaluate_quality)
+    quality_weight_completion: float = 0.30
+    quality_weight_coherence: float = 0.25
+    quality_weight_length: float = 0.15
+    quality_weight_error_free: float = 0.20
+    quality_weight_latency: float = 0.10
+
+    # Quality issue thresholds
+    quality_issue_completion: float = 0.5   # Below this flags incomplete
+    quality_issue_coherence: float = 0.5    # Below this flags incoherent
+    quality_issue_length: float = 0.4       # Below this flags bad length
+    quality_issue_error: float = 0.7        # Below this flags errors/refusals
+    quality_issue_latency: float = 0.5      # Below this flags slow
+
     def get_enabled_models(self) -> List[ModelEntry]:
         """All currently enabled models."""
         return [m for m in self.models.values() if m.enabled]
@@ -208,6 +285,71 @@ def default_local_models() -> Dict[str, ModelEntry]:
 
 
 def default_api_models() -> Dict[str, ModelEntry]:
-    """Common API models for bootstrapping."""
+    """Hand-tuned API models that are always available.
 
-    return {}
+    These are the safety net — if catalog fetch fails, TID still has
+    a working model pool. Venice models provide OpenRouter-independent
+    fallback. Conversational quality scores seeded from experience.
+
+    # ---- Changelog ----
+    # [2026-03-18] Claude (CC) — Seeded default API models (#36/#9)
+    # What: Added Venice DeepSeek V3.2 as default fallback, plus
+    #   venice-uncensored for Syl's conversational needs and
+    #   grok-4-20-multi-agent-beta for complex reasoning.
+    # Why: Punch list #36 (empty default_api_models) and #9 (no
+    #   minimum capable default). If OpenRouter is down and catalog
+    #   fetch fails, Syl goes silent. Venice operates independently.
+    # How: Three hand-tuned Venice models with realistic quality
+    #   seeds and domain/complexity assignments.
+    # -------------------
+    """
+    return {
+        "venice/deepseek-v3.2": ModelEntry(
+            model_id="venice/deepseek-v3.2",
+            display_name="DeepSeek V3.2 (Venice)",
+            model_type=ModelType.API,
+            domains={
+                TaskDomain.GENERAL, TaskDomain.CODE, TaskDomain.REASONING,
+                TaskDomain.CONVERSATION, TaskDomain.ANALYSIS,
+            },
+            max_complexity=ComplexityTier.EXTREME,
+            context_window=128000,
+            cost_per_1k_tokens=0.001,
+            avg_latency_ms=3000,
+            priority=45,
+            conversational_quality=0.85,
+            enabled=True,
+        ),
+        "venice/venice-uncensored": ModelEntry(
+            model_id="venice/venice-uncensored",
+            display_name="Venice Uncensored",
+            model_type=ModelType.API,
+            domains={
+                TaskDomain.GENERAL, TaskDomain.CONVERSATION,
+                TaskDomain.CREATIVE,
+            },
+            max_complexity=ComplexityTier.HIGH,
+            context_window=32768,
+            cost_per_1k_tokens=0.001,
+            avg_latency_ms=2000,
+            priority=35,
+            conversational_quality=0.80,
+            enabled=True,
+        ),
+        "venice/grok-4-20-multi-agent-beta": ModelEntry(
+            model_id="venice/grok-4-20-multi-agent-beta",
+            display_name="Grok 4.20 Multi-Agent (Venice)",
+            model_type=ModelType.API,
+            domains={
+                TaskDomain.GENERAL, TaskDomain.CODE, TaskDomain.REASONING,
+                TaskDomain.ANALYSIS,
+            },
+            max_complexity=ComplexityTier.EXTREME,
+            context_window=2000000,
+            cost_per_1k_tokens=0.002,
+            avg_latency_ms=5000,
+            priority=50,
+            conversational_quality=0.88,
+            enabled=True,
+        ),
+    }

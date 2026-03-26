@@ -120,7 +120,7 @@ class CatalogManager:
     """
 
     OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
-    HF_CATALOG_URL = "https://api-inference.huggingface.co/models"
+    HF_CATALOG_URL = "https://huggingface.co/api/models"
 
     def __init__(
         self,
@@ -347,26 +347,12 @@ class CatalogManager:
             "openrouter", len(or_models), start, now,
         )
 
-        # ============================================================
-        # !! HUGGINGFACE FETCH DISABLED — DO NOT RE-ENABLE WITHOUT A KEY !!
-        #
-        # HuggingFace Inference API keys rotated / expired as of early 2026.
-        # Josh does not have a current HF key. Attempting this fetch on
-        # every catalog refresh cycle burns time, fills logs with warnings,
-        # and provides zero value until a valid key is configured.
-        #
-        # TO RE-ENABLE:
-        #   1. Get a fresh HF API key from huggingface.co/settings/tokens
-        #   2. Add it to the systemd service file:
-        #      Environment=HUGGINGFACE_API_KEY=hf_xxxx...
-        #   3. Run: sudo systemctl daemon-reload && sudo systemctl restart inference-difference
-        #   4. Add "huggingface" back to catalog_filters.yaml allowlist.providers
-        #   5. Remove this comment block and uncomment the lines below.
-        #
-        # hf_models = self._fetch_huggingface_catalog(now)
-        # new_models.extend(hf_models)
-        # self._log_refresh("huggingface", len(hf_models), start, now)
-        # ============================================================
+        # HuggingFace catalog — re-enabled 2026-03-18 with new HF_TOKEN.
+        # Skips gracefully if HF_TOKEN not set (no error spam).
+        hf_models = self._fetch_huggingface_catalog(now)
+        new_models.extend(hf_models)
+        if hf_models:
+            self._log_refresh("huggingface", len(hf_models), start, now)
 
         # Fetch from Venice
         venice_models = self._fetch_venice_catalog(now)
@@ -529,7 +515,22 @@ class CatalogManager:
     def _fetch_huggingface_catalog(self, now: str) -> List[CatalogModel]:
         """Fetch model catalog from HuggingFace Inference API.
 
+        Queries HF's model API for warm text-generation models available
+        on the Inference API. Requires HF_TOKEN env var for authenticated
+        access (higher rate limits, more models visible).
+
         Returns empty list on failure (graceful degradation).
+
+        # ---- Changelog ----
+        # [2026-03-18] Claude (CC) — Re-enabled HuggingFace catalog
+        # What: Updated URL from legacy api-inference to huggingface.co/api,
+        #   added Bearer auth via HF_TOKEN, updated env var from
+        #   HUGGINGFACE_API_KEY to HF_TOKEN (HF standard).
+        # Why: HF changed token structure, old API stopped working.
+        #   New token created, catalog re-enabled.
+        # How: Auth header added. URL updated. Model prefix: huggingface/.
+        #   Inference routing uses router.huggingface.co (model_client.py).
+        # -------------------
         """
         try:
             import httpx
@@ -539,16 +540,27 @@ class CatalogManager:
             )
             return []
 
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if not hf_token:
+            logger.debug("HF_TOKEN not set — skipping HuggingFace catalog")
+            return []
+
         try:
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {hf_token}",
+            }
             resp = httpx.get(
                 self.HF_CATALOG_URL,
                 timeout=30.0,
                 params={
                     "pipeline_tag": "text-generation",
-                    "inference": "warm",
+                    "inference_provider": "all",
                     "limit": 100,
+                    "sort": "downloads",
+                    "direction": "-1",
                 },
-                headers={"Accept": "application/json"},
+                headers=headers,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -565,13 +577,12 @@ class CatalogManager:
             if not model_id:
                 continue
 
-            # HuggingFace Inference API models are typically free tier
             models.append(CatalogModel(
                 id=f"huggingface/{model_id}",
                 provider="huggingface",
                 display_name=model_id.split("/")[-1] if "/" in model_id else model_id,
                 context_window=self._hf_context_window(item),
-                cost_per_1m_input=0.0,   # HF Inference API free tier
+                cost_per_1m_input=0.0,   # HF Inference API — free/pro tier
                 cost_per_1m_output=0.0,
                 provider_tier="standard",
                 capabilities=self._hf_capabilities(item),

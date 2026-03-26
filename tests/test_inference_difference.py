@@ -13,6 +13,16 @@ Changelog (Grok audit response, 2026-02-19):
 - ADDED: Negative latency edge case test (audit: "zero latency=1.0").
 
 # ---- Changelog ----
+# [2026-03-18] Claude (CC) — Added explore-exploit balance tests
+# What: New TestExploreExploit class covering exploration picks,
+#   decay behavior, config defaults, serialization, and statistical
+#   distribution over many routing calls.
+# Why: Punch list #47 implementation needs test coverage.
+# How: Seed random for deterministic tests where needed. Use
+#   controlled exploration_rate=1.0 to force exploration, 0.0 to
+#   disable it, and statistical tests over 200 routes to verify
+#   the 5% rate produces the expected distribution.
+# -------------------
 # [2026-03-14] Claude (CC) — Updated for qwen removal + quality floor
 # What: Removed qwen2.5:1.5b from model pool, replaced default_local_models/
 #   default_api_models fixtures with explicit test model sets. Added tests
@@ -257,10 +267,13 @@ class TestConfig:
         models = default_local_models()
         assert len(models) == 0
 
-    def test_default_api_models_empty(self):
-        """default_api_models() is empty — punch list #36."""
+    def test_default_api_models_seeded(self):
+        """default_api_models() has hand-tuned Venice fallbacks (#36 fix)."""
         models = default_api_models()
-        assert len(models) == 0
+        assert len(models) >= 3
+        assert "venice/deepseek-v3.2" in models
+        assert "venice/venice-uncensored" in models
+        assert "venice/grok-4-20-multi-agent-beta" in models
 
     def test_config_get_enabled_models(self, full_config):
         enabled = full_config.get_enabled_models()
@@ -1004,3 +1017,180 @@ class TestRouterReasoning:
         # Concise should NOT include "Top factors"
         assert "Top factors" not in decision.reasoning
         assert "Selected" in decision.reasoning
+
+
+# ---------------------------------------------------------------------------
+# Explore-Exploit Balance Tests (Punch list #47)
+# ---------------------------------------------------------------------------
+
+class TestExploreExploit:
+
+    def test_exploration_config_defaults(self):
+        """Config has exploration fields with correct defaults."""
+        config = InferenceDifferenceConfig()
+        assert config.exploration_rate == 0.05
+        assert config.exploration_decay == 0.001
+        assert config.exploration_min_rate == 0.01
+        assert config.exploration_pool_size == 3
+
+    def test_exploration_pick_flag_in_to_dict(self, full_config, gpu_hardware):
+        """exploration_pick appears in serialized decision."""
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        decision = engine.route(classification)
+        d = decision.to_dict()
+        assert "exploration_pick" in d
+
+    def test_forced_exploration_picks_alternative(self, full_config, gpu_hardware):
+        """With exploration_rate=1.0, every pick is an exploration pick."""
+        full_config.exploration_rate = 1.0
+        full_config.exploration_min_rate = 1.0  # Prevent decay
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+
+        classification = classify_request("Write Python code")
+        decision = engine.route(classification)
+
+        assert decision.exploration_pick is True
+        assert decision.model_id != ""
+
+    def test_no_exploration_when_rate_zero(self, full_config, gpu_hardware):
+        """With exploration_rate=0.0, no exploration ever happens."""
+        full_config.exploration_rate = 0.0
+        full_config.exploration_min_rate = 0.0
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+
+        for _ in range(20):
+            classification = classify_request("Write Python code")
+            decision = engine.route(classification)
+            assert decision.exploration_pick is False
+
+    def test_exploration_picks_from_top_n(self, full_config, gpu_hardware):
+        """Exploration picks come from the configured pool, not any random model."""
+        full_config.exploration_rate = 1.0
+        full_config.exploration_min_rate = 1.0
+        full_config.exploration_pool_size = 2
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+
+        # Route many times and collect all exploration picks
+        picked_models = set()
+        for _ in range(50):
+            # Reset exploration rate each time since engine decays it
+            engine._exploration_rate = 1.0
+            classification = classify_request("Explain quantum physics")
+            decision = engine.route(classification)
+            picked_models.add(decision.model_id)
+
+        # Should not have picked ALL available models — only from top pool
+        all_models = set(full_config.models.keys())
+        assert len(picked_models) <= full_config.exploration_pool_size + 1
+
+    def test_exploration_rate_decays(self, full_config, gpu_hardware):
+        """Exploration rate decays with each routing decision."""
+        full_config.exploration_rate = 0.05
+        full_config.exploration_decay = 0.01
+        full_config.exploration_min_rate = 0.01
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+
+        initial_rate = engine._exploration_rate
+        classification = classify_request("Hello")
+
+        for _ in range(3):
+            engine.route(classification)
+
+        assert engine._exploration_rate < initial_rate
+        assert engine._exploration_rate >= full_config.exploration_min_rate
+
+    def test_exploration_rate_respects_floor(self, full_config, gpu_hardware):
+        """Rate never drops below exploration_min_rate."""
+        full_config.exploration_rate = 0.02
+        full_config.exploration_decay = 0.01
+        full_config.exploration_min_rate = 0.01
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+
+        classification = classify_request("Hello")
+        # Route many times to force full decay
+        for _ in range(100):
+            engine.route(classification)
+
+        assert engine._exploration_rate == full_config.exploration_min_rate
+
+    def test_exploration_statistical_distribution(self, full_config, gpu_hardware):
+        """Over many requests at 5%, roughly 5% should be exploration picks."""
+        import random as _random
+        _random.seed(42)  # Deterministic for test stability
+
+        full_config.exploration_rate = 0.05
+        full_config.exploration_min_rate = 0.05  # No decay for this test
+        engine = RoutingEngine(config=full_config, hardware=gpu_hardware)
+
+        n_routes = 200
+        exploration_count = 0
+        classification = classify_request("Write code")
+
+        for _ in range(n_routes):
+            # Hold rate steady for statistical test
+            engine._exploration_rate = 0.05
+            decision = engine.route(classification)
+            if decision.exploration_pick:
+                exploration_count += 1
+
+        # With 5% rate over 200 requests, expect ~10.
+        # Allow wide margin (1-25) to avoid flaky test.
+        assert 1 <= exploration_count <= 25, (
+            f"Expected ~10 exploration picks out of {n_routes}, "
+            f"got {exploration_count}"
+        )
+
+    def test_single_candidate_no_exploration(self, gpu_hardware):
+        """With only one candidate, exploration cannot happen."""
+        config = InferenceDifferenceConfig()
+        config.exploration_rate = 1.0
+        config.exploration_min_rate = 1.0
+        config.models = {
+            "only-model": ModelEntry(
+                model_id="only-model",
+                display_name="Only Model",
+                model_type=ModelType.API,
+                domains={TaskDomain.GENERAL},
+                max_complexity=ComplexityTier.HIGH,
+                context_window=32768,
+                cost_per_1k_tokens=0.005,
+                avg_latency_ms=2000,
+                priority=40,
+                enabled=True,
+            ),
+        }
+        config.default_model = "only-model"
+
+        engine = RoutingEngine(config=config, hardware=gpu_hardware)
+        classification = classify_request("Hello")
+        decision = engine.route(classification)
+
+        assert decision.exploration_pick is False
+        assert decision.model_id == "only-model"
+
+    def test_exploration_still_learns(self, full_config, gpu_hardware):
+        """Exploration picks still feed outcomes to NG-Lite."""
+        full_config.exploration_rate = 1.0
+        full_config.exploration_min_rate = 1.0
+        ng = NGLite(module_id="explore_learn_test")
+        engine = RoutingEngine(
+            config=full_config, hardware=gpu_hardware, ng_lite=ng,
+        )
+
+        classification = classify_request("Write Python code")
+        decision = engine.route(classification)
+        assert decision.exploration_pick is True
+
+        # Report outcome — should not raise, should record normally
+        engine.report_outcome(
+            decision=decision,
+            success=True,
+            quality_score=0.9,
+            latency_ms=500,
+        )
+
+        stats = engine.get_stats()
+        assert stats["total_requests"] == 1
+        assert stats["success_rate"] == 1.0
+        assert ng.get_stats()["total_outcomes"] >= 1

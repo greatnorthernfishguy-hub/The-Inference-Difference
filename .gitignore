@@ -22,3 +22,6 @@ config.json
 gateway.db-shm
 gateway.db-wal
 *.bak.*
+fastembed_cache/
+__pycache__/
+*.pyc

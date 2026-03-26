@@ -9,6 +9,8 @@ OpenAI-compatible chat completion response.
 Supported backends:
     - Ollama (local): http://localhost:11434/v1/chat/completions
     - OpenRouter (cloud): https://openrouter.ai/api/v1/chat/completions
+    - HuggingFace (cloud): https://router.huggingface.co/v1/chat/completions
+    - Venice AI (cloud): https://api.venice.ai/api/v1/chat/completions
     - Anthropic (cloud): https://api.anthropic.com/v1/messages
     - OpenAI (cloud): https://api.openai.com/v1/chat/completions
     - LiteLLM (unified): configurable endpoint
@@ -19,6 +21,8 @@ translated to OpenAI format before returning.
 
 Environment variables for API keys:
     OPENROUTER_API_KEY  — OpenRouter
+    HF_TOKEN            — HuggingFace Inference API
+    VENICE_API_KEY      — Venice AI
     ANTHROPIC_API_KEY   — Anthropic
     OPENAI_API_KEY      — OpenAI
     LITELLM_BASE_URL    — LiteLLM proxy (if running)
@@ -42,6 +46,46 @@ from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger("inference_difference.model_client")
 
+
+# ---------------------------------------------------------------------------
+# Token estimation fallback (when providers return zeros)
+# ---------------------------------------------------------------------------
+
+def _estimate_usage(
+    messages: list,
+    response_content: str,
+) -> Dict[str, int]:
+    """Estimate token usage from word counts when provider reports zeros.
+
+    Uses word_count * 1.3 as a rough tokens-per-word ratio (covers
+    subword tokenization overhead). This gives OpenClaw a non-zero
+    context count so compaction can trigger.
+
+    The substrate learns the real mapping over time via
+    token_estimation experience records.
+    """
+    # Input: count words across all messages
+    input_words = 0
+    for msg in (messages or []):
+        c = msg.get("content", "")
+        if isinstance(c, str):
+            input_words += len(c.split())
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    input_words += len(part.get("text", "").split())
+
+    # Output: count words in response
+    output_words = len((response_content or "").split())
+
+    prompt_tokens = max(1, int(input_words * 1.3))
+    completion_tokens = max(1, int(output_words * 1.3))
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
 # ---------------------------------------------------------------------------
 # Provider routing table
@@ -82,6 +126,12 @@ def _resolve_provider(model_id: str) -> tuple[str, str, str]:
     # Catalog models use "openrouter/" prefix — strip it for the API call.
     # OpenRouter expects just "deepseek/deepseek-chat", not
     # "openrouter/deepseek/deepseek-chat".
+    if model_id.startswith("huggingface/") or model_id.startswith("hf/"):
+        prefix = "huggingface/" if model_id.startswith("huggingface/") else "hf/"
+        model_name = model_id[len(prefix):]
+        api_key = os.environ.get("HF_TOKEN", "")
+        return "https://router.huggingface.co", api_key, model_name
+
     if model_id.startswith("venice/"):
         model_name = model_id[len("venice/"):]
         api_key = os.environ.get("VENICE_API_KEY", "")
@@ -215,16 +265,27 @@ class ModelClient:
 
         # Anthropic uses a different API format
         if model_id.startswith("anthropic/") and "anthropic.com" in base_url:
-            return self._call_anthropic(
+            resp = self._call_anthropic(
                 base_url, api_key, model_name, messages,
                 temperature, max_tokens, start,
             )
+        else:
+            # Everyone else: OpenAI-compatible endpoint
+            resp = self._call_openai_compat(
+                base_url, api_key, model_name, messages,
+                temperature, max_tokens, start, extra_params,
+            )
 
-        # Everyone else: OpenAI-compatible endpoint
-        return self._call_openai_compat(
-            base_url, api_key, model_name, messages,
-            temperature, max_tokens, start, extra_params,
-        )
+        # Fallback: estimate usage when provider reports zeros
+        if resp.success and resp.usage.get("total_tokens", 0) == 0:
+            estimated = _estimate_usage(messages, resp.content)
+            resp.usage = estimated
+            resp.usage["estimated"] = True
+            logger.debug(
+                "Provider returned zero usage, estimated: %s", estimated,
+            )
+
+        return resp
 
     def _call_openai_compat(
         self,
