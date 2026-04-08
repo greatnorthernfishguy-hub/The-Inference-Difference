@@ -253,6 +253,7 @@ class NGEcosystem:
         # Internal state
         self._tier = TIER_STANDALONE
         self._ng: Any = None              # NGLite instance
+        self._ng_memory: Any = None       # NeuroGraphMemory ref (set externally at Tier 3)
         self._peer_bridge: Any = None     # NGPeerBridge instance
         self._shutdown_event = threading.Event()
         self._ops_lock = threading.Lock()

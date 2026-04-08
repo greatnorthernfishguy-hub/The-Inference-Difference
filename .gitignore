@@ -25,3 +25,8 @@ gateway.db-wal
 fastembed_cache/
 __pycache__/
 *.pyc
+
+# Credentials — never track
+.env
+.env.*
+*.key
