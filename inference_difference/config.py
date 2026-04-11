@@ -240,6 +240,27 @@ class InferenceDifferenceConfig:
     # Classification confidence
     no_domain_confidence: float = 0.3       # Confidence when no patterns match
 
+    # Tier mapping bootstrap defaults — substrate learns actual values (#8)
+    # These are starting points. The substrate's opinion on each tier
+    # (via get_recommendations on "tier:{tier_name}") modulates the
+    # complexity and priority assigned to catalog models from that tier.
+    # Bootstrap: substrate returns 0.5 (neutral) → defaults used below.
+    # As substrate accumulates outcome evidence, weights diverge from 0.5.
+    tier_complexity_frontier: float = 1.0     # → EXTREME
+    tier_complexity_performance: float = 0.75 # → HIGH
+    tier_complexity_standard: float = 0.5     # → MEDIUM
+    tier_complexity_budget: float = 0.25      # → LOW
+    tier_complexity_private: float = 0.5      # → MEDIUM (Venice private)
+    tier_complexity_anonymized: float = 0.35  # → LOW-MED (Venice anon)
+    tier_priority_frontier: int = 40
+    tier_priority_performance: int = 30
+    tier_priority_standard: int = 20
+    tier_priority_budget: int = 10
+    tier_priority_private: int = 35           # Venice private — no logging
+    tier_priority_anonymized: int = 25        # Venice anonymized
+    tier_neutral_weight: float = 0.5          # Substrate has no opinion yet
+    substrate_tier_influence: float = 0.20    # How much substrate opinion shifts the default (grows with competence)
+
     # Quality evaluation weights (passable to evaluate_quality)
     quality_weight_completion: float = 0.30
     quality_weight_coherence: float = 0.25

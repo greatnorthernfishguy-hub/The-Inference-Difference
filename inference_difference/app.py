@@ -287,6 +287,108 @@ _TIER_TO_PRIORITY = {
 _DEFAULT_TIER_PRIORITY = 20  # Fallback for unknown tiers
 
 
+def _substrate_tier_mapping(
+    provider_tier: str,
+) -> tuple[ComplexityTier, int]:
+    """Substrate-learned tier → complexity + priority mapping (Punch list #8).
+
+    Queries the substrate for its opinion on this provider_tier.
+    At bootstrap, substrate returns 0.5 (neutral) — bootstrap defaults used.
+    As the substrate accumulates routing outcome evidence, its weight
+    diverges from 0.5 and naturally influences complexity/priority.
+    No gates, no ceremony — competence builds with evidence.
+    """
+    from ng_embed import embed as _ng_embed
+
+    # Bootstrap defaults from config
+    complexity_default = {
+        "frontier": _state.config.tier_complexity_frontier,
+        "performance": _state.config.tier_complexity_performance,
+        "standard": _state.config.tier_complexity_standard,
+        "budget": _state.config.tier_complexity_budget,
+        "private": _state.config.tier_complexity_private,
+        "anonymized": _state.config.tier_complexity_anonymized,
+    }.get(provider_tier, _state.config.tier_complexity_standard)
+
+    priority_default = {
+        "frontier": _state.config.tier_priority_frontier,
+        "performance": _state.config.tier_priority_performance,
+        "standard": _state.config.tier_priority_standard,
+        "budget": _state.config.tier_priority_budget,
+        "private": _state.config.tier_priority_private,
+        "anonymized": _state.config.tier_priority_anonymized,
+    }.get(provider_tier, _DEFAULT_TIER_PRIORITY)
+
+    if _state.ng_ecosystem is None:
+        return (_tier_weight_to_complexity(complexity_default),
+                priority_default)
+
+    try:
+        tier_emb = _ng_embed(f"tier:{provider_tier}")
+        recs = _state.ng_ecosystem.get_recommendations(tier_emb, top_k=5)
+
+        substrate_weight = None
+        for target_id, weight, _reasoning in recs:
+            # Look for substrate opinions on this tier
+            if provider_tier.lower() in target_id.lower():
+                substrate_weight = weight
+                break
+
+        if substrate_weight is not None:
+            influence = getattr(
+                _state.config, 'substrate_tier_influence', 0.20,
+            )
+            neutral = getattr(_state.config, 'tier_neutral_weight', 0.5)
+            # Substrate opinion modulates the complexity weight
+            substrate_complexity = complexity_default + (
+                substrate_weight - neutral
+            ) * influence * 2.0
+            substrate_complexity = max(0.0, min(1.0, substrate_complexity))
+
+            # Priority shifted proportionally
+            priority_range = 30  # 10..40 span
+            priority_shift = int(
+                (substrate_weight - neutral) * influence * priority_range,
+            )
+            substrate_priority = max(
+                1, min(50, priority_default + priority_shift),
+            )
+
+            logger.debug(
+                "Substrate tier mapping '%s': weight=%.3f → "
+                "complexity=%.2f priority=%d (bootstrap: %.2f/%d)",
+                provider_tier, substrate_weight,
+                substrate_complexity, substrate_priority,
+                complexity_default, priority_default,
+            )
+
+            return (_tier_weight_to_complexity(substrate_complexity),
+                    substrate_priority)
+
+    except Exception as exc:
+        logger.debug(
+            "Substrate tier query failed for '%s': %s — using defaults",
+            provider_tier, exc,
+        )
+
+    return (
+        _tier_weight_to_complexity(complexity_default),
+        priority_default,
+    )
+
+
+def _tier_weight_to_complexity(weight: float) -> ComplexityTier:
+    """Map 0.0–1.0 substrate weight → ComplexityTier."""
+    if weight >= 0.85:
+        return ComplexityTier.EXTREME
+    elif weight >= 0.60:
+        return ComplexityTier.HIGH
+    elif weight >= 0.35:
+        return ComplexityTier.MEDIUM
+    else:
+        return ComplexityTier.LOW
+
+
 def _register_catalog_models() -> None:
     """Register catalog models in the routing config.
 
@@ -297,6 +399,11 @@ def _register_catalog_models() -> None:
 
     Skips models already in the static config to avoid overwriting
     hand-tuned entries with generic metadata.
+
+    Tier mappings are substrate-learned (Punch list #8): _substrate_tier_mapping()
+    queries the substrate for opinions on each provider_tier. At bootstrap,
+    defaults are used. As the substrate learns from routing outcomes,
+    the mappings self-adjust.
 
     # ---- Changelog ----
     # [2026-03-14] Claude (CC) — Added sub-1.5B parameter filter
@@ -340,19 +447,20 @@ def _register_catalog_models() -> None:
         # for promotional pricing, but ModelEntry requires >= 0.
         cost_per_1k = max(cm.cost_per_1m_input / 1000.0, 0.0)
 
+        # Substrate-learned tier mapping (#8)
+        max_complexity, priority = _substrate_tier_mapping(cm.provider_tier)
+
         try:
             entry = ModelEntry(
                 model_id=cm.id,
                 display_name=cm.display_name or cm.id,
                 model_type=ModelType.API,
                 domains=domains,
-                max_complexity=_TIER_TO_COMPLEXITY.get(
-                    cm.provider_tier, ComplexityTier.MEDIUM,
-                ),
+                max_complexity=max_complexity,
                 context_window=max(cm.context_window, 4096),
                 cost_per_1k_tokens=cost_per_1k,
                 avg_latency_ms=2000.0,  # Sensible default for cloud APIs
-                priority=_TIER_TO_PRIORITY.get(cm.provider_tier, _DEFAULT_TIER_PRIORITY),
+                priority=priority,
                 enabled=cm.is_active,
             )
         except (ValueError, TypeError) as e:
@@ -1417,7 +1525,7 @@ async def get_stats() -> Dict[str, Any]:
     """Router performance statistics."""
     stats = _state.engine.get_stats()
     if _state.ng_lite is not None:
-        stats["ng_lite"] = _state.ng_lite.get_stats()
+        stats["ng_lite"] = _state.ng_lite.stats()
     if _state.catalog_manager is not None:
         stats["catalog"] = _state.catalog_manager.get_catalog_stats()
     if _state.dream_cycle is not None:
