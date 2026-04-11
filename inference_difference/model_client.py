@@ -31,6 +31,15 @@ Environment variables for API keys:
 Author: Josh + Claude
 Date: February 2026
 License: AGPL-3.0
+
+Changelog:
+    [2026-04-11] Claude Code (Sonnet 4.6) — Tool call pass-through
+        Added tools/tool_choice params to call() and call_stream().
+        Added tool_calls field to ModelResponse.
+        _call_openai_compat now extracts tool_calls from response messages.
+        to_openai_dict includes tool_calls and sets finish_reason=tool_calls.
+        Previously TID silently dropped all tool definitions — models could
+        never execute tool calls, only generate text intent.
 """
 
 from __future__ import annotations
@@ -185,6 +194,7 @@ class ModelResponse:
     id: str = ""
     model: str = ""
     content: str = ""
+    tool_calls: Optional[List[Dict[str, Any]]] = field(default=None)
     finish_reason: str = "stop"
     usage: Dict[str, int] = field(default_factory=lambda: {
         "prompt_tokens": 0,
@@ -198,6 +208,15 @@ class ModelResponse:
 
     def to_openai_dict(self) -> Dict[str, Any]:
         """Format as OpenAI-compatible chat completion response."""
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": self.content,
+        }
+        if self.tool_calls:
+            message["tool_calls"] = self.tool_calls
+        finish_reason = self.finish_reason
+        if self.tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
         return {
             "id": self.id or f"chatcmpl-tid-{int(time.time())}",
             "object": "chat.completion",
@@ -205,11 +224,8 @@ class ModelResponse:
             "model": self.model,
             "choices": [{
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": self.content,
-                },
-                "finish_reason": self.finish_reason,
+                "message": message,
+                "finish_reason": finish_reason,
             }],
             "usage": self.usage,
         }
@@ -246,6 +262,8 @@ class ModelClient:
         max_tokens: Optional[int] = None,
         stream: bool = False,
         extra_params: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> ModelResponse:
         """Call a model and return the response.
 
@@ -262,6 +280,14 @@ class ModelClient:
         """
         start = time.monotonic()
         base_url, api_key, model_name = _resolve_provider(model_id)
+
+        # Merge tools/tool_choice into extra_params
+        if tools is not None or tool_choice is not None:
+            extra_params = dict(extra_params or {})
+            if tools is not None:
+                extra_params["tools"] = tools
+            if tool_choice is not None:
+                extra_params["tool_choice"] = tool_choice
 
         # Anthropic uses a different API format
         if model_id.startswith("anthropic/") and "anthropic.com" in base_url:
@@ -344,15 +370,18 @@ class ModelClient:
             choices = resp_body.get("choices", [])
             content = ""
             finish_reason = "stop"
+            tool_calls = None
             if choices:
                 msg = choices[0].get("message", {})
-                content = msg.get("content", "")
+                content = msg.get("content", "") or ""
+                tool_calls = msg.get("tool_calls") or None
                 finish_reason = choices[0].get("finish_reason", "stop")
 
             return ModelResponse(
                 id=resp_body.get("id", ""),
                 model=resp_body.get("model", model_name),
                 content=content,
+                tool_calls=tool_calls,
                 finish_reason=finish_reason,
                 usage=resp_body.get("usage", {
                     "prompt_tokens": 0,
@@ -504,6 +533,8 @@ class ModelClient:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         extra_params: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> tuple[Iterator[str], StreamResult]:
         """Stream a model call, yielding raw SSE lines.
 
@@ -516,6 +547,14 @@ class ModelClient:
         The final "data: [DONE]\\n\\n" is always yielded.
         """
         base_url, api_key, model_name = _resolve_provider(model_id)
+
+        # Merge tools/tool_choice into extra_params
+        if tools is not None or tool_choice is not None:
+            extra_params = dict(extra_params or {})
+            if tools is not None:
+                extra_params["tools"] = tools
+            if tool_choice is not None:
+                extra_params["tool_choice"] = tool_choice
 
         # Anthropic streaming uses a different format — for now, fall back
         # to non-streaming for Anthropic and wrap result as fake SSE.

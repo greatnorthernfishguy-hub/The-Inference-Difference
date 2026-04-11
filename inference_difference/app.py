@@ -161,6 +161,12 @@ class ChatCompletionRequest(BaseModel):
         None, description="CTEM consciousness score (0.0-1.0). When set,\
         routing is elevated to prefer higher-capability models.",
     )
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        None, description="OpenAI-format tool definitions to pass through to the model.",
+    )
+    tool_choice: Optional[Any] = Field(
+        None, description="OpenAI tool_choice value ('auto', 'none', or specific tool).",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +881,8 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         messages=req.messages,
         temperature=req.temperature,
         max_tokens=req.max_tokens,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
     )
 
     # --- Step 6: Auto-retry with fallback chain ---
@@ -910,6 +918,8 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             messages=req.messages,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
         )
         tried_models.append(fallback_id)
 
@@ -1049,6 +1059,8 @@ def _stream_response(
                 messages=req.messages,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
+                tools=req.tools,
+                tool_choice=req.tool_choice,
             )
 
             # Buffer chunks — if the model fails (HTTP error, timeout),
