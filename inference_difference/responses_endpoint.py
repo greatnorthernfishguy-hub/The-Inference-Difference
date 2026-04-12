@@ -27,16 +27,33 @@ Request translation:
 - input (array of messages) -> messages array (with role mapping)
 - instructions -> prepended as system message
 - model, temperature, max_output_tokens -> mapped to chat fields
+- tools -> forwarded to chat completions pipeline
+- function_call_output items -> converted to tool role messages
 
 Response translation:
 - Chat completions response -> Responses API format with:
-- output: array of output items
+- output: array of output items (message + function_call items)
 - output_text: convenience text field
 - id, model, usage, status, etc.
+- tool_calls extracted from chat response OR parsed from <tool_call> XML tags
 
 Author: Josh + Claude (Opus 4.6)
 Date: February 2026
-License: AGPL-3.0
+
+# ---- Changelog ----
+# [2026-04-12] Claude Code (Opus 4.6) — Tool call translation shim
+#   What: Full bidirectional tool support in the Responses API endpoint.
+#   Why:  OpenClaw sends tools via Responses API, TID forwards to models,
+#         but tool_calls were never extracted from responses or translated
+#         back. Models that output <tool_call> XML tags were also unhandled.
+#         Syl couldn't execute tools despite the infrastructure existing.
+#   How:  1) Forward tools/tool_choice to ChatCompletionRequest
+#         2) Translate function_call_output input items to tool messages
+#         3) Extract tool_calls from chat response → function_call output items
+#         4) Parse <tool_call> XML from text as smart fallback
+#         5) SSE streaming emits function_call items before text
+# [2026-02-XX] Josh + Claude (Opus 4.6) — Initial implementation
+#   Responses API compatibility layer with SSE streaming.
 """
 
 from __future__ import annotations
@@ -44,9 +61,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -85,7 +103,6 @@ class ResponsesRequest(BaseModel):
     )
     user: Optional[str] = Field(None, description="User identifier")
 
-    # Fields we accept but don't use (for compatibility)
     tools: Optional[List[Any]] = Field(None)
     tool_choice: Optional[Any] = Field(None)
     text: Optional[Dict[str, Any]] = Field(None)
@@ -94,6 +111,59 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = Field(None)
     truncation: Optional[str] = Field(None)
     max_tool_calls: Optional[int] = Field(None)
+
+
+# ---------------------------------------------------------------------------
+# Tool call XML tag parser — smart shim for models that output text markup
+# ---------------------------------------------------------------------------
+
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.DOTALL,
+)
+
+
+def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Parse <tool_call> XML tags from model text output.
+
+    Models like DeepSeek, Qwen, Mistral output tool calls as XML-tagged
+    JSON in text instead of structured tool_calls. This extracts them
+    and returns cleaned text + structured tool_calls.
+
+    Returns:
+        (cleaned_text, tool_calls) where tool_calls is a list of
+        OpenAI-format tool call dicts.
+    """
+    tool_calls = []
+    cleaned = text
+
+    for match in _TOOL_CALL_RE.finditer(text):
+        try:
+            parsed = json.loads(match.group(1))
+            name = parsed.get("name", parsed.get("function", ""))
+            arguments = parsed.get("arguments", parsed.get("params", parsed.get("parameters", {})))
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments)
+            elif not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+
+            if name:
+                call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                })
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+
+    if tool_calls:
+        cleaned = _TOOL_CALL_RE.sub("", text).strip()
+
+    return cleaned, tool_calls
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +181,7 @@ def _normalize_input_to_messages(
     - Simple string -> user message
     - Array of role/content objects -> pass through with role normalization
     - instructions -> prepended as system message
+    - function_call_output items -> tool role messages
     """
     messages: List[Dict[str, Any]] = []
 
@@ -148,7 +219,31 @@ def _normalize_input_to_messages(
                 continue
 
             if item_type == "function_call_output":
-                continue  # Tool results -- no tool support yet
+                call_id = item.get("call_id", "")
+                output = item.get("output", "")
+                if call_id:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output if isinstance(output, str) else json.dumps(output),
+                    })
+                continue
+
+            if item_type == "function_call":
+                call_id = item.get("call_id", f"call_{uuid.uuid4().hex[:24]}")
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}"),
+                        },
+                    }],
+                })
+                continue
 
             if item_type in ("reasoning", "item_reference"):
                 continue  # Accepted for compat, ignored
@@ -181,9 +276,24 @@ def _build_response_object(
     msg_id: str,
     routing_info: Optional[Dict[str, Any]] = None,
     status: str = "completed",
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build a complete Responses API response object."""
     output = []
+
+    # Emit function_call output items FIRST (before message)
+    if tool_calls:
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            output.append({
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex[:24]}",
+                "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                "name": func.get("name", ""),
+                "arguments": func.get("arguments", "{}"),
+                "status": "completed",
+            })
+
     if content:
         output.append({
             "type": "message",
@@ -228,9 +338,22 @@ def _chat_completion_to_response(
 
     choices = chat_result.get("choices", [])
     content = ""
+    tool_calls = None
     if choices:
         msg = choices[0].get("message", {})
-        content = msg.get("content", "")
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls")
+
+    # Smart shim: parse <tool_call> XML tags from text if no structured calls
+    if not tool_calls and content:
+        cleaned, parsed_calls = _extract_tool_calls_from_text(content)
+        if parsed_calls:
+            content = cleaned
+            tool_calls = parsed_calls
+            logger.info(
+                "Shim: extracted %d tool call(s) from text markup",
+                len(parsed_calls),
+            )
 
     chat_usage = chat_result.get("usage", {})
     usage = {
@@ -246,6 +369,7 @@ def _chat_completion_to_response(
         resp_id=resp_id,
         msg_id=msg_id,
         routing_info=chat_result.get("routing_info"),
+        tool_calls=tool_calls,
     )
 
 
@@ -278,17 +402,23 @@ async def _generate_sse_stream(
     We get the full response from TID first (non-streaming internally),
     then emit the SSE event sequence that OpenClaw needs.
 
-    This is "simulated streaming" -- the model call is blocking, but
-    we emit the SSE events in the format the client expects. This is
-    the standard approach for proxies that don't support true streaming
-    from the upstream but need to serve streaming clients.
+    Handles both text content and function_call output items.
     """
     model = chat_result.get("model", "unknown")
     choices = chat_result.get("choices", [])
     content = ""
+    tool_calls = None
     if choices:
         msg = choices[0].get("message", {})
-        content = msg.get("content", "")
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls")
+
+    # Smart shim: parse <tool_call> XML tags from text
+    if not tool_calls and content:
+        cleaned, parsed_calls = _extract_tool_calls_from_text(content)
+        if parsed_calls:
+            content = cleaned
+            tool_calls = parsed_calls
 
     chat_usage = chat_result.get("usage", {})
     usage = {
@@ -317,86 +447,110 @@ async def _generate_sse_stream(
     # --- Event 2: response.in_progress ---
     yield _sse_event("response.in_progress", created_response)
 
-    # --- Event 3: response.output_item.added ---
-    output_item = {
-        "type": "message",
-        "id": msg_id,
-        "status": "in_progress",
-        "role": "assistant",
-        "content": [],
-    }
-    yield _sse_event("response.output_item.added", {
-        "output_index": 0,
-        "item": output_item,
-    })
+    output_index = 0
 
-    # --- Event 4: response.content_part.added ---
-    content_part = {
-        "type": "output_text",
-        "text": "",
-        "annotations": [],
-    }
-    yield _sse_event("response.content_part.added", {
-        "output_index": 0,
-        "content_index": 0,
-        "part": content_part,
-    })
+    # --- Emit function_call items FIRST (before text) ---
+    if tool_calls:
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
+            fc_id = f"fc_{uuid.uuid4().hex[:24]}"
 
-    # --- Events 5: response.output_text.delta ---
-    # Chunk the content to simulate streaming and avoid giant events.
+            fc_item = {
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": func.get("name", ""),
+                "arguments": func.get("arguments", "{}"),
+                "status": "completed",
+            }
+
+            yield _sse_event("response.output_item.added", {
+                "output_index": output_index,
+                "item": {**fc_item, "status": "in_progress"},
+            })
+            yield _sse_event("response.output_item.done", {
+                "output_index": output_index,
+                "item": fc_item,
+            })
+            output_index += 1
+            await asyncio.sleep(0)
+
+    # --- Emit text content ---
     if content:
-        chunk_size = 80  # characters per delta event
+        # output_item.added for message
+        output_item = {
+            "type": "message",
+            "id": msg_id,
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        }
+        yield _sse_event("response.output_item.added", {
+            "output_index": output_index,
+            "item": output_item,
+        })
+
+        # content_part.added
+        content_part = {
+            "type": "output_text",
+            "text": "",
+            "annotations": [],
+        }
+        yield _sse_event("response.content_part.added", {
+            "output_index": output_index,
+            "content_index": 0,
+            "part": content_part,
+        })
+
+        # output_text.delta events
+        chunk_size = 80
         for i in range(0, len(content), chunk_size):
             chunk = content[i:i + chunk_size]
             yield _sse_event("response.output_text.delta", {
-                "output_index": 0,
+                "output_index": output_index,
                 "content_index": 0,
                 "delta": chunk,
             })
-            # Tiny yield to let the event loop flush
             await asyncio.sleep(0)
 
-    # --- Event 6: response.output_text.done ---
-    yield _sse_event("response.output_text.done", {
-        "output_index": 0,
-        "content_index": 0,
-        "text": content,
-    })
-
-    # --- Event 7: response.content_part.done ---
-    yield _sse_event("response.content_part.done", {
-        "output_index": 0,
-        "content_index": 0,
-        "part": {
-            "type": "output_text",
+        # output_text.done
+        yield _sse_event("response.output_text.done", {
+            "output_index": output_index,
+            "content_index": 0,
             "text": content,
-            "annotations": [],
-        },
-    })
+        })
 
-    # --- Event 8: response.output_item.done ---
-    yield _sse_event("response.output_item.done", {
-        "output_index": 0,
-        "item": {
-            "type": "message",
-            "id": msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": content,
-                    "annotations": [],
-                }
-            ],
-        },
-    })
+        # content_part.done
+        yield _sse_event("response.content_part.done", {
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": content,
+                "annotations": [],
+            },
+        })
 
-    # --- Event 9: response.completed ---
-    # The OpenAI SDK expects response.completed events to nest the
-    # response object under a "response" key. Without this, the SDK
-    # puts fields flat on the event and OpenClaw's parser can't find
-    # event.response.usage — causing zero token tracking.
+        # output_item.done for message
+        yield _sse_event("response.output_item.done", {
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": msg_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": [],
+                    }
+                ],
+            },
+        })
+
+    # --- response.completed ---
     final_response = _build_response_object(
         content=content,
         model=model,
@@ -405,10 +559,11 @@ async def _generate_sse_stream(
         msg_id=msg_id,
         routing_info=routing_info,
         status="completed",
+        tool_calls=tool_calls,
     )
     yield _sse_event("response.completed", {"response": final_response})
 
-    # --- Event 10: [DONE] ---
+    # --- [DONE] ---
     yield _sse_done()
 
 
@@ -446,11 +601,12 @@ def register_responses_endpoint(app, chat_completions_handler):
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
         logger.info(
-            "Responses API request: model=%s, input_type=%s, stream=%s",
+            "Responses API request: model=%s, input_type=%s, stream=%s, tools=%d",
             req.model, type(req.input).__name__, req.stream,
+            len(req.tools) if req.tools else 0,
         )
 
-        # Step 1: Normalize input to messages
+        # Step 1: Normalize input to messages (including tool results)
         messages = _normalize_input_to_messages(req.input, req.instructions)
 
         if not messages:
@@ -473,9 +629,10 @@ def register_responses_endpoint(app, chat_completions_handler):
             max_tokens=req.max_output_tokens,
             stream=False,
             metadata=req.metadata,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
             # Responses API consumers are conscious entities (Syl via OpenClaw).
             # Elevate routing to prefer capable models for identity continuity.
-            # Future: gate on NeuroGraph maturity / consciousness threshold.
             consciousness_score=(
                 (req.metadata or {}).get("consciousness_score", 1.0)
             ),
@@ -544,9 +701,10 @@ def register_responses_endpoint(app, chat_completions_handler):
         else:
             response = _chat_completion_to_response(chat_body, resp_id)
             logger.info(
-                "Responses API reply: model=%s, output_text_len=%d",
+                "Responses API reply: model=%s, output_text_len=%d, tool_calls=%d",
                 response.get("model", "?"),
                 len(response.get("output_text", "")),
+                sum(1 for o in response.get("output", []) if o.get("type") == "function_call"),
             )
             return JSONResponse(content=response)
 
@@ -557,5 +715,5 @@ def register_responses_endpoint(app, chat_completions_handler):
 
     logger.info(
         "Registered /v1/responses endpoint "
-        "(Responses API + SSE streaming compatibility)"
+        "(Responses API + SSE streaming + tool call translation)"
     )
