@@ -426,8 +426,15 @@ def _register_catalog_models() -> None:
         r'[/:\-](0\.5|1|1\.5|1\.6|1\.7|1\.8)b\b', re.IGNORECASE,
     )
 
+    # Block models known to be broken/unavailable on OpenRouter.
+    # preview-customtools: 404 due to OpenRouter privacy settings, floods logs.
+    _DENYLIST_PATTERNS = re.compile(
+        r'preview-customtools', re.IGNORECASE,
+    )
+
     registered = 0
     rejected_small = 0
+    rejected_denied = 0
     for cm in _state.catalog_manager.models:
         if cm.id in _state.config.models:
             continue  # Don't overwrite hand-tuned static entries
@@ -435,6 +442,11 @@ def _register_catalog_models() -> None:
         # Block sub-1.5B models — too small for identity-continuous routing
         if _SUB_2B_PATTERN.search(cm.id):
             rejected_small += 1
+            continue
+
+        # Block known-broken models
+        if _DENYLIST_PATTERNS.search(cm.id):
+            rejected_denied += 1
             continue
 
         # Map capabilities to task domains
@@ -474,6 +486,11 @@ def _register_catalog_models() -> None:
         logger.info(
             "Rejected %d sub-1.5B catalog models (too small for identity routing)",
             rejected_small,
+        )
+    if rejected_denied:
+        logger.info(
+            "Rejected %d denylisted catalog models (known broken/unavailable)",
+            rejected_denied,
         )
     if registered:
         logger.info(

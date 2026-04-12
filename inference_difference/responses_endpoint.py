@@ -414,11 +414,16 @@ async def _generate_sse_stream(
         tool_calls = msg.get("tool_calls")
 
     # Smart shim: parse <tool_call> XML tags from text
+    import sys as _sys
+    print(f"[SHIM-DEBUG] SSE path: content_len={len(content)}, has_tool_calls={bool(tool_calls)}, has_xml_tags={'<tool_call>' in content}", file=_sys.stderr, flush=True)
     if not tool_calls and content:
         cleaned, parsed_calls = _extract_tool_calls_from_text(content)
         if parsed_calls:
             content = cleaned
             tool_calls = parsed_calls
+            print(f"[SHIM-DEBUG] Extracted {len(parsed_calls)} tool calls from XML tags", file=_sys.stderr, flush=True)
+        elif "<tool_call>" in content:
+            print(f"[SHIM-DEBUG] XML tags found but regex failed. Content sample: {content[content.find('<tool_call>'):content.find('</tool_call>')+13][:300]}", file=_sys.stderr, flush=True)
 
     chat_usage = chat_result.get("usage", {})
     usage = {
