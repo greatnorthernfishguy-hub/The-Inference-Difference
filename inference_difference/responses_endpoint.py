@@ -107,10 +107,28 @@ def _learn_from_tool_outcome(call_id: str, output: str) -> None:
     - model X + tool Y → success/failure
     - Over time, routing naturally avoids models that produce bad calls
     """
-    if call_id not in _tool_call_cache:
+    import sys as _sys
+
+    # OpenClaw may modify call_ids (e.g., "call_abc|fc_xyz").
+    # Try exact match first, then prefix match.
+    matched_key = None
+    if call_id in _tool_call_cache:
+        matched_key = call_id
+    else:
+        base_id = call_id.split("|")[0] if "|" in call_id else call_id
+        if base_id in _tool_call_cache:
+            matched_key = base_id
+        else:
+            for cached_id in _tool_call_cache:
+                if call_id.startswith(cached_id) or cached_id.startswith(base_id):
+                    matched_key = cached_id
+                    break
+
+    if matched_key is None:
+        print(f"[SHIM-DEBUG] Tool outcome: no cache match for call_id={call_id[:40]} (cache has {len(_tool_call_cache)} entries)", file=_sys.stderr, flush=True)
         return
 
-    entry = _tool_call_cache.pop(call_id)
+    entry = _tool_call_cache.pop(matched_key)
 
     # Expire stale entries
     if time.time() - entry["timestamp"] > _TOOL_CACHE_TTL:
