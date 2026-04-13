@@ -659,8 +659,19 @@ def register_responses_endpoint(app, chat_completions_handler):
 
         # Step 2: Build a ChatCompletionRequest for the internal pipeline
         # Always non-streaming internally; we simulate SSE from the result
+        #
+        # Tool-aware routing: when tools are present, prefer models with
+        # proven tool-use capability. GLM models generate calls with empty
+        # args; Anthropic models handle tools correctly. This override is
+        # temporary scaffolding until TID's substrate learns tool competency
+        # per model. Will graduate to substrate-informed routing.
+        effective_model = req.model
+        if req.tools and req.model == "auto":
+            effective_model = "openrouter/anthropic/claude-sonnet-4"
+            print(f"[SHIM-DEBUG] Tool-aware routing override: auto → {effective_model}", file=_sys.stderr, flush=True)
+
         chat_req = ChatCompletionRequest(
-            model=req.model,
+            model=effective_model,
             messages=messages,
             temperature=req.temperature if req.temperature is not None else 0.7,
             max_tokens=req.max_output_tokens,
