@@ -253,6 +253,7 @@ class ModelClient:
 
     def __init__(self, timeout: int = _DEFAULT_TIMEOUT):
         self._timeout = timeout
+        self._policy_blocked: set = set()
 
     def call(
         self,
@@ -280,6 +281,14 @@ class ModelClient:
         """
         start = time.monotonic()
         base_url, api_key, model_name = _resolve_provider(model_id)
+
+        if model_name in self._policy_blocked:
+            return ModelResponse(
+                model=model_name,
+                latency_ms=0.0,
+                success=False,
+                error="Skipped: data policy blocked (cached)",
+            )
 
         # Merge tools/tool_choice into extra_params
         if tools is not None or tool_choice is not None:
@@ -400,6 +409,13 @@ class ModelClient:
                 error_body = e.read().decode("utf-8")
             except Exception:
                 pass
+            # Cache permanent failures so we don't retry them
+            if e.code in (404, 403) and "data policy" in error_body.lower():
+                self._policy_blocked.add(model_name)
+                logger.info(
+                    "Model %s permanently blocked (data policy) — won't retry",
+                    model_name,
+                )
             logger.warning(
                 "Model call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
