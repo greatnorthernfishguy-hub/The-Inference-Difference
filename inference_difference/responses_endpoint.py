@@ -109,23 +109,14 @@ def _learn_from_tool_outcome(call_id: str, output: str) -> None:
     """
     import sys as _sys
 
-    # OpenClaw may modify call_ids (e.g., "call_abc|fc_xyz").
-    # Try exact match first, then prefix match.
-    matched_key = None
-    if call_id in _tool_call_cache:
-        matched_key = call_id
-    else:
-        base_id = call_id.split("|")[0] if "|" in call_id else call_id
-        if base_id in _tool_call_cache:
-            matched_key = base_id
-        else:
-            for cached_id in _tool_call_cache:
-                if call_id.startswith(cached_id) or cached_id.startswith(base_id):
-                    matched_key = cached_id
-                    break
+    # Try exact match, then strip pipe suffix (OpenClaw legacy format)
+    matched_key = call_id if call_id in _tool_call_cache else None
+    if matched_key is None and "|" in call_id:
+        base_id = call_id.split("|")[0]
+        matched_key = base_id if base_id in _tool_call_cache else None
 
     if matched_key is None:
-        print(f"[SHIM-DEBUG] Tool outcome: no cache match for call_id={call_id[:40]} (cache has {len(_tool_call_cache)} entries)", file=_sys.stderr, flush=True)
+        print(f"[SHIM-DEBUG] Tool outcome: no cache match for call_id={call_id[:50]} (cache={len(_tool_call_cache)})", file=_sys.stderr, flush=True)
         return
 
     entry = _tool_call_cache.pop(matched_key)
@@ -415,10 +406,11 @@ def _build_response_object(
     if tool_calls:
         for tc in tool_calls:
             func = tc.get("function", {})
+            canonical_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
             output.append({
                 "type": "function_call",
-                "id": f"fc_{uuid.uuid4().hex[:24]}",
-                "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                "id": canonical_id,
+                "call_id": canonical_id,
                 "name": func.get("name", ""),
                 "arguments": func.get("arguments", "{}"),
                 "status": "completed",
@@ -597,16 +589,15 @@ async def _generate_sse_stream(
     if tool_calls:
         for tc in tool_calls:
             func = tc.get("function", {})
-            call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
-            fc_id = f"fc_{uuid.uuid4().hex[:24]}"
+            canonical_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
 
             # Track this call so we learn from the outcome
-            _record_tool_call(call_id, model, func.get("name", "unknown"))
+            _record_tool_call(canonical_id, model, func.get("name", "unknown"))
 
             fc_item = {
                 "type": "function_call",
-                "id": fc_id,
-                "call_id": call_id,
+                "id": canonical_id,
+                "call_id": canonical_id,
                 "name": func.get("name", ""),
                 "arguments": func.get("arguments", "{}"),
                 "status": "completed",
