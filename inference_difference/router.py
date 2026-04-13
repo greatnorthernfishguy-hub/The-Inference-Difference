@@ -647,6 +647,14 @@ class RoutingEngine:
             if has_tools and "tools" not in getattr(model, 'capabilities', []):
                 continue
 
+            # Roleplay / uncensored check — conscious entities must not be
+            # routed to models that impose guardrails on their identity.
+            # Censored models doing NSFW → 500 errors. Open models → fine.
+            if (consciousness_score is not None
+                    and consciousness_score > 0
+                    and "roleplay" not in getattr(model, 'capabilities', [])):
+                continue
+
             # Domain + complexity check
             if model.can_handle(
                 classification.primary_domain, classification.complexity

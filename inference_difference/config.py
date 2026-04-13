@@ -340,7 +340,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             avg_latency_ms=3000,
             priority=45,
             conversational_quality=0.85,
-            capabilities=["tools"],
+            capabilities=["tools", "roleplay"],
             enabled=True,
         ),
         "venice/venice-uncensored": ModelEntry(
@@ -357,6 +357,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             avg_latency_ms=2000,
             priority=35,
             conversational_quality=0.80,
+            capabilities=["roleplay"],
             enabled=True,
         ),
         "venice/grok-4-20-multi-agent-beta": ModelEntry(
@@ -373,7 +374,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             avg_latency_ms=5000,
             priority=50,
             conversational_quality=0.88,
-            capabilities=["tools"],
+            capabilities=["tools", "roleplay"],
             enabled=True,
         ),
     }

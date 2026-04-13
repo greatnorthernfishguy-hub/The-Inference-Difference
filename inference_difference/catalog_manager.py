@@ -487,6 +487,16 @@ class CatalogManager:
                     caps.append("web_search")
                 if caps_raw.get("supportsSystemPrompt"):
                     caps.append("system_prompt")
+                if caps_raw.get("supportsFunctionCalling"):
+                    caps.append("tools")
+
+                # Venice is uncensored by design
+                caps.append("roleplay")
+
+                # Detect tool support from known families if API doesn't flag it
+                vid = item.get("id", "").lower()
+                if "tools" not in caps and self._TOOL_CAPABLE_FAMILIES.search(vid):
+                    caps.append("tools")
 
                 privacy = spec.get("privacy", "")
                 traits = spec.get("traits", [])
@@ -625,15 +635,25 @@ class CatalogManager:
 
         return "standard"
 
+    _ROLEPLAY_KEYWORDS = re.compile(
+        r"roleplay|role.?play|character|persona|creative.?writing|"
+        r"storytell|immersive|uncensored|unfiltered|unrestricted|"
+        r"euryale|mytho|hermes|dolphin|nous|sao10k|virtuoso|"
+        r"trinity.*thinking|role.?play",
+        re.IGNORECASE,
+    )
+
     def _extract_capabilities(self, item: Dict[str, Any]) -> List[str]:
         """Extract model capabilities from OpenRouter metadata.
 
         Uses supported_parameters (authoritative) for tool support,
-        with description fallback. Architecture.modality for vision.
+        description + model family for roleplay/uncensored detection,
+        architecture.modality for vision.
         """
         caps = []
         model_id = item.get("id", "").lower()
         name = item.get("name", "").lower()
+        desc = item.get("description", "").lower()
         supported_params = item.get("supported_parameters") or []
 
         # Code capability
@@ -648,12 +668,19 @@ class CatalogManager:
         # Tool use — supported_parameters is authoritative
         if "tools" in supported_params:
             caps.append("tools")
-        else:
-            desc = item.get("description", "").lower()
-            if "function calling" in desc or "tool use" in desc:
-                caps.append("tools")
+        elif "function calling" in desc or "tool use" in desc:
+            caps.append("tools")
 
-        return caps
+        # Roleplay / uncensored — description text + known model families
+        if self._ROLEPLAY_KEYWORDS.search(desc) or self._ROLEPLAY_KEYWORDS.search(name):
+            caps.append("roleplay")
+        # Open-weight model families are generally uncensored
+        open_families = ["deepseek", "llama", "qwen", "mistral", "gemma",
+                         "command-r", "yi-", "nemotron", "grok"]
+        if any(f in model_id for f in open_families):
+            caps.append("roleplay")
+
+        return list(set(caps))
 
     def _hf_context_window(self, item: Dict[str, Any]) -> int:
         """Extract context window from HuggingFace model metadata."""
@@ -692,6 +719,13 @@ class CatalogManager:
 
         if self._TOOL_CAPABLE_FAMILIES.search(model_id):
             caps.append("tools")
+
+        # Roleplay / uncensored — open-weight families + explicit markers
+        if "uncensored" in model_id or "unfiltered" in model_id:
+            caps.append("roleplay")
+        if self._TOOL_CAPABLE_FAMILIES.search(model_id):
+            # Open-weight model families are generally uncensored
+            caps.append("roleplay")
 
         return list(set(caps))
 
