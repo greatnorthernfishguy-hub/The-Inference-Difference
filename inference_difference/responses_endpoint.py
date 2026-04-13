@@ -71,6 +71,19 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
+# ShimObserver — substrate-smart translation learning
+# ---------------------------------------------------------------------------
+
+_shim_observer: Optional[Any] = None
+
+
+def set_shim_observer(observer: Any) -> None:
+    """Wire the ShimObserver from app.py startup."""
+    global _shim_observer
+    _shim_observer = observer
+
+
+# ---------------------------------------------------------------------------
 # Tool call outcome learning — the River carries tool experience
 # ---------------------------------------------------------------------------
 

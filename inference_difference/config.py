@@ -262,6 +262,10 @@ class InferenceDifferenceConfig:
     tier_neutral_weight: float = 0.5          # Substrate has no opinion yet
     substrate_tier_influence: float = 0.20    # How much substrate opinion shifts the default (grows with competence)
 
+    # Shim substrate learning (Phase 1: observe, Phase 3: query+blend)
+    shim_substrate_influence: float = 0.20    # How much substrate opinion shifts shim confidence (same scale as tier_influence)
+    shim_observation_window: int = 50         # Min deposits before substrate weight is considered meaningful (diagnostic guide, not a gate)
+
     # Quality evaluation weights (passable to evaluate_quality)
     quality_weight_completion: float = 0.30
     quality_weight_coherence: float = 0.25

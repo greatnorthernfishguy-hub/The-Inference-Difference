@@ -607,6 +607,16 @@ async def lifespan(app: FastAPI):
         )
         _state.ng_lite = _state.ng_ecosystem  # uni-bridge: router uses ecosystem directly
         logger.info("NG Ecosystem uni-bridge initialized — learning flows to shared_learning/")
+
+        # Wire ShimObserver — substrate-smart translation learning
+        try:
+            from inference_difference.translation_shim import ShimObserver
+            from inference_difference.responses_endpoint import set_shim_observer
+            _state.shim_observer = ShimObserver(_state.ng_ecosystem)
+            set_shim_observer(_state.shim_observer)
+            logger.info("ShimObserver wired to substrate")
+        except Exception as shim_exc:
+            logger.debug("ShimObserver wiring failed (non-fatal): %s", shim_exc)
     except Exception as e:
         logger.warning("NG Ecosystem init failed, falling back to bare NGLite: %s", e)
         _state.ng_ecosystem = None
