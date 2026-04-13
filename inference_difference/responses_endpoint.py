@@ -83,9 +83,14 @@ _last_tool_model: Optional[str] = None
 _last_tool_names: List[str] = []
 _last_tool_time: float = 0.0
 
+# Detect TOOL EXECUTION failures, not empty results.
+# "No results found" is a valid response, not a failure.
+# Only match patterns that indicate the tool CALL itself broke.
 _TOOL_FAILURE_PATTERNS = re.compile(
-    r"failed|error|missing required|denied|invalid|not found|"
-    r"not available|rejected|timed out|permission",
+    r"Missing required parameter|Supply correct parameters|"
+    r"tool.*(?:failed|denied|rejected|not available|not found)|"
+    r"permission denied|timed out|invalid.*parameter|"
+    r"Field required|cannot be converted",
     re.IGNORECASE,
 )
 
@@ -531,8 +536,11 @@ async def _generate_sse_stream(
 
     # Smart shim: parse <tool_call> XML tags from text
     import sys as _sys
-    tc_names = [tc.get("function", {}).get("name", "?") for tc in (tool_calls or [])]
-    print(f"[SHIM-DEBUG] SSE path: model={model}, content_len={len(content)}, tool_calls={tc_names}, has_xml_tags={'<tool_call>' in content}", file=_sys.stderr, flush=True)
+    tc_debug = []
+    for tc in (tool_calls or []):
+        f = tc.get("function", {})
+        tc_debug.append(f"{f.get('name','?')}({f.get('arguments','')[:150]})")
+    print(f"[SHIM-DEBUG] SSE path: model={model}, content_len={len(content)}, tool_calls={tc_debug}", file=_sys.stderr, flush=True)
     if not tool_calls and content:
         cleaned, parsed_calls = _extract_tool_calls_from_text(content)
         if parsed_calls:
