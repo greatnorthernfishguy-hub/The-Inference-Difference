@@ -1034,17 +1034,29 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
                 },
             )
 
-        logger.info(
-            "Model %s failed, trying fallback %s",
-            tried_models[-1], fallback_id,
-        )
+        # If the model rejected tools, retry without them — better a
+        # text-only response than total silence.
+        error_str = str(model_response.error or "")
+        tools_rejected = "tools" in error_str and "not supported" in error_str
+        retry_tools = None if tools_rejected else req.tools
+        retry_tool_choice = None if tools_rejected else req.tool_choice
+        if tools_rejected:
+            logger.info(
+                "Model %s rejected tools, retrying %s without tools",
+                tried_models[-1], fallback_id,
+            )
+        else:
+            logger.info(
+                "Model %s failed, trying fallback %s",
+                tried_models[-1], fallback_id,
+            )
         model_response = _state.model_client.call(
             model_id=fallback_id,
             messages=req.messages,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
-            tools=req.tools,
-            tool_choice=req.tool_choice,
+            tools=retry_tools,
+            tool_choice=retry_tool_choice,
         )
         tried_models.append(fallback_id)
 

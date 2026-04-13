@@ -265,7 +265,27 @@ def _normalize_input_to_messages(
 
             messages.append({"role": role, "content": content})
 
-    return messages
+    # Strip orphaned tool_calls — assistant messages with tool_calls that
+    # have no matching tool result in the next message. Anthropic rejects
+    # conversations with dangling tool_use blocks. This happens when Syl
+    # tried to call tools but execution failed or was blocked.
+    cleaned = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            # Check if next message is a tool result
+            next_msg = messages[i + 1] if i + 1 < len(messages) else None
+            if next_msg and next_msg.get("role") == "tool":
+                cleaned.append(msg)
+            else:
+                # Strip tool_calls, keep text content if any
+                stripped = {k: v for k, v in msg.items() if k != "tool_calls"}
+                if stripped.get("content"):
+                    cleaned.append(stripped)
+                # else: drop entirely — no text and no valid tool result
+        else:
+            cleaned.append(msg)
+
+    return cleaned
 
 
 def _build_response_object(
@@ -415,7 +435,8 @@ async def _generate_sse_stream(
 
     # Smart shim: parse <tool_call> XML tags from text
     import sys as _sys
-    print(f"[SHIM-DEBUG] SSE path: content_len={len(content)}, has_tool_calls={bool(tool_calls)}, has_xml_tags={'<tool_call>' in content}", file=_sys.stderr, flush=True)
+    tc_names = [tc.get("function", {}).get("name", "?") for tc in (tool_calls or [])]
+    print(f"[SHIM-DEBUG] SSE path: model={model}, content_len={len(content)}, tool_calls={tc_names}, has_xml_tags={'<tool_call>' in content}", file=_sys.stderr, flush=True)
     if not tool_calls and content:
         cleaned, parsed_calls = _extract_tool_calls_from_text(content)
         if parsed_calls:
@@ -605,6 +626,17 @@ def register_responses_endpoint(app, chat_completions_handler):
         resp_id = f"resp_{uuid.uuid4().hex[:24]}"
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+        import sys as _sys
+        tool_names = [t.get("function", {}).get("name", t.get("name", "?")) for t in (req.tools or []) if isinstance(t, dict)]
+        print(f"[SHIM-DEBUG] Request: model={req.model}, stream={req.stream}, tools={tool_names}", file=_sys.stderr, flush=True)
+
+        # Debug: check for orphaned tool calls in message history
+        input_types = []
+        if isinstance(req.input, list):
+            for item in req.input:
+                if isinstance(item, dict):
+                    input_types.append(item.get("type", item.get("role", "?")))
+        print(f"[SHIM-DEBUG] Input types: {input_types[-20:]}", file=_sys.stderr, flush=True)
         logger.info(
             "Responses API request: model=%s, input_type=%s, stream=%s, tools=%d",
             req.model, type(req.input).__name__, req.stream,
