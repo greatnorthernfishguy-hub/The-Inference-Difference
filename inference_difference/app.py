@@ -61,6 +61,13 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-04-13] Claude (Sonnet 4.6) — Fix ng_lite stats method name (#107)
+# What: stats() → get_stats() on line 1559 in /stats endpoint.
+# Why: ng_lite.py defines get_stats(), not stats(). Every /stats call
+#   raised AttributeError, breaking TID monitoring entirely.
+# How: Single method rename. No behavioral change.
+# -------------------
+# ---- Changelog ----
 # [2026-03-25] Claude (CC) — Handle list-type message content
 # What: Extract text from OpenAI list-format content blocks before
 #   passing to hooks and classifier. content can be a string OR a
@@ -1556,7 +1563,7 @@ async def get_stats() -> Dict[str, Any]:
     """Router performance statistics."""
     stats = _state.engine.get_stats()
     if _state.ng_lite is not None:
-        stats["ng_lite"] = _state.ng_lite.stats()
+        stats["ng_lite"] = _state.ng_lite.get_stats()
     if _state.catalog_manager is not None:
         stats["catalog"] = _state.catalog_manager.get_catalog_stats()
     if _state.dream_cycle is not None:
