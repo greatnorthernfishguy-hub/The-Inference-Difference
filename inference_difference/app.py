@@ -1588,7 +1588,7 @@ async def get_stats() -> Dict[str, Any]:
     """Router performance statistics."""
     stats = _state.engine.get_stats()
     if _state.ng_lite is not None:
-        stats["ng_lite"] = _state.ng_lite.get_stats()
+        stats["ng_lite"] = _state.ng_lite.stats() if hasattr(_state.ng_lite, 'stats') else {}
     if _state.catalog_manager is not None:
         stats["catalog"] = _state.catalog_manager.get_catalog_stats()
     if _state.dream_cycle is not None:
