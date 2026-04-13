@@ -143,14 +143,24 @@ class ShimObserver:
     not classified labels. The substrate learns the semantic space.
     """
 
-    def __init__(self, ng_ecosystem: Optional[Any] = None):
+    def __init__(
+        self,
+        ng_ecosystem: Optional[Any] = None,
+        influence: float = 0.20,
+        neutral: float = 0.5,
+    ):
         """Initialize with optional substrate reference.
 
         Args:
             ng_ecosystem: TID's NG-Lite/NGEcosystem instance. When None,
                 observe() and query_confidence() are silent no-ops.
+            influence: How much substrate opinion shifts confidence.
+                Read from config.shim_substrate_influence at startup.
+            neutral: Baseline "no opinion" value.
         """
         self._ng = ng_ecosystem
+        self._influence = influence
+        self._neutral = neutral
         self._observation_count: Dict[str, int] = {}
 
     def observe(
@@ -213,8 +223,6 @@ class ShimObserver:
         self,
         model_id: str,
         operation: str,
-        influence: float = 0.20,
-        neutral: float = 0.5,
     ) -> float:
         """Query the substrate for its opinion on whether this model
         needs this translation operation.
@@ -224,17 +232,18 @@ class ShimObserver:
         - >0.5 = substrate thinks this operation IS needed for this model
         - <0.5 = substrate thinks this operation is NOT needed
 
+        Influence and neutral are set at construction time from config,
+        not per-call. Matches _substrate_tier_mapping() pattern.
+
         Args:
             model_id: The model to query about.
             operation: The translation operation name.
-            influence: How much substrate weight shifts the neutral point.
-            neutral: The baseline "no opinion" value.
 
         Returns:
             Blended confidence (0.0–1.0).
         """
         if self._ng is None:
-            return neutral
+            return self._neutral
 
         try:
             from ng_embed import embed
@@ -242,24 +251,26 @@ class ShimObserver:
             query_text = f"model {model_id} needs {operation} translation"
             query_emb = embed(query_text)
             if query_emb is None:
-                return neutral
+                return self._neutral
 
             recs = self._ng.get_recommendations(query_emb, top_k=5)
             if not recs:
-                return neutral
+                return self._neutral
 
             target_prefix = f"shim:{operation}:{model_id}"
             for target_id, weight, _reasoning in recs:
                 if target_prefix in target_id:
                     # Blend substrate weight with neutral using influence
-                    blended = neutral + (weight - neutral) * influence * 2.0
+                    blended = self._neutral + (
+                        weight - self._neutral
+                    ) * self._influence * 2.0
                     return max(0.0, min(1.0, blended))
 
-            return neutral
+            return self._neutral
 
         except Exception as exc:
             logger.debug("Shim query_confidence failed: %s", exc)
-            return neutral
+            return self._neutral
 
     def get_stats(self) -> Dict[str, Any]:
         """Return observation stats for diagnostics."""

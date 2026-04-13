@@ -612,9 +612,14 @@ async def lifespan(app: FastAPI):
         try:
             from inference_difference.translation_shim import ShimObserver
             from inference_difference.responses_endpoint import set_shim_observer
-            _state.shim_observer = ShimObserver(_state.ng_ecosystem)
+            _state.shim_observer = ShimObserver(
+                ng_ecosystem=_state.ng_ecosystem,
+                influence=getattr(_state.config, 'shim_substrate_influence', 0.20),
+                neutral=getattr(_state.config, 'tier_neutral_weight', 0.5),
+            )
             set_shim_observer(_state.shim_observer)
-            logger.info("ShimObserver wired to substrate")
+            logger.info("ShimObserver wired to substrate (influence=%.2f)",
+                        _state.config.shim_substrate_influence)
         except Exception as shim_exc:
             logger.debug("ShimObserver wiring failed (non-fatal): %s", shim_exc)
     except Exception as e:
