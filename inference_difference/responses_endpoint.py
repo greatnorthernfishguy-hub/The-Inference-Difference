@@ -87,14 +87,31 @@ def set_shim_observer(observer: Any) -> None:
 # Tool call outcome learning — the River carries tool experience
 # ---------------------------------------------------------------------------
 
-# Track last model used for tool-bearing responses.
-# OpenClaw replaces call_ids with its own tool execution IDs,
-# so matching by call_id is impossible. Instead, we track which
-# model generated the most recent tool calls and attribute all
-# incoming tool outcomes to that model.
-_last_tool_model: Optional[str] = None
-_last_tool_names: List[str] = []
-_last_tool_time: float = 0.0
+# Per-request tool tracking context — replaces module-level globals (#134).
+# Passed through the call chain instead of stored globally.
+# This prevents concurrent requests from cross-attributing tool outcomes.
+class _ToolContext:
+    """Request-scoped tool tracking. Created per endpoint call."""
+    __slots__ = ('model_id', 'tool_names', 'timestamp')
+
+    def __init__(self) -> None:
+        self.model_id: Optional[str] = None
+        self.tool_names: List[str] = []
+        self.timestamp: float = 0.0
+
+    def record(self, model_id: str, tool_names: List[str]) -> None:
+        self.model_id = model_id
+        self.tool_names = tool_names
+        self.timestamp = time.time()
+
+    @property
+    def stale(self) -> bool:
+        return time.time() - self.timestamp > 3600.0
+
+
+# Active tool context for the current request — set at the endpoint
+# handler level, consumed by _learn_from_tool_outcome.
+_active_tool_ctx: Optional[_ToolContext] = None
 
 # Detect TOOL EXECUTION failures, not empty results.
 # "No results found" is a valid response, not a failure.
@@ -109,51 +126,44 @@ _TOOL_FAILURE_PATTERNS = re.compile(
 
 
 def _record_tool_response(model_id: str, tool_names: List[str]) -> None:
-    """Track which model generated the most recent tool calls."""
-    global _last_tool_model, _last_tool_names, _last_tool_time
-    _last_tool_model = model_id
-    _last_tool_names = tool_names
-    _last_tool_time = time.time()
+    """Track which model generated tool calls for this request."""
+    if _active_tool_ctx is not None:
+        _active_tool_ctx.record(model_id, tool_names)
 
 
 def _learn_from_tool_outcome(output: str) -> None:
     """When a tool result comes back, teach the substrate which model
     generated the call and whether the tool execution succeeded.
 
-    Routes through ShimObserver for unified substrate access —
-    no circular import of _state needed.
+    Uses request-scoped _active_tool_ctx instead of module globals (#134).
+    Routes through ShimObserver for unified substrate access.
 
     Raw experience in (Law 7). The substrate learns:
     - model X + tool calls → success/failure
     - Over time, routing naturally avoids models that produce bad calls
     """
-    global _last_tool_model
     import sys as _sys
 
-    if _last_tool_model is None:
+    ctx = _active_tool_ctx
+    if ctx is None or ctx.model_id is None:
         return
 
-    # Expire stale tracking (1 hour)
-    if time.time() - _last_tool_time > 3600.0:
-        _last_tool_model = None
+    if ctx.stale:
         return
 
-    model_id = _last_tool_model
-    tool_name = _last_tool_names[0] if _last_tool_names else "unknown"
+    model_id = ctx.model_id
+    tool_name = ctx.tool_names[0] if ctx.tool_names else "unknown"
     success = not bool(_TOOL_FAILURE_PATTERNS.search(output[:500]))
 
     print(f"[SHIM-DEBUG] Tool outcome: {tool_name} on {model_id} → {'SUCCESS' if success else 'FAILURE'}", file=_sys.stderr, flush=True)
 
     if _shim_observer is not None:
-        # Tool-specific observation
         _shim_observer.observe(
             model_id=model_id,
             operation=f"tool_exec_{tool_name}",
             did_apply=success,
             raw_context=f"tool call {tool_name} by {model_id} {'succeeded' if success else 'failed'}: {output[:200]}",
         )
-        # Also deposit against bare model_id so router's
-        # _score_learned_performance sees it directly
         _shim_observer.observe(
             model_id=model_id,
             operation="tool_exec",
@@ -321,6 +331,7 @@ def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]
 def _normalize_input_to_messages(
     input_data: Union[str, List[Dict[str, Any]]],
     instructions: Optional[str] = None,
+    model_id: str = "unknown",
 ) -> List[Dict[str, Any]]:
     """Convert Responses API input to chat completions messages format.
 
@@ -329,6 +340,7 @@ def _normalize_input_to_messages(
     - Array of role/content objects -> pass through with role normalization
     - instructions -> prepended as system message
     - function_call_output items -> tool role messages
+    - Orphaned tool_call stripping with model-attributed observation (#135)
     """
     messages: List[Dict[str, Any]] = []
 
@@ -420,6 +432,7 @@ def _normalize_input_to_messages(
     # conversations with dangling tool_use blocks. This happens when Syl
     # tried to call tools but execution failed or was blocked.
     cleaned = []
+    orphan_count = 0
     for i, msg in enumerate(messages):
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
             # Check if next message is a tool result
@@ -431,9 +444,19 @@ def _normalize_input_to_messages(
                 stripped = {k: v for k, v in msg.items() if k != "tool_calls"}
                 if stripped.get("content"):
                     cleaned.append(stripped)
+                orphan_count += 1
                 # else: drop entirely — no text and no valid tool result
         else:
             cleaned.append(msg)
+
+    # Observe orphan stripping — now model-attributed (#135)
+    if orphan_count > 0 and _shim_observer is not None:
+        _shim_observer.observe(
+            model_id=model_id,
+            operation="orphan_strip",
+            did_apply=True,
+            raw_context=f"stripped {orphan_count} orphaned tool_call blocks from conversation history",
+        )
 
     return cleaned
 
@@ -845,8 +868,14 @@ def register_responses_endpoint(app, chat_completions_handler):
             len(req.tools) if req.tools else 0,
         )
 
+        # Create request-scoped tool context (#134 — replaces module globals)
+        global _active_tool_ctx
+        _active_tool_ctx = _ToolContext()
+
         # Step 1: Normalize input to messages (including tool results)
-        messages = _normalize_input_to_messages(req.input, req.instructions)
+        messages = _normalize_input_to_messages(
+            req.input, req.instructions, model_id=req.model,
+        )
 
         if not messages:
             return JSONResponse(
