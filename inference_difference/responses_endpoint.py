@@ -589,23 +589,35 @@ async def _generate_sse_stream(
             func = tc.get("function", {})
             canonical_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
 
+            raw_args = func.get("arguments", "{}")
+            # Ensure arguments is a JSON string, not a dict
+            if isinstance(raw_args, dict):
+                raw_args = json.dumps(raw_args)
+            elif not isinstance(raw_args, str):
+                raw_args = json.dumps(raw_args) if raw_args else "{}"
+
+            print(f"[SHIM-DEBUG] fc_item: name={func.get('name')} args_type={type(func.get('arguments')).__name__} args={raw_args[:200]}", file=_sys.stderr, flush=True)
+
             fc_item = {
                 "type": "function_call",
                 "id": canonical_id,
                 "call_id": canonical_id,
                 "name": func.get("name", ""),
-                "arguments": func.get("arguments", "{}"),
+                "arguments": raw_args,
                 "status": "completed",
             }
 
-            yield _sse_event("response.output_item.added", {
+            added_event = _sse_event("response.output_item.added", {
                 "output_index": output_index,
                 "item": {**fc_item, "status": "in_progress"},
             })
-            yield _sse_event("response.output_item.done", {
+            done_event = _sse_event("response.output_item.done", {
                 "output_index": output_index,
                 "item": fc_item,
             })
+            print(f"[SHIM-DEBUG] SSE fc event: {done_event.replace(chr(10), ' | ')[:500]}", file=_sys.stderr, flush=True)
+            yield added_event
+            yield done_event
             output_index += 1
             await asyncio.sleep(0)
 
