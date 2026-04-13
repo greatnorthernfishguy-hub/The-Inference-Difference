@@ -225,6 +225,7 @@ class RoutingEngine:
         classification: RequestClassification,
         consciousness_score: Optional[float] = None,
         request_id: Optional[str] = None,
+        has_tools: bool = False,
     ) -> RoutingDecision:
         """Route a classified request to the best model.
 
@@ -234,6 +235,8 @@ class RoutingEngine:
                 agent. If above threshold, routing is elevated to prefer
                 higher-capability models.
             request_id: Optional request identifier for tracking.
+            has_tools: Whether the request includes tool definitions.
+                When True, only models with "tools" capability are considered.
 
         Returns:
             RoutingDecision with selected model and full reasoning trace.
@@ -243,7 +246,7 @@ class RoutingEngine:
 
         # Get candidate models (with consciousness quality floor applied)
         candidates, _quality_floor_bypassed = self._filter_candidates(
-            classification, consciousness_score,
+            classification, consciousness_score, has_tools=has_tools,
         )
 
         # Interactive priority floor — punch list #33 fix: log on fallthrough
@@ -607,6 +610,7 @@ class RoutingEngine:
         self,
         classification: RequestClassification,
         consciousness_score: Optional[float] = None,
+        has_tools: bool = False,
     ) -> Tuple[List[ModelEntry], bool]:
         """Filter models to those that can handle this request.
 
@@ -636,6 +640,11 @@ class RoutingEngine:
 
             # Context window check
             if model.context_window < classification.requires_context_window:
+                continue
+
+            # Tool capability check — only consider tool-capable models
+            # when tools are in the request
+            if has_tools and "tools" not in getattr(model, 'capabilities', []):
                 continue
 
             # Domain + complexity check

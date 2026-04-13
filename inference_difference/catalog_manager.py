@@ -625,10 +625,15 @@ class CatalogManager:
         return "standard"
 
     def _extract_capabilities(self, item: Dict[str, Any]) -> List[str]:
-        """Extract model capabilities from OpenRouter metadata."""
+        """Extract model capabilities from OpenRouter metadata.
+
+        Uses supported_parameters (authoritative) for tool support,
+        with description fallback. Architecture.modality for vision.
+        """
         caps = []
         model_id = item.get("id", "").lower()
         name = item.get("name", "").lower()
+        supported_params = item.get("supported_parameters") or []
 
         # Code capability
         code_keywords = ["code", "coder", "codestral", "deepseek-coder"]
@@ -639,10 +644,13 @@ class CatalogManager:
         if item.get("architecture", {}).get("modality", "") == "multimodal":
             caps.append("vision")
 
-        # Tool use
-        desc = item.get("description", "").lower()
-        if "function calling" in desc or "tool" in desc:
+        # Tool use — supported_parameters is authoritative
+        if "tools" in supported_params:
             caps.append("tools")
+        else:
+            desc = item.get("description", "").lower()
+            if "function calling" in desc or "tool use" in desc:
+                caps.append("tools")
 
         return caps
 

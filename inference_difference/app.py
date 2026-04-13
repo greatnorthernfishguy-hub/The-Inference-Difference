@@ -473,6 +473,7 @@ def _register_catalog_models() -> None:
                 cost_per_1k_tokens=cost_per_1k,
                 avg_latency_ms=2000.0,  # Sensible default for cloud APIs
                 priority=priority,
+                capabilities=cm.capabilities,
                 enabled=cm.is_active,
             )
         except (ValueError, TypeError) as e:
@@ -981,6 +982,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             classification=classification,
             consciousness_score=consciousness_score,
             request_id=request_id,
+            has_tools=bool(req.tools),
         )
         ctx.routing_decision = decision
         selected_model = decision.model_id

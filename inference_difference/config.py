@@ -96,6 +96,7 @@ class ModelEntry:
     quantization: str = ""
     priority: int = 0
     conversational_quality: float = 0.5
+    capabilities: List[str] = field(default_factory=list)
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
