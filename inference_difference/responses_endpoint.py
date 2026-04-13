@@ -120,6 +120,9 @@ def _learn_from_tool_outcome(output: str) -> None:
     """When a tool result comes back, teach the substrate which model
     generated the call and whether the tool execution succeeded.
 
+    Routes through ShimObserver for unified substrate access —
+    no circular import of _state needed.
+
     Raw experience in (Law 7). The substrate learns:
     - model X + tool calls → success/failure
     - Over time, routing naturally avoids models that produce bad calls
@@ -141,38 +144,68 @@ def _learn_from_tool_outcome(output: str) -> None:
 
     print(f"[SHIM-DEBUG] Tool outcome: {tool_name} on {model_id} → {'SUCCESS' if success else 'FAILURE'}", file=_sys.stderr, flush=True)
 
-    # Deposit to TID's local substrate
-    try:
-        from inference_difference.app import _state
-        ng = getattr(_state, 'ng_lite', None) or getattr(_state, 'ng_ecosystem', None)
-        if ng is not None and hasattr(ng, 'record_outcome'):
-            try:
-                from ng_embed import embed
-                embedding = embed(f"tool call {tool_name} by {model_id} {'succeeded' if success else 'failed'}: {output[:200]}")
-            except Exception:
-                embedding = None
+    if _shim_observer is not None:
+        # Tool-specific observation
+        _shim_observer.observe(
+            model_id=model_id,
+            operation=f"tool_exec_{tool_name}",
+            did_apply=success,
+            raw_context=f"tool call {tool_name} by {model_id} {'succeeded' if success else 'failed'}: {output[:200]}",
+        )
+        # Also deposit against bare model_id so router's
+        # _score_learned_performance sees it directly
+        _shim_observer.observe(
+            model_id=model_id,
+            operation="tool_exec",
+            did_apply=success,
+            raw_context=f"model {model_id} tool execution {'succeeded' if success else 'failed'} for {tool_name}",
+        )
+        print(f"[SHIM-DEBUG] Tool outcome deposited via ShimObserver", file=_sys.stderr, flush=True)
 
-            if embedding is not None:
-                try:
-                    ng.record_outcome(
-                        embedding=embedding,
-                        target_id=f"tool:{tool_name}:{model_id}",
-                        success=success,
-                        strength=1.0 if success else 0.0,
-                    )
-                    ng.record_outcome(
-                        embedding=embedding,
-                        target_id=model_id,
-                        success=success,
-                        strength=0.8 if success else 0.1,
-                    )
-                    print(f"[SHIM-DEBUG] Deposited to substrate OK", file=_sys.stderr, flush=True)
-                except Exception as ro_exc:
-                    # Bridge failure is expected (TID is infrastructure, not River participant)
-                    # Local NG-Lite learning still happens despite bridge warning
-                    print(f"[SHIM-DEBUG] record_outcome raised: {type(ro_exc).__name__}: {ro_exc}", file=_sys.stderr, flush=True)
-    except Exception as exc:
-        print(f"[SHIM-DEBUG] Tool learning failed: {type(exc).__name__}: {exc}", file=_sys.stderr, flush=True)
+def _normalize_tools(
+    tools: Optional[List[Any]],
+    model_id: str = "unknown",
+) -> Optional[List[Dict[str, Any]]]:
+    """Normalize tool definitions to OpenAI nested format.
+
+    OpenClaw sends flat: {"type":"function","name":"exec","parameters":{}}
+    OpenAI requires: {"type":"function","function":{"name":"exec","parameters":{}}}
+
+    Deposits format observation to ShimObserver when normalization fires.
+    """
+    if not tools:
+        return None
+
+    normalized = []
+    flat_count = 0
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if "function" in t:
+            normalized.append(t)  # already nested
+        elif "name" in t:
+            # Flat format → wrap in function key
+            normalized.append({
+                "type": t.get("type", "function"),
+                "function": {
+                    k: v for k, v in t.items()
+                    if k not in ("type",)
+                },
+            })
+            flat_count += 1
+        else:
+            normalized.append(t)
+
+    if flat_count > 0 and _shim_observer is not None:
+        _shim_observer.observe(
+            model_id=model_id,
+            operation="tool_flat_to_nested",
+            did_apply=True,
+            raw_context=f"{flat_count} tool definitions normalized from flat to nested format",
+        )
+
+    return normalized
+
 
 logger = logging.getLogger("inference_difference.responses_endpoint")
 
@@ -483,6 +516,13 @@ def _chat_completion_to_response(
                 "Shim: extracted %d tool call(s) from text markup",
                 len(parsed_calls),
             )
+            if _shim_observer is not None:
+                _shim_observer.observe(
+                    model_id=model,
+                    operation="tool_call_xml_parse",
+                    did_apply=True,
+                    raw_context=f"extracted {len(parsed_calls)} tool calls from XML tags in response text",
+                )
 
     # Record model + tool names for outcome learning (non-streaming path)
     if tool_calls:
@@ -560,6 +600,13 @@ async def _generate_sse_stream(
             content = cleaned
             tool_calls = parsed_calls
             print(f"[SHIM-DEBUG] Extracted {len(parsed_calls)} tool calls from XML tags", file=_sys.stderr, flush=True)
+            if _shim_observer is not None:
+                _shim_observer.observe(
+                    model_id=model,
+                    operation="tool_call_xml_parse",
+                    did_apply=True,
+                    raw_context=f"extracted {len(parsed_calls)} tool calls from XML tags in streaming response",
+                )
         elif "<tool_call>" in content:
             print(f"[SHIM-DEBUG] XML tags found but regex failed. Content sample: {content[content.find('<tool_call>'):content.find('</tool_call>')+13][:300]}", file=_sys.stderr, flush=True)
 
@@ -604,10 +651,19 @@ async def _generate_sse_stream(
 
             raw_args = func.get("arguments", "{}")
             # Ensure arguments is a JSON string, not a dict
-            if isinstance(raw_args, dict):
+            was_dict = isinstance(raw_args, dict)
+            if was_dict:
                 raw_args = json.dumps(raw_args)
             elif not isinstance(raw_args, str):
                 raw_args = json.dumps(raw_args) if raw_args else "{}"
+
+            if was_dict and _shim_observer is not None:
+                _shim_observer.observe(
+                    model_id=model,
+                    operation="args_dict_to_string",
+                    did_apply=True,
+                    raw_context=f"model returned tool arguments as dict instead of JSON string, tool name {func.get('name', 'unknown')}",
+                )
 
             print(f"[SHIM-DEBUG] fc_item: name={func.get('name')} args_type={type(func.get('arguments')).__name__} args={raw_args[:200]}", file=_sys.stderr, flush=True)
 
@@ -799,29 +855,7 @@ def register_responses_endpoint(app, chat_completions_handler):
         #
         effective_model = req.model
 
-        # Normalize tool definitions to OpenAI nested format.
-        # OpenClaw sends flat: {"type":"function","name":"exec","parameters":{}}
-        # OpenAI requires: {"type":"function","function":{"name":"exec","parameters":{}}}
-        # Some providers accept both, stricter ones (nvidia) 422 on flat format.
-        normalized_tools = None
-        if req.tools:
-            normalized_tools = []
-            for t in req.tools:
-                if not isinstance(t, dict):
-                    continue
-                if "function" in t:
-                    normalized_tools.append(t)  # already nested
-                elif "name" in t:
-                    # Flat format → wrap in function key
-                    normalized_tools.append({
-                        "type": t.get("type", "function"),
-                        "function": {
-                            k: v for k, v in t.items()
-                            if k not in ("type",)
-                        },
-                    })
-                else:
-                    normalized_tools.append(t)
+        normalized_tools = _normalize_tools(req.tools, effective_model)
 
         chat_req = ChatCompletionRequest(
             model=effective_model,

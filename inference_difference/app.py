@@ -905,6 +905,16 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     resolved_model, translation_type = translate_request(
         req.model, req.messages,
     )
+    # Observe alias resolution
+    if (translation_type == "alias"
+            and hasattr(_state, 'shim_observer')
+            and _state.shim_observer is not None):
+        _state.shim_observer.observe(
+            model_id=req.model,
+            operation="alias_resolve",
+            did_apply=True,
+            raw_context=f"alias {req.model} resolved to {resolved_model}",
+        )
     # If caller specified an exact model (not auto), we'll try it
     # but still run hooks for security/compliance
     caller_chose_model = (
