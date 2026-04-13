@@ -135,26 +135,26 @@ def _learn_from_tool_outcome(output: str) -> None:
                 embedding = None
 
             if embedding is not None:
-                # Tool-specific target for semantic learning
-                ng.record_outcome(
-                    embedding=embedding,
-                    target_id=f"tool:{tool_name}:{model_id}",
-                    success=success,
-                    strength=1.0 if success else 0.0,
-                )
-                # Bare model_id so router's _score_learned_performance sees it
-                ng.record_outcome(
-                    embedding=embedding,
-                    target_id=model_id,
-                    success=success,
-                    strength=0.8 if success else 0.1,
-                )
-                logger.info(
-                    "Tool outcome → substrate: %s on %s → %s",
-                    tool_name, model_id, "success" if success else "FAILURE",
-                )
+                try:
+                    ng.record_outcome(
+                        embedding=embedding,
+                        target_id=f"tool:{tool_name}:{model_id}",
+                        success=success,
+                        strength=1.0 if success else 0.0,
+                    )
+                    ng.record_outcome(
+                        embedding=embedding,
+                        target_id=model_id,
+                        success=success,
+                        strength=0.8 if success else 0.1,
+                    )
+                    print(f"[SHIM-DEBUG] Deposited to substrate OK", file=_sys.stderr, flush=True)
+                except Exception as ro_exc:
+                    # Bridge failure is expected (TID is infrastructure, not River participant)
+                    # Local NG-Lite learning still happens despite bridge warning
+                    print(f"[SHIM-DEBUG] record_outcome raised: {type(ro_exc).__name__}: {ro_exc}", file=_sys.stderr, flush=True)
     except Exception as exc:
-        logger.debug("Tool outcome recording failed: %s", exc)
+        print(f"[SHIM-DEBUG] Tool learning failed: {type(exc).__name__}: {exc}", file=_sys.stderr, flush=True)
 
 logger = logging.getLogger("inference_difference.responses_endpoint")
 
