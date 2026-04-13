@@ -340,6 +340,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             avg_latency_ms=3000,
             priority=45,
             conversational_quality=0.85,
+            capabilities=["tools"],
             enabled=True,
         ),
         "venice/venice-uncensored": ModelEntry(
@@ -372,6 +373,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             avg_latency_ms=5000,
             priority=50,
             conversational_quality=0.88,
+            capabilities=["tools"],
             enabled=True,
         ),
     }

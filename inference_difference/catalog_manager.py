@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -664,8 +665,19 @@ class CatalogManager:
                 return max_len
         return 4096  # Conservative default
 
+    # Model families with known tool/function-calling support.
+    _TOOL_CAPABLE_FAMILIES = re.compile(
+        r"qwen[23]|llama-[34]|llama-3\.[123]|deepseek|mistral|gemma-[34]|"
+        r"command-r|hermes|nous-hermes|nemotron|grok|kimi|minimax",
+        re.IGNORECASE,
+    )
+
     def _hf_capabilities(self, item: Dict[str, Any]) -> List[str]:
-        """Extract capabilities from HuggingFace model metadata."""
+        """Extract capabilities from HuggingFace model metadata.
+
+        HF tags don't expose tool support directly. Detected from
+        known model families that implement tool/function calling.
+        """
         caps = []
         tags = item.get("tags", [])
         if not isinstance(tags, list):
@@ -677,6 +689,9 @@ class CatalogManager:
         model_id = str(item.get("id", "")).lower()
         if "code" in model_id or "coder" in model_id:
             caps.append("code")
+
+        if self._TOOL_CAPABLE_FAMILIES.search(model_id):
+            caps.append("tools")
 
         return list(set(caps))
 
