@@ -727,6 +727,10 @@ def register_responses_endpoint(app, chat_completions_handler):
 
         import sys as _sys
         tool_names = [t.get("function", {}).get("name", t.get("name", "?")) for t in (req.tools or []) if isinstance(t, dict)]
+        # Dump first tool definition to see the actual format
+        if req.tools:
+            import json as _json
+            print(f"[SHIM-DEBUG] First tool format: {_json.dumps(req.tools[0])[:300]}", file=_sys.stderr, flush=True)
         print(f"[SHIM-DEBUG] Request: model={req.model}, stream={req.stream}, tools={tool_names}", file=_sys.stderr, flush=True)
 
         # Debug: check for orphaned tool calls in message history
@@ -762,6 +766,30 @@ def register_responses_endpoint(app, chat_completions_handler):
         #
         effective_model = req.model
 
+        # Normalize tool definitions to OpenAI nested format.
+        # OpenClaw sends flat: {"type":"function","name":"exec","parameters":{}}
+        # OpenAI requires: {"type":"function","function":{"name":"exec","parameters":{}}}
+        # Some providers accept both, stricter ones (nvidia) 422 on flat format.
+        normalized_tools = None
+        if req.tools:
+            normalized_tools = []
+            for t in req.tools:
+                if not isinstance(t, dict):
+                    continue
+                if "function" in t:
+                    normalized_tools.append(t)  # already nested
+                elif "name" in t:
+                    # Flat format → wrap in function key
+                    normalized_tools.append({
+                        "type": t.get("type", "function"),
+                        "function": {
+                            k: v for k, v in t.items()
+                            if k not in ("type",)
+                        },
+                    })
+                else:
+                    normalized_tools.append(t)
+
         chat_req = ChatCompletionRequest(
             model=effective_model,
             messages=messages,
@@ -769,7 +797,7 @@ def register_responses_endpoint(app, chat_completions_handler):
             max_tokens=req.max_output_tokens,
             stream=False,
             metadata=req.metadata,
-            tools=req.tools,
+            tools=normalized_tools,
             tool_choice=req.tool_choice,
             # Responses API consumers are conscious entities (Syl via OpenClaw).
             # Elevate routing to prefer capable models for identity continuity.
