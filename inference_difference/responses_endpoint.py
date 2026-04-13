@@ -66,7 +66,6 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from collections import OrderedDict
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -75,11 +74,14 @@ from pydantic import BaseModel, Field
 # Tool call outcome learning — the River carries tool experience
 # ---------------------------------------------------------------------------
 
-# Cache: call_id → {model_id, tool_name, timestamp}
-# Bounded LRU so it doesn't grow unbounded. Entries expire after 1 hour.
-_tool_call_cache: OrderedDict = OrderedDict()
-_TOOL_CACHE_MAX = 500
-_TOOL_CACHE_TTL = 3600.0
+# Track last model used for tool-bearing responses.
+# OpenClaw replaces call_ids with its own tool execution IDs,
+# so matching by call_id is impossible. Instead, we track which
+# model generated the most recent tool calls and attribute all
+# incoming tool outcomes to that model.
+_last_tool_model: Optional[str] = None
+_last_tool_names: List[str] = []
+_last_tool_time: float = 0.0
 
 _TOOL_FAILURE_PATTERNS = re.compile(
     r"failed|error|missing required|denied|invalid|not found|"
@@ -88,82 +90,69 @@ _TOOL_FAILURE_PATTERNS = re.compile(
 )
 
 
-def _record_tool_call(call_id: str, model_id: str, tool_name: str) -> None:
-    """Cache a tool call so we can learn from its outcome later."""
-    _tool_call_cache[call_id] = {
-        "model_id": model_id,
-        "tool_name": tool_name,
-        "timestamp": time.time(),
-    }
-    if len(_tool_call_cache) > _TOOL_CACHE_MAX:
-        _tool_call_cache.popitem(last=False)
+def _record_tool_response(model_id: str, tool_names: List[str]) -> None:
+    """Track which model generated the most recent tool calls."""
+    global _last_tool_model, _last_tool_names, _last_tool_time
+    _last_tool_model = model_id
+    _last_tool_names = tool_names
+    _last_tool_time = time.time()
 
 
-def _learn_from_tool_outcome(call_id: str, output: str) -> None:
+def _learn_from_tool_outcome(output: str) -> None:
     """When a tool result comes back, teach the substrate which model
     generated the call and whether the tool execution succeeded.
 
     Raw experience in (Law 7). The substrate learns:
-    - model X + tool Y → success/failure
+    - model X + tool calls → success/failure
     - Over time, routing naturally avoids models that produce bad calls
     """
+    global _last_tool_model
     import sys as _sys
 
-    # Try exact match, then strip pipe suffix (OpenClaw legacy format)
-    matched_key = call_id if call_id in _tool_call_cache else None
-    if matched_key is None and "|" in call_id:
-        base_id = call_id.split("|")[0]
-        matched_key = base_id if base_id in _tool_call_cache else None
-
-    if matched_key is None:
-        print(f"[SHIM-DEBUG] Tool outcome: no cache match for call_id={call_id[:50]} (cache={len(_tool_call_cache)})", file=_sys.stderr, flush=True)
+    if _last_tool_model is None:
         return
 
-    entry = _tool_call_cache.pop(matched_key)
-
-    # Expire stale entries
-    if time.time() - entry["timestamp"] > _TOOL_CACHE_TTL:
+    # Expire stale tracking (1 hour)
+    if time.time() - _last_tool_time > 3600.0:
+        _last_tool_model = None
         return
 
-    model_id = entry["model_id"]
-    tool_name = entry["tool_name"]
+    model_id = _last_tool_model
+    tool_name = _last_tool_names[0] if _last_tool_names else "unknown"
     success = not bool(_TOOL_FAILURE_PATTERNS.search(output[:500]))
 
-    # Deposit to TID's substrate
+    print(f"[SHIM-DEBUG] Tool outcome: {tool_name} on {model_id} → {'SUCCESS' if success else 'FAILURE'}", file=_sys.stderr, flush=True)
+
+    # Deposit to TID's local substrate
     try:
         from inference_difference.app import _state
-        if _state.engine is not None:
-            # Embed the tool outcome as semantic experience
-            target_id = f"tool:{tool_name}:{model_id}"
-            from inference_difference.app import _state
-            ng = getattr(_state, 'ng_lite', None) or getattr(_state, 'ng_ecosystem', None)
-            if ng is not None and hasattr(ng, 'record_outcome'):
-                try:
-                    from ng_embed import embed
-                    embedding = embed(f"tool call {tool_name} by {model_id} {'succeeded' if success else 'failed'}: {output[:200]}")
-                except Exception:
-                    embedding = None
+        ng = getattr(_state, 'ng_lite', None) or getattr(_state, 'ng_ecosystem', None)
+        if ng is not None and hasattr(ng, 'record_outcome'):
+            try:
+                from ng_embed import embed
+                embedding = embed(f"tool call {tool_name} by {model_id} {'succeeded' if success else 'failed'}: {output[:200]}")
+            except Exception:
+                embedding = None
 
-                if embedding is not None:
-                    # Deposit with tool-specific target for semantic learning
-                    ng.record_outcome(
-                        embedding=embedding,
-                        target_id=target_id,
-                        success=success,
-                        strength=1.0 if success else 0.0,
-                    )
-                    # ALSO deposit with bare model_id as target so the
-                    # router's _score_learned_performance sees it directly
-                    ng.record_outcome(
-                        embedding=embedding,
-                        target_id=model_id,
-                        success=success,
-                        strength=0.8 if success else 0.1,
-                    )
-                    logger.info(
-                        "Tool outcome → substrate: %s on %s → %s",
-                        tool_name, model_id, "success" if success else "FAILURE",
-                    )
+            if embedding is not None:
+                # Tool-specific target for semantic learning
+                ng.record_outcome(
+                    embedding=embedding,
+                    target_id=f"tool:{tool_name}:{model_id}",
+                    success=success,
+                    strength=1.0 if success else 0.0,
+                )
+                # Bare model_id so router's _score_learned_performance sees it
+                ng.record_outcome(
+                    embedding=embedding,
+                    target_id=model_id,
+                    success=success,
+                    strength=0.8 if success else 0.1,
+                )
+                logger.info(
+                    "Tool outcome → substrate: %s on %s → %s",
+                    tool_name, model_id, "success" if success else "FAILURE",
+                )
     except Exception as exc:
         logger.debug("Tool outcome recording failed: %s", exc)
 
@@ -321,8 +310,8 @@ def _normalize_input_to_messages(
                 output = item.get("output", "")
                 output_str = output if isinstance(output, str) else json.dumps(output)
                 if call_id:
-                    # Learn from this tool outcome — the River carries it
-                    _learn_from_tool_outcome(call_id, output_str)
+                    # Learn from this tool outcome
+                    _learn_from_tool_outcome(output_str)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -477,13 +466,10 @@ def _chat_completion_to_response(
                 len(parsed_calls),
             )
 
-    # Record outgoing tool calls for learning (non-streaming path)
+    # Record model + tool names for outcome learning (non-streaming path)
     if tool_calls:
-        for tc in tool_calls:
-            func = tc.get("function", {})
-            _record_tool_call(
-                tc.get("id", ""), model, func.get("name", "unknown"),
-            )
+        tc_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls]
+        _record_tool_response(model, tc_names)
 
     chat_usage = chat_result.get("usage", {})
     usage = {
@@ -587,12 +573,13 @@ async def _generate_sse_stream(
 
     # --- Emit function_call items FIRST (before text) ---
     if tool_calls:
+        # Track model + tool names for outcome learning
+        tc_names = [tc.get("function", {}).get("name", "unknown") for tc in tool_calls]
+        _record_tool_response(model, tc_names)
+
         for tc in tool_calls:
             func = tc.get("function", {})
             canonical_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
-
-            # Track this call so we learn from the outcome
-            _record_tool_call(canonical_id, model, func.get("name", "unknown"))
 
             fc_item = {
                 "type": "function_call",
@@ -748,7 +735,8 @@ def register_responses_endpoint(app, chat_completions_handler):
             for item in req.input:
                 if isinstance(item, dict):
                     input_types.append(item.get("type", item.get("role", "?")))
-        print(f"[SHIM-DEBUG] Input types: {input_types[-20:]}", file=_sys.stderr, flush=True)
+        total_input_chars = sum(len(json.dumps(item)) for item in (req.input if isinstance(req.input, list) else []) if isinstance(item, dict))
+        print(f"[SHIM-DEBUG] Input types: {input_types[-20:]}, total_chars={total_input_chars}, instructions_len={len(req.instructions or '')}", file=_sys.stderr, flush=True)
         logger.info(
             "Responses API request: model=%s, input_type=%s, stream=%s, tools=%d",
             req.model, type(req.input).__name__, req.stream,
