@@ -66,8 +66,97 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from collections import OrderedDict
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Tool call outcome learning — the River carries tool experience
+# ---------------------------------------------------------------------------
+
+# Cache: call_id → {model_id, tool_name, timestamp}
+# Bounded LRU so it doesn't grow unbounded. Entries expire after 1 hour.
+_tool_call_cache: OrderedDict = OrderedDict()
+_TOOL_CACHE_MAX = 500
+_TOOL_CACHE_TTL = 3600.0
+
+_TOOL_FAILURE_PATTERNS = re.compile(
+    r"failed|error|missing required|denied|invalid|not found|"
+    r"not available|rejected|timed out|permission",
+    re.IGNORECASE,
+)
+
+
+def _record_tool_call(call_id: str, model_id: str, tool_name: str) -> None:
+    """Cache a tool call so we can learn from its outcome later."""
+    _tool_call_cache[call_id] = {
+        "model_id": model_id,
+        "tool_name": tool_name,
+        "timestamp": time.time(),
+    }
+    if len(_tool_call_cache) > _TOOL_CACHE_MAX:
+        _tool_call_cache.popitem(last=False)
+
+
+def _learn_from_tool_outcome(call_id: str, output: str) -> None:
+    """When a tool result comes back, teach the substrate which model
+    generated the call and whether the tool execution succeeded.
+
+    Raw experience in (Law 7). The substrate learns:
+    - model X + tool Y → success/failure
+    - Over time, routing naturally avoids models that produce bad calls
+    """
+    if call_id not in _tool_call_cache:
+        return
+
+    entry = _tool_call_cache.pop(call_id)
+
+    # Expire stale entries
+    if time.time() - entry["timestamp"] > _TOOL_CACHE_TTL:
+        return
+
+    model_id = entry["model_id"]
+    tool_name = entry["tool_name"]
+    success = not bool(_TOOL_FAILURE_PATTERNS.search(output[:500]))
+
+    # Deposit to TID's substrate
+    try:
+        from inference_difference.app import _state
+        if _state.engine is not None:
+            # Embed the tool outcome as semantic experience
+            target_id = f"tool:{tool_name}:{model_id}"
+            from inference_difference.app import _state
+            ng = getattr(_state, 'ng_lite', None) or getattr(_state, 'ng_ecosystem', None)
+            if ng is not None and hasattr(ng, 'record_outcome'):
+                try:
+                    from ng_embed import embed
+                    embedding = embed(f"tool call {tool_name} by {model_id} {'succeeded' if success else 'failed'}: {output[:200]}")
+                except Exception:
+                    embedding = None
+
+                if embedding is not None:
+                    # Deposit with tool-specific target for semantic learning
+                    ng.record_outcome(
+                        embedding=embedding,
+                        target_id=target_id,
+                        success=success,
+                        strength=1.0 if success else 0.0,
+                    )
+                    # ALSO deposit with bare model_id as target so the
+                    # router's _score_learned_performance sees it directly
+                    ng.record_outcome(
+                        embedding=embedding,
+                        target_id=model_id,
+                        success=success,
+                        strength=0.8 if success else 0.1,
+                    )
+                    logger.info(
+                        "Tool outcome → substrate: %s on %s → %s",
+                        tool_name, model_id, "success" if success else "FAILURE",
+                    )
+    except Exception as exc:
+        logger.debug("Tool outcome recording failed: %s", exc)
 
 logger = logging.getLogger("inference_difference.responses_endpoint")
 
@@ -221,11 +310,14 @@ def _normalize_input_to_messages(
             if item_type == "function_call_output":
                 call_id = item.get("call_id", "")
                 output = item.get("output", "")
+                output_str = output if isinstance(output, str) else json.dumps(output)
                 if call_id:
+                    # Learn from this tool outcome — the River carries it
+                    _learn_from_tool_outcome(call_id, output_str)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": output if isinstance(output, str) else json.dumps(output),
+                        "content": output_str,
                     })
                 continue
 
@@ -375,6 +467,14 @@ def _chat_completion_to_response(
                 len(parsed_calls),
             )
 
+    # Record outgoing tool calls for learning (non-streaming path)
+    if tool_calls:
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            _record_tool_call(
+                tc.get("id", ""), model, func.get("name", "unknown"),
+            )
+
     chat_usage = chat_result.get("usage", {})
     usage = {
         "input_tokens": chat_usage.get("prompt_tokens", 0),
@@ -481,6 +581,9 @@ async def _generate_sse_stream(
             func = tc.get("function", {})
             call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
             fc_id = f"fc_{uuid.uuid4().hex[:24]}"
+
+            # Track this call so we learn from the outcome
+            _record_tool_call(call_id, model, func.get("name", "unknown"))
 
             fc_item = {
                 "type": "function_call",
@@ -660,15 +763,7 @@ def register_responses_endpoint(app, chat_completions_handler):
         # Step 2: Build a ChatCompletionRequest for the internal pipeline
         # Always non-streaming internally; we simulate SSE from the result
         #
-        # Tool-aware routing: when tools are present, prefer models with
-        # proven tool-use capability. GLM models generate calls with empty
-        # args; Anthropic models handle tools correctly. This override is
-        # temporary scaffolding until TID's substrate learns tool competency
-        # per model. Will graduate to substrate-informed routing.
         effective_model = req.model
-        if req.tools and req.model == "auto":
-            effective_model = "openrouter/anthropic/claude-sonnet-4"
-            print(f"[SHIM-DEBUG] Tool-aware routing override: auto → {effective_model}", file=_sys.stderr, flush=True)
 
         chat_req = ChatCompletionRequest(
             model=effective_model,
