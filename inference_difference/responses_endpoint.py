@@ -196,13 +196,22 @@ def _normalize_tools(
         else:
             normalized.append(t)
 
-    if flat_count > 0 and _shim_observer is not None:
-        _shim_observer.observe(
-            model_id=model_id,
-            operation="tool_flat_to_nested",
-            did_apply=True,
-            raw_context=f"{flat_count} tool definitions normalized from flat to nested format",
-        )
+    if _shim_observer is not None:
+        if flat_count > 0:
+            _shim_observer.observe(
+                model_id=model_id,
+                operation="tool_flat_to_nested",
+                did_apply=True,
+                raw_context=f"{flat_count} tool definitions normalized from flat to nested format",
+            )
+        # Phase 3: log substrate opinion for diagnostics
+        # (flat→nested always applies regardless — safety-critical)
+        confidence = _shim_observer.query_confidence(model_id, "tool_flat_to_nested")
+        if confidence != 0.5:  # substrate has an opinion
+            logger.debug(
+                "Shim substrate: tool_flat_to_nested for %s confidence=%.3f",
+                model_id, confidence,
+            )
 
     return normalized
 

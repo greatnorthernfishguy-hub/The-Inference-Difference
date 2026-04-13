@@ -1597,6 +1597,8 @@ async def get_stats() -> Dict[str, Any]:
         stats["modules"] = _state.module_registry.get_stats()
     if _state.ng_ecosystem is not None:
         stats["ng_ecosystem"] = _state.ng_ecosystem.stats()
+    if hasattr(_state, 'shim_observer') and _state.shim_observer is not None:
+        stats["shim_observer"] = _state.shim_observer.get_stats()
     return stats
 
 
