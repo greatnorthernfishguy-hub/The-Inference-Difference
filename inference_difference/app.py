@@ -78,6 +78,17 @@ Changelog (Transparent Proxy, 2026-02-24):
 #   a multimodal payload hit TID.
 # How: Helper _extract_text_content() joins text blocks from list
 #   content, applied at the extraction point (Law 4 — fix at source).
+# [2026-04-14] Claude Code (Opus 4.6) — Wire responses_endpoint capabilities to chat path
+#   What: Five capabilities from the dormant responses_endpoint wired into
+#     chat_completions(): tool format normalization, tool outcome learning,
+#     text tool call parsing (non-streaming), consciousness_score default,
+#     ShimObserver observe calls.
+#   Why:  OC switched to openai-completions. Chat path was missing all
+#     translation and learning capabilities. Tools not normalized, outcomes
+#     not learned, text-format tool calls silently dropped.
+#   How:  Import from responses_endpoint. Four insertion points: outcome
+#     learning scan, consciousness_score, tool normalization, text parsing.
+#   Limitation: Streaming path text parsing not wired — requires buffering.
 # -------------------
 # ---- Changelog ----
 # [2026-03-18] Claude (CC) — Retry chain experience (#19)
@@ -135,7 +146,14 @@ from inference_difference.model_client import ModelClient, ModelResponse, Stream
 from inference_difference.quality import evaluate_quality
 from inference_difference.router import RoutingEngine
 from inference_difference.translation_shim import translate_request
-from inference_difference.responses_endpoint import register_responses_endpoint
+from inference_difference.responses_endpoint import (
+    register_responses_endpoint,
+    _normalize_tools,
+    _extract_tool_calls_from_text,
+    _learn_from_tool_outcome,
+    _ToolContext,
+)
+import inference_difference.responses_endpoint as _resp_ep
 
 logger = logging.getLogger("inference_difference.app")
 
@@ -935,6 +953,35 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         if msg.get("role") == "user"
     ]
 
+    # --- Tool outcome learning (chat path) ---
+    # Scan for tool role messages (results from prior model tool calls).
+    # Build call_id → tool_name lookup from assistant messages, then
+    # deposit success/failure to ShimObserver so substrate learns.
+    _tool_role_msgs = [m for m in req.messages if m.get("role") == "tool"]
+    if _tool_role_msgs:
+        # Build call_id → tool_name from assistant tool_calls
+        _call_id_to_name: Dict[str, str] = {}
+        for _amsg in req.messages:
+            if _amsg.get("role") == "assistant":
+                for _tc_entry in (_amsg.get("tool_calls") or []):
+                    _cid = _tc_entry.get("id", "")
+                    _fname = (_tc_entry.get("function") or {}).get("name", "")
+                    if _cid and _fname:
+                        _call_id_to_name[_cid] = _fname
+
+        _tc = _ToolContext()
+        _tc.record(
+            model_id=req.model or "unknown",
+            tool_names=[
+                _call_id_to_name.get(m.get("tool_call_id", ""), "unknown")
+                for m in _tool_role_msgs
+            ],
+        )
+        _resp_ep._active_tool_ctx = _tc
+        for _tmsg in _tool_role_msgs:
+            _learn_from_tool_outcome(_tmsg.get("content", "") or "")
+        _resp_ep._active_tool_ctx = None
+
     # --- Step 2: pre_route hooks ---
     ctx = HookContext(
         request_id=request_id,
@@ -942,6 +989,12 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         conversation_history=conversation_history,
         metadata=req.metadata or {},
     )
+
+    # consciousness_score from OC metadata (chat path)
+    # Extract if OC embedded it — no artificial default.
+    # Absence of an explicit score means no routing elevation.
+    if req.consciousness_score is None and req.metadata:
+        req.consciousness_score = req.metadata.get("consciousness_score")
 
     if _state.module_registry is not None:
         _state.module_registry.dispatch(HookPhase.PRE_ROUTE, ctx)
@@ -1024,6 +1077,12 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     if _state.module_registry is not None:
         _state.module_registry.dispatch(HookPhase.POST_ROUTE, ctx)
 
+    # --- Tool format normalization (covers both paths) ---
+    # OC may send flat tool format {type, name, parameters}.
+    # Providers require nested {type, function: {name, parameters}}.
+    if req.tools:
+        req.tools = _normalize_tools(req.tools, selected_model)
+
     # --- Step 5: Forward to provider ---
     # Branch: streaming vs blocking. Most chat UIs send stream=true
     # by default — without this path, the client hangs waiting for SSE
@@ -1096,6 +1155,30 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
 
     # --- Step 7: Response hooks + learning (all internal) ---
     ctx.response_text = model_response.content
+
+    # --- Text tool call parsing (non-streaming path only) ---
+    # Parse XML tags, colon notation, paren notation from model text output.
+    # Only fires when the model returned no structured tool_calls.
+    # LIMITATION: streaming path proxies raw SSE — text parsing skipped.
+    if (model_response.success
+            and model_response.content
+            and not model_response.tool_calls):
+        _cleaned, _tcalls = _extract_tool_calls_from_text(model_response.content)
+        if _tcalls:
+            logger.info(
+                "Chat path shim: extracted %d tool call(s) from text (model=%s)",
+                len(_tcalls), selected_model,
+            )
+            model_response.content = _cleaned
+            model_response.tool_calls = _tcalls
+            ctx.response_text = _cleaned
+            if hasattr(_state, 'shim_observer') and _state.shim_observer is not None:
+                _state.shim_observer.observe(
+                    model_id=selected_model,
+                    operation="tool_call_xml_parse",
+                    did_apply=True,
+                    raw_context=f"chat path: extracted {len(_tcalls)} tool calls from text markup",
+                )
 
     if _state.module_registry is not None:
         _state.module_registry.dispatch(HookPhase.PRE_RESPONSE, ctx)
