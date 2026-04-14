@@ -274,18 +274,56 @@ class ResponsesRequest(BaseModel):
 # Tool call XML tag parser — smart shim for models that output text markup
 # ---------------------------------------------------------------------------
 
-_TOOL_CALL_RE = re.compile(
+# Known tool names from OpenClaw — used for text-based tool call detection
+_KNOWN_TOOLS = {
+    "read", "edit", "write", "exec", "process", "browser", "canvas",
+    "message", "tts", "agents_list", "sessions_list", "sessions_history",
+    "sessions_send", "sessions_yield", "sessions_spawn", "subagents",
+    "session_status", "web_search", "web_fetch", "image", "pdf",
+    "memory_search", "memory_get",
+}
+
+# Format 1: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+_TOOL_CALL_XML_RE = re.compile(
     r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
     re.DOTALL,
 )
 
+# Format 2: tool_name:["arg1", "arg2"] or tool_name:{"key": "value"}
+# DeepSeek text-based fallback at high context lengths
+_TOOL_CALL_COLON_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(t) for t in _KNOWN_TOOLS) + r'):(\[.*?\]|\{.*?\})',
+    re.DOTALL,
+)
+
+# Map positional args to named params for known tools
+_TOOL_ARG_SCHEMAS: Dict[str, List[str]] = {
+    "read": ["path"],
+    "write": ["path", "content"],
+    "edit": ["path", "old_string", "new_string"],
+    "exec": ["command"],
+    "web_search": ["query", "limit"],
+    "web_fetch": ["url"],
+    "memory_search": ["query"],
+    "memory_get": ["key"],
+    "message": ["content"],
+    "tts": ["text"],
+    "image": ["prompt"],
+    "browser": ["url"],
+    "sessions_spawn": ["agent"],
+    "sessions_send": ["session_id", "message"],
+}
+
 
 def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Parse <tool_call> XML tags from model text output.
+    """Parse tool calls from model text output.
 
-    Models like DeepSeek, Qwen, Mistral output tool calls as XML-tagged
-    JSON in text instead of structured tool_calls. This extracts them
-    and returns cleaned text + structured tool_calls.
+    Handles multiple formats models use when they output tool intent
+    as text instead of structured tool_calls:
+
+    Format 1: <tool_call>{"name":"exec","arguments":{"command":"ls"}}</tool_call>
+    Format 2: web_search:["query", 10]  (DeepSeek colon notation)
+    Format 3: exec:{"command": "ls"}    (DeepSeek colon with dict)
 
     Returns:
         (cleaned_text, tool_calls) where tool_calls is a list of
@@ -294,7 +332,8 @@ def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]
     tool_calls = []
     cleaned = text
 
-    for match in _TOOL_CALL_RE.finditer(text):
+    # Try XML format first
+    for match in _TOOL_CALL_XML_RE.finditer(text):
         try:
             parsed = json.loads(match.group(1))
             name = parsed.get("name", parsed.get("function", ""))
@@ -318,7 +357,48 @@ def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]
             continue
 
     if tool_calls:
-        cleaned = _TOOL_CALL_RE.sub("", text).strip()
+        cleaned = _TOOL_CALL_XML_RE.sub("", text).strip()
+        return cleaned, tool_calls
+
+    # Try colon notation: tool_name:[args] or tool_name:{args}
+    for match in _TOOL_CALL_COLON_RE.finditer(text):
+        try:
+            name = match.group(1)
+            raw_args = match.group(2)
+            parsed_args = json.loads(raw_args)
+
+            # Convert to named arguments
+            if isinstance(parsed_args, list):
+                # Positional args → map to named params using schema
+                schema = _TOOL_ARG_SCHEMAS.get(name, [])
+                arguments = {}
+                for i, val in enumerate(parsed_args):
+                    if i < len(schema):
+                        arguments[schema[i]] = val
+                    else:
+                        arguments[f"arg{i}"] = val
+                arguments = json.dumps(arguments)
+            elif isinstance(parsed_args, dict):
+                arguments = json.dumps(parsed_args)
+            else:
+                # Single value — use first param name from schema
+                schema = _TOOL_ARG_SCHEMAS.get(name, ["input"])
+                arguments = json.dumps({schema[0]: parsed_args})
+
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            })
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            continue
+
+    if tool_calls:
+        cleaned = _TOOL_CALL_COLON_RE.sub("", text).strip()
 
     return cleaned, tool_calls
 
