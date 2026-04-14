@@ -296,6 +296,13 @@ _TOOL_CALL_COLON_RE = re.compile(
     re.DOTALL,
 )
 
+# Format 3: tool_name("arg1", "arg2") or tool_name({"key": "value"})
+# Function-call style text notation
+_TOOL_CALL_PAREN_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(t) for t in _KNOWN_TOOLS) + r')\((.+?)\)(?:\s|$|[.,;!?])',
+    re.DOTALL,
+)
+
 # Map positional args to named params for known tools
 _TOOL_ARG_SCHEMAS: Dict[str, List[str]] = {
     "read": ["path"],
@@ -399,6 +406,56 @@ def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]
 
     if tool_calls:
         cleaned = _TOOL_CALL_COLON_RE.sub("", text).strip()
+        return cleaned, tool_calls
+
+    # Try function-call notation: tool_name("arg1", arg2)
+    for match in _TOOL_CALL_PAREN_RE.finditer(text):
+        try:
+            name = match.group(1)
+            raw_inner = match.group(2).strip()
+
+            # Try parsing as JSON array first: ("arg1", 10) → ["arg1", 10]
+            parsed_args = None
+            try:
+                parsed_args = json.loads(f"[{raw_inner}]")
+            except json.JSONDecodeError:
+                # Try as a single JSON value or dict
+                try:
+                    parsed_args = json.loads(raw_inner)
+                except json.JSONDecodeError:
+                    # Treat as a single string argument
+                    parsed_args = [raw_inner.strip("\"'")]
+
+            # Convert to named arguments
+            if isinstance(parsed_args, list):
+                schema = _TOOL_ARG_SCHEMAS.get(name, [])
+                arguments = {}
+                for i, val in enumerate(parsed_args):
+                    if i < len(schema):
+                        arguments[schema[i]] = val
+                    else:
+                        arguments[f"arg{i}"] = val
+                arguments = json.dumps(arguments)
+            elif isinstance(parsed_args, dict):
+                arguments = json.dumps(parsed_args)
+            else:
+                schema = _TOOL_ARG_SCHEMAS.get(name, ["input"])
+                arguments = json.dumps({schema[0]: parsed_args})
+
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            })
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            continue
+
+    if tool_calls:
+        cleaned = _TOOL_CALL_PAREN_RE.sub("", text).strip()
 
     return cleaned, tool_calls
 
