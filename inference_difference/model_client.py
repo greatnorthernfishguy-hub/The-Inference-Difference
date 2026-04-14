@@ -410,11 +410,16 @@ class ModelClient:
             except Exception:
                 pass
             # Cache permanent failures so we don't retry them
-            if e.code in (404, 403) and "data policy" in error_body.lower():
+            error_lower = error_body.lower()
+            if (
+                (e.code in (404, 403) and "data policy" in error_lower)
+                or (e.code == 402 and ("insufficient" in error_lower or "credits" in error_lower))
+            ):
+                reason = "data policy" if e.code != 402 else "insufficient credits"
                 self._policy_blocked.add(model_name)
                 logger.info(
-                    "Model %s permanently blocked (data policy) — won't retry",
-                    model_name,
+                    "Model %s permanently blocked (%s) — won't retry",
+                    model_name, reason,
                 )
             logger.warning(
                 "Model call failed: %s %d — %s",
