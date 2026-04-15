@@ -46,6 +46,17 @@ Changelog:
             plus error-path inbound deposits. Correlation ID pairs each
             outbound with its inbound. Failures are swallowed; deposits
             never block the request pipeline.
+    [2026-04-15] Claude Code (Sonnet 4.6) — Punchlist #133: Anthropic tools pass-through
+        What: _call_anthropic now accepts extra_params (tools, tool_choice) and injects
+            them into the Anthropic request body. tool_use response blocks are extracted
+            into ModelResponse.tool_calls. stop_reason 'tool_use' maps to 'tool_calls'.
+            call_stream()/_fake_stream_from_blocking() thread extra_params through.
+        Why:  extra_params was merged in call() and call_stream() but never forwarded
+            to _call_anthropic. Anthropic models silently dropped all tool definitions.
+            _fake_stream_from_blocking also bypassed extra_params to self.call().
+        How:  Six targeted edits: _call_anthropic signature, body injection, response
+            extraction, ModelResponse return, call() dispatch, call_stream() dispatch,
+            _fake_stream_from_blocking signature+body. No new files.
     [2026-04-11] Claude Code (Sonnet 4.6) — Tool call pass-through
         Added tools/tool_choice params to call() and call_stream().
         Added tool_calls field to ModelResponse.
@@ -315,7 +326,7 @@ class ModelClient:
         if model_id.startswith("anthropic/") and "anthropic.com" in base_url:
             resp = self._call_anthropic(
                 base_url, api_key, model_name, messages,
-                temperature, max_tokens, start,
+                temperature, max_tokens, start, extra_params,
             )
         else:
             # Everyone else: OpenAI-compatible endpoint
@@ -512,6 +523,7 @@ class ModelClient:
         temperature: float,
         max_tokens: Optional[int],
         start: float,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> ModelResponse:
         """Call Anthropic's Messages API and translate to OpenAI format."""
         url = f"{base_url}/v1/messages"
@@ -533,6 +545,24 @@ class ModelClient:
         }
         if system_text:
             body["system"] = system_text
+
+        # Thread tools/tool_choice from extra_params into Anthropic body.
+        # Tools are already in Anthropic format from _normalize_tools upstream.
+        # Do NOT re-convert here — that is _normalize_tools' job (Law 4).
+        if extra_params:
+            tools_list = extra_params.get("tools")
+            if tools_list:
+                body["tools"] = tools_list
+            tool_choice = extra_params.get("tool_choice")
+            if tool_choice:
+                if isinstance(tool_choice, str):
+                    if tool_choice == "auto":
+                        body["tool_choice"] = {"type": "auto"}
+                    # "none" -> omit (Anthropic default: tool use optional)
+                elif isinstance(tool_choice, dict):
+                    fn_name = tool_choice.get("function", {}).get("name", "")
+                    if fn_name:
+                        body["tool_choice"] = {"type": "tool", "name": fn_name}
 
         data = json.dumps(body).encode("utf-8")
 
@@ -572,20 +602,34 @@ class ModelClient:
             except Exception:
                 pass
 
-            # Extract content from Anthropic response
+            # Extract text content and tool_use blocks from Anthropic response
             content_blocks = resp_body.get("content", [])
             content = ""
+            tool_calls = []
             for block in content_blocks:
                 if block.get("type") == "text":
                     content += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            "arguments": json.dumps(block.get("input", {})),
+                        },
+                    })
 
             usage_in = resp_body.get("usage", {})
 
+            # Map Anthropic stop_reason "tool_use" -> OpenAI finish_reason "tool_calls"
+            _stop_reason = resp_body.get("stop_reason", "stop")
+            _finish_reason = "tool_calls" if _stop_reason == "tool_use" else _stop_reason
             return ModelResponse(
                 id=resp_body.get("id", ""),
                 model=resp_body.get("model", model_name),
                 content=content,
-                finish_reason=resp_body.get("stop_reason", "stop"),
+                tool_calls=tool_calls if tool_calls else None,
+                finish_reason=_finish_reason,
                 usage={
                     "prompt_tokens": usage_in.get("input_tokens", 0),
                     "completion_tokens": usage_in.get("output_tokens", 0),
@@ -683,7 +727,7 @@ class ModelClient:
         # to non-streaming for Anthropic and wrap result as fake SSE.
         if model_id.startswith("anthropic/") and "anthropic.com" in base_url:
             return self._fake_stream_from_blocking(
-                model_id, messages, temperature, max_tokens,
+                model_id, messages, temperature, max_tokens, extra_params,
             )
 
         result = StreamResult(model=model_name)
@@ -885,6 +929,7 @@ class ModelClient:
         messages: List[Dict[str, str]],
         temperature: float,
         max_tokens: Optional[int],
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> tuple[Iterator[str], StreamResult]:
         """For providers without streaming, wrap a blocking call as SSE.
 
@@ -896,6 +941,7 @@ class ModelClient:
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_params=extra_params,
         )
 
         result = StreamResult(

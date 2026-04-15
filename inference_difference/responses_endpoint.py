@@ -41,6 +41,13 @@ Author: Josh + Claude (Opus 4.6)
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-04-15] Claude Code (Sonnet 4.6) — Punchlist #133: Anthropic tool format in _normalize_tools
+#   What: _normalize_tools now converts OpenAI-nested tools to Anthropic Messages API format
+#         when model_id starts with 'anthropic/'. Unwraps function wrapper, renames
+#         parameters -> input_schema. ShimObserver records 'anthropic_tool_format'.
+#   Why:  _normalize_tools was OpenAI-only; Anthropic models received unconverted tools
+#         causing 400 Bad Request. Law 4: fix at source in the single shim.
+#   How:  Added Anthropic branch before final return in _normalize_tools. No new files.
 # [2026-04-12] Claude Code (Opus 4.6) — Tool call translation shim
 #   What: Full bidirectional tool support in the Responses API endpoint.
 #   Why:  OpenClaw sends tools via Responses API, TID forwards to models,
@@ -222,6 +229,29 @@ def _normalize_tools(
                 "Shim substrate: tool_flat_to_nested for %s confidence=%.3f",
                 model_id, confidence,
             )
+
+    # Anthropic Messages API format: convert from OpenAI-nested format.
+    # This is the single shim (Law 4) — conversion belongs here only.
+    if model_id.startswith("anthropic/"):
+        anthropic_tools = []
+        for t in (normalized or []):
+            fn = t.get("function", t)
+            anthropic_tools.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get(
+                    "parameters",
+                    fn.get("input_schema", {"type": "object", "properties": {}}),
+                ),
+            })
+        if _shim_observer is not None:
+            _shim_observer.observe(
+                model_id=model_id,
+                operation="anthropic_tool_format",
+                did_apply=True,
+                raw_context=f"{len(anthropic_tools)} tools converted to Anthropic Messages API format",
+            )
+        return anthropic_tools
 
     return normalized
 
