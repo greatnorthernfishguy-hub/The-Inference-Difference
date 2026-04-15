@@ -788,6 +788,13 @@ class ModelClient:
             pass
 
         collected_content: List[str] = []
+        # Raw SSE lines as they arrived, interleaved with `: chunk_ms=N`
+        # comment lines carrying wall-clock deltas since stream start. The
+        # comments are valid SSE (per spec). Gives the substrate the real
+        # streamed sequence including inter-chunk timing, not just the
+        # flattened aggregate.
+        raw_stream_lines: List[str] = []
+        stream_start_mono = time.monotonic()
 
         try:
             resp = urllib.request.urlopen(req, timeout=self._timeout)
@@ -809,11 +816,14 @@ class ModelClient:
                         )
                         result.content = "".join(collected_content)
                         result.success = True
+                        chunk_ms = int((time.monotonic() - stream_start_mono) * 1000)
+                        raw_stream_lines.append(f": chunk_ms={chunk_ms}")
+                        raw_stream_lines.append("data: [DONE]")
                         try:
                             deposit_inbound(
                                 provider=_provider, model_id=model_name, url=url,
                                 status_code=200,
-                                response_body={"streamed_content": result.content},
+                                response_body="\n".join(raw_stream_lines),
                                 headers=dict(resp.getheaders()) if resp else None,
                                 latency_ms=result.latency_ms,
                                 correlation_id=_corr_id,
@@ -824,6 +834,10 @@ class ModelClient:
                         return
 
                     if line.startswith("data: "):
+                        # Capture arrival time for this data line.
+                        chunk_ms = int((time.monotonic() - stream_start_mono) * 1000)
+                        raw_stream_lines.append(f": chunk_ms={chunk_ms}")
+                        raw_stream_lines.append(line)
                         # Extract content delta for aggregation
                         try:
                             chunk_data = json.loads(line[6:])
@@ -840,6 +854,10 @@ class ModelClient:
                             pass
 
                         yield line + "\n\n"
+                    else:
+                        # Non-data SSE line (event:, id:, real : comment, etc.) —
+                        # record it too; the substrate gets the full wire.
+                        raw_stream_lines.append(line)
 
             # If we exit the loop without [DONE], finalize
             result.latency_ms = (time.monotonic() - start) * 1000
@@ -849,7 +867,7 @@ class ModelClient:
                 deposit_inbound(
                     provider=_provider, model_id=model_name, url=url,
                     status_code=200,
-                    response_body={"streamed_content": result.content},
+                    response_body="\n".join(raw_stream_lines),
                     headers=None, latency_ms=result.latency_ms,
                     correlation_id=_corr_id,
                 )
