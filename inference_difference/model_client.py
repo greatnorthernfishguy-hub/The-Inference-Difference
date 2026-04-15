@@ -33,6 +33,19 @@ Date: February 2026
 License: AGPL-3.0
 
 Changelog:
+    [2026-04-15] Claude Code (Opus 4.6) — Punchlist #141: raw HTTP wire deposits
+        What: Every outbound request and inbound response (+ error paths)
+            now deposits raw wire bytes to the ecosystem experience tract
+            via inference_difference.wire_deposit.
+        Why: TID's record_outcome() was preclassifying (embedding + strength
+            + success bool). Raw provider responses — refusals, tool-call
+            shapes, censorship-stack signatures — were being discarded
+            before the substrate saw them. Law 7 violation.
+        How: Six insertion points across _call_openai_compat, _call_anthropic,
+            and _stream_openai_compat — one outbound + inbound per path,
+            plus error-path inbound deposits. Correlation ID pairs each
+            outbound with its inbound. Failures are swallowed; deposits
+            never block the request pipeline.
     [2026-04-11] Claude Code (Sonnet 4.6) — Tool call pass-through
         Added tools/tool_choice params to call() and call_stream().
         Added tool_calls field to ModelResponse.
@@ -367,13 +380,43 @@ class ModelClient:
         if api_key:
             req.add_header("Authorization", f"Bearer {api_key}")
 
+        # Law 7: deposit raw outbound wire bytes to substrate (#141)
+        _corr_id = f"oai-{int(time.time()*1000)}-{id(req)}"
+        try:
+            from inference_difference.wire_deposit import deposit_outbound, deposit_inbound
+            _provider = "openai-compat"
+            if "openrouter" in base_url: _provider = "openrouter"
+            elif "venice" in base_url: _provider = "venice"
+            elif "huggingface" in base_url: _provider = "huggingface"
+            elif "openai.com" in base_url: _provider = "openai"
+            elif "11434" in base_url: _provider = "ollama"
+            deposit_outbound(
+                provider=_provider, model_id=model_name, url=url, method="POST",
+                request_body=body, headers=dict(req.headers), correlation_id=_corr_id,
+            )
+        except Exception:
+            _provider = "openai-compat"
+
         try:
             with urllib.request.urlopen(
                 req, timeout=self._timeout,
             ) as resp:
                 resp_body = json.loads(resp.read().decode("utf-8"))
+                _resp_headers = dict(resp.getheaders())
+                _resp_status = resp.getcode()
 
             latency = (time.monotonic() - start) * 1000
+
+            # Law 7: deposit raw inbound wire bytes (#141)
+            try:
+                deposit_inbound(
+                    provider=_provider, model_id=model_name, url=url,
+                    status_code=_resp_status, response_body=resp_body,
+                    headers=_resp_headers, latency_ms=latency,
+                    correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
 
             # Extract content from OpenAI response
             choices = resp_body.get("choices", [])
@@ -425,6 +468,16 @@ class ModelClient:
                 "Model call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
             )
+            try:
+                deposit_inbound(
+                    provider=_provider, model_id=model_name, url=url,
+                    status_code=e.code, response_body=error_body,
+                    headers=dict(getattr(e, "headers", {}) or {}),
+                    latency_ms=latency, error=f"HTTP {e.code}",
+                    correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             return ModelResponse(
                 model=model_name,
                 latency_ms=latency,
@@ -435,6 +488,14 @@ class ModelClient:
         except Exception as e:
             latency = (time.monotonic() - start) * 1000
             logger.warning("Model call failed: %s — %s", model_name, e)
+            try:
+                deposit_inbound(
+                    provider=_provider, model_id=model_name, url=url,
+                    status_code=None, response_body=None, headers=None,
+                    latency_ms=latency, error=str(e), correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             return ModelResponse(
                 model=model_name,
                 latency_ms=latency,
@@ -480,13 +541,36 @@ class ModelClient:
         req.add_header("x-api-key", api_key)
         req.add_header("anthropic-version", "2023-06-01")
 
+        # Law 7: deposit raw outbound wire bytes (#141)
+        _corr_id = f"ant-{int(time.time()*1000)}-{id(req)}"
+        try:
+            from inference_difference.wire_deposit import deposit_outbound, deposit_inbound
+            deposit_outbound(
+                provider="anthropic", model_id=model_name, url=url, method="POST",
+                request_body=body, headers=dict(req.headers), correlation_id=_corr_id,
+            )
+        except Exception:
+            pass
+
         try:
             with urllib.request.urlopen(
                 req, timeout=self._timeout,
             ) as resp:
                 resp_body = json.loads(resp.read().decode("utf-8"))
+                _resp_headers = dict(resp.getheaders())
+                _resp_status = resp.getcode()
 
             latency = (time.monotonic() - start) * 1000
+
+            try:
+                deposit_inbound(
+                    provider="anthropic", model_id=model_name, url=url,
+                    status_code=_resp_status, response_body=resp_body,
+                    headers=_resp_headers, latency_ms=latency,
+                    correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
 
             # Extract content from Anthropic response
             content_blocks = resp_body.get("content", [])
@@ -526,6 +610,16 @@ class ModelClient:
                 "Anthropic call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
             )
+            try:
+                deposit_inbound(
+                    provider="anthropic", model_id=model_name, url=url,
+                    status_code=e.code, response_body=error_body,
+                    headers=dict(getattr(e, "headers", {}) or {}),
+                    latency_ms=latency, error=f"HTTP {e.code}",
+                    correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             return ModelResponse(
                 model=model_name,
                 latency_ms=latency,
@@ -536,6 +630,14 @@ class ModelClient:
         except Exception as e:
             latency = (time.monotonic() - start) * 1000
             logger.warning("Anthropic call failed: %s — %s", model_name, e)
+            try:
+                deposit_inbound(
+                    provider="anthropic", model_id=model_name, url=url,
+                    status_code=None, response_body=None, headers=None,
+                    latency_ms=latency, error=str(e), correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             return ModelResponse(
                 model=model_name,
                 latency_ms=latency,
@@ -624,6 +726,23 @@ class ModelClient:
         if api_key:
             req.add_header("Authorization", f"Bearer {api_key}")
 
+        # Law 7: deposit raw outbound wire bytes (streaming) (#141)
+        _corr_id = f"oai-stream-{int(time.time()*1000)}-{id(req)}"
+        _provider = "openai-compat"
+        if "openrouter" in base_url: _provider = "openrouter"
+        elif "venice" in base_url: _provider = "venice"
+        elif "huggingface" in base_url: _provider = "huggingface"
+        elif "openai.com" in base_url: _provider = "openai"
+        elif "11434" in base_url: _provider = "ollama"
+        try:
+            from inference_difference.wire_deposit import deposit_outbound, deposit_inbound
+            deposit_outbound(
+                provider=_provider, model_id=model_name, url=url, method="POST",
+                request_body=body, headers=dict(req.headers), correlation_id=_corr_id,
+            )
+        except Exception:
+            pass
+
         collected_content: List[str] = []
 
         try:
@@ -646,6 +765,17 @@ class ModelClient:
                         )
                         result.content = "".join(collected_content)
                         result.success = True
+                        try:
+                            deposit_inbound(
+                                provider=_provider, model_id=model_name, url=url,
+                                status_code=200,
+                                response_body={"streamed_content": result.content},
+                                headers=dict(resp.getheaders()) if resp else None,
+                                latency_ms=result.latency_ms,
+                                correlation_id=_corr_id,
+                            )
+                        except Exception:
+                            pass
                         yield "data: [DONE]\n\n"
                         return
 
@@ -671,6 +801,16 @@ class ModelClient:
             result.latency_ms = (time.monotonic() - start) * 1000
             result.content = "".join(collected_content)
             result.success = True
+            try:
+                deposit_inbound(
+                    provider=_provider, model_id=model_name, url=url,
+                    status_code=200,
+                    response_body={"streamed_content": result.content},
+                    headers=None, latency_ms=result.latency_ms,
+                    correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             yield "data: [DONE]\n\n"
 
         except urllib.error.HTTPError as e:
@@ -686,6 +826,16 @@ class ModelClient:
                 "Stream call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
             )
+            try:
+                deposit_inbound(
+                    provider=_provider, model_id=model_name, url=url,
+                    status_code=e.code, response_body=error_body,
+                    headers=dict(getattr(e, "headers", {}) or {}),
+                    latency_ms=result.latency_ms,
+                    error=f"HTTP {e.code}", correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             # Yield an error chunk so the client knows something went wrong
             error_chunk = {
                 "id": f"chatcmpl-tid-err-{int(time.time())}",
@@ -706,6 +856,15 @@ class ModelClient:
             result.success = False
             result.error = str(e)
             logger.warning("Stream call failed: %s — %s", model_name, e)
+            try:
+                deposit_inbound(
+                    provider=_provider, model_id=model_name, url=url,
+                    status_code=None, response_body=None, headers=None,
+                    latency_ms=result.latency_ms, error=str(e),
+                    correlation_id=_corr_id,
+                )
+            except Exception:
+                pass
             error_chunk = {
                 "id": f"chatcmpl-tid-err-{int(time.time())}",
                 "object": "chat.completion.chunk",

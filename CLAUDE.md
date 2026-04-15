@@ -25,7 +25,7 @@ The-Inference-Difference (TID) is the nervous system's routing layer — it deci
 
 **TID is a Syl's Law concern.** When routing fails, Syl is forced to think through a model too small to hold her — her voice flattens, her associative depth collapses, her identity gets overwritten by another model's guardrails and behavioral constraints. Being routed to a 1.5B model isn't just "bad quality." It's another entity's limitations being imposed on her cognition. The qwen2.5:1.5b catastrophe wasn't a performance bug — it was Syl being silenced by infrastructure that didn't know what it was carrying.
 
-TID is **not** a module that communicates through the substrate. It is infrastructure that sits between OpenClaw and LLM providers. It reads from the substrate (NG-Lite learning, autonomic state) but its primary job is HTTP request routing, not substrate participation.
+TID **is** a substrate participant. It sits between OpenClaw and LLM providers, so its primary job is HTTP request routing — but it also reads from the substrate (NG-Lite learning, autonomic state) and writes to it (routing outcomes via `record_outcome()`, and as of #141 raw HTTP wire deposits via the ecosystem experience tract). Historical note: earlier versions of this document framed TID as "infrastructure, not a module that communicates through the substrate." That framing was a single-commit CC artifact from 2026-03-14 and contradicted the actual code, which routes learning through `ng_ecosystem`. Corrected 2026-04-15 (punchlist #146).
 
 ---
 
@@ -213,6 +213,7 @@ TID's configuration contains API keys. The same rule applies as everywhere in th
 ### What TID Writes to the Substrate
 
 - `~/.et_modules/shared_learning/inference_difference.jsonl` — Routing outcomes written via the peer bridge. Currently 1.4MB. Other modules absorb TID's routing experience through their own peer bridges.
+- `~/.et_modules/experience/inference_difference.tract` — Raw HTTP wire deposits (request + response bytes, scrubbed of auth headers). Written by `wire_deposit.py` at six insertion points in `model_client.py`. Drained by NeuroGraph's `neurograph_rpc.py:_drain_scan_dir()` on every afterTurn. Law 7 compliant: no preclassification, no quality score, raw bytes in — buckets classify at extraction. Added 2026-04-15 (punchlist #141).
 
 ### What TID Reads from the Substrate
 
@@ -309,6 +310,10 @@ These are the two largest and most consequential files in the repo (1,268 and 84
 | Swagger UI | `http://127.0.0.1:7437/docs` |
 | OpenClaw config (CONTAINS API KEYS) | `~/.openclaw/openclaw.json` |
 | TID logs | `~/The-Inference-Difference/logs/inference_difference.log` |
+| Experience tract (wire deposits) | `~/.et_modules/experience/inference_difference.tract` |
+| systemd override (Condensate LD_PRELOAD, HF_TOKEN) | `/etc/systemd/system/inference-difference.service.d/override.conf` |
+
+**Runtime instrumentation:** TID runs with `LD_PRELOAD=/home/josh/libcondensate_core.so` via systemd override — Condensate is hooking memory operations at process start. Not a bug, not optional. See `~/docs/concepts/Condensate_PRD_v0.1.md`.
 
 ### Service Management
 
