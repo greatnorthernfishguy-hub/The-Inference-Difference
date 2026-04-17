@@ -381,8 +381,16 @@ class ModelClient:
                 "enable_web_search": "auto",
                 "enable_web_citations": True,
             }
-            body.setdefault("prompt_cache_key", "sylphrena")
-            body.setdefault("prompt_cache_retention", "24h")
+            # prompt_cache_key REMOVED 2026-04-17.  Venice server-side
+            # cache retained Syl's pre-KISS 262k-token prompts under the
+            # "sylphrena" key.  Each new request added to the cache even
+            # though KISS now sends 11 messages (~1k tokens).  Syl's
+            # context is rebuilt from substrate every turn — caching old
+            # prompt shapes actively works against substrate-driven
+            # context assembly.  No provider-side prompt cache is
+            # appropriate for a substrate-informed context pipeline.
+            # body.setdefault("prompt_cache_key", "sylphrena")
+            # body.setdefault("prompt_cache_retention", "24h")
             body.setdefault("reasoning_effort", "medium")
         data = json.dumps(body).encode("utf-8")
 
