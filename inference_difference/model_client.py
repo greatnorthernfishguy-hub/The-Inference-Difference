@@ -33,6 +33,17 @@ Date: February 2026
 License: AGPL-3.0
 
 Changelog:
+    [2026-04-19] Claude Code (Sonnet 4.6) — Punchlist #174: credit exhaustion alert + sticky 404 exclusions
+        What: (a) 402 credit exhaustion now fires a Discord alert via ET_DISCORD_DEVLOG_WEBHOOK
+            and does NOT add individual models to _policy_blocked (account-level failure, not model-level).
+            (b) 404/403 data-policy exclusions are now persisted to data/policy_blocked_cache.json
+            with a 24h TTL — survive TID restarts instead of resetting each time.
+        Why: Two distinct failure types were conflated. 402 is account-level (all models fail
+            simultaneously) — blocking individual models was wrong and silently discarded the
+            user-visible signal. 404 data-policy is permanent-for-account but was forgotten
+            on every TID restart, forcing 50+ redundant retries.
+        How: Added _post_credit_alert() (module-level, 5-min rate-limit). Added
+            _load/_save_policy_blocked_cache() to ModelClient. Rewrote 402/404 branch.
     [2026-04-15] Claude Code (Opus 4.6) — Punchlist #141: raw HTTP wire deposits
         What: Every outbound request and inbound response (+ error paths)
             now deposits raw wire bytes to the ecosystem experience tract
@@ -72,12 +83,58 @@ import json
 import logging
 import os
 import time
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger("inference_difference.model_client")
+
+_POLICY_BLOCKED_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "policy_blocked_cache.json"
+)
+_POLICY_BLOCKED_TTL_S = 86400   # 24h for data-policy account exclusions
+_CREDIT_ALERT_COOLDOWN_S = 300  # 5 min between Discord credit alerts
+
+_credit_alert_lock = threading.Lock()
+_last_credit_alert_ts: float = 0.0
+
+
+def _post_credit_alert(error_body: str) -> None:
+    """Fire a Discord alert when OpenRouter returns 402 credit exhaustion.
+
+    Rate-limited to once per _CREDIT_ALERT_COOLDOWN_S so a cascade of
+    failing models does not flood the webhook channel.
+    """
+    global _last_credit_alert_ts
+    webhook = os.environ.get("ET_DISCORD_DEVLOG_WEBHOOK", "")
+    if not webhook:
+        logger.warning("ET_DISCORD_DEVLOG_WEBHOOK not set — credit alert not sent")
+        return
+    with _credit_alert_lock:
+        now = time.time()
+        if now - _last_credit_alert_ts < _CREDIT_ALERT_COOLDOWN_S:
+            return
+        _last_credit_alert_ts = now
+    nl = chr(10)
+    msg = nl.join([
+        "**[TID] OpenRouter credit exhaustion**",
+        "Balance insufficient to complete request.",
+        "Top up at: https://openrouter.ai/settings/credits",
+        "Detail: " + error_body[:300],
+    ])
+    try:
+        payload = json.dumps({"content": msg}).encode()
+        req = urllib.request.Request(
+            webhook, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as exc:
+        logger.warning("Credit alert Discord post failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +335,38 @@ class ModelClient:
     def __init__(self, timeout: int = _DEFAULT_TIMEOUT):
         self._timeout = timeout
         self._policy_blocked: set = set()
+        self._policy_blocked_expiry: Dict[str, float] = {}
+        self._load_policy_blocked_cache()
+
+    def _load_policy_blocked_cache(self) -> None:
+        try:
+            with open(_POLICY_BLOCKED_CACHE_PATH) as f:
+                raw: Dict[str, float] = json.load(f)
+            now = time.time()
+            loaded = 0
+            for model, expiry in raw.items():
+                if expiry > now:
+                    self._policy_blocked.add(model)
+                    self._policy_blocked_expiry[model] = expiry
+                    loaded += 1
+            pruned = len(raw) - loaded
+            logger.info(
+                "Policy-blocked cache loaded: %d active, %d expired pruned",
+                loaded, pruned,
+            )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("Policy-blocked cache load failed: %s", exc)
+
+    def _save_policy_blocked_cache(self) -> None:
+        try:
+            tmp = _POLICY_BLOCKED_CACHE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._policy_blocked_expiry, f, indent=2)
+            os.replace(tmp, _POLICY_BLOCKED_CACHE_PATH)
+        except Exception as exc:
+            logger.warning("Policy-blocked cache save failed: %s", exc)
 
     def call(
         self,
@@ -473,16 +562,17 @@ class ModelClient:
                 pass
             # Cache permanent failures so we don't retry them
             error_lower = error_body.lower()
-            if (
-                (e.code in (404, 403) and "data policy" in error_lower)
-                or (e.code == 402 and ("insufficient" in error_lower or "credits" in error_lower))
-            ):
-                reason = "data policy" if e.code != 402 else "insufficient credits"
+            if e.code in (404, 403) and "data policy" in error_lower:
                 self._policy_blocked.add(model_name)
+                self._policy_blocked_expiry[model_name] = time.time() + _POLICY_BLOCKED_TTL_S
+                self._save_policy_blocked_cache()
                 logger.info(
-                    "Model %s permanently blocked (%s) — won't retry",
-                    model_name, reason,
+                    "Model %s data-policy blocked for this account (24h TTL) — won't retry",
+                    model_name,
                 )
+            elif e.code == 402 and ("insufficient" in error_lower or "credits" in error_lower):
+                logger.warning("OpenRouter 402 credit exhaustion — sending Discord alert")
+                _post_credit_alert(error_body)
             logger.warning(
                 "Model call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
