@@ -61,6 +61,10 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-04-19] CC (punchlist #173) -- TID cascade avoidance (app.py)
+#   What: (b) skip rate-limited fallbacks, (c) cascade_start_ms, (d) cascade metadata in report_outcome
+#   Why:  #173 -- surface cascade depth + wall-time to substrate for learning
+#   How:  readlines patch applied by patch_173_app.py
 # [2026-04-13] Claude (Sonnet 4.6) — Fix ng_lite stats method name (#107)
 # What: stats() → get_stats() on line 1559 in /stats endpoint.
 # Why: ng_lite.py defines get_stats(), not stats(). Every /stats call
@@ -113,6 +117,7 @@ try:
 except Exception:
     pass  # Never prevent module startup
 
+import json
 import logging
 import os
 import time
@@ -1107,10 +1112,15 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     # Record EVERY failure to the substrate, not just the final outcome.
     # The substrate needs to learn which models fail for which patterns,
     # not just which model eventually succeeded. (#19)
+    _cascade_start_ms = time.monotonic() * 1000  # cascade wall-time (#173c)
     tried_models = [selected_model]
     for fallback_id in fallback_chain:
         if model_response.success:
             break
+
+        if _state.model_client and _state.model_client.is_rate_limited_by_id(fallback_id):
+            logger.info("Fallback %s rate-limited -- skipping", fallback_id)
+            continue
 
         # Record the failure BEFORE moving on (#19 — retry chain experience)
         if decision is not None and _state.engine is not None:
@@ -1199,6 +1209,11 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             success=model_response.success and quality.is_success,
             quality_score=quality.overall_score,
             latency_ms=model_response.latency_ms,
+            metadata={
+                "cascade_depth": len(tried_models) - 1,
+                "cascade_total_ms": time.monotonic() * 1000 - _cascade_start_ms,
+                "models_tried": tried_models,
+            },
         )
 
     if _state.module_registry is not None:

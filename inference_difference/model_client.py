@@ -337,6 +337,8 @@ class ModelClient:
         self._policy_blocked: set = set()
         self._policy_blocked_expiry: Dict[str, float] = {}
         self._load_policy_blocked_cache()
+        self._rate_limited = {}   # model_name -> unblock_timestamp (#173b)
+        self._rate_limit_hits = {}  # consecutive 429 count per model
 
     def _load_policy_blocked_cache(self) -> None:
         try:
@@ -367,6 +369,18 @@ class ModelClient:
             os.replace(tmp, _POLICY_BLOCKED_CACHE_PATH)
         except Exception as exc:
             logger.warning("Policy-blocked cache save failed: %s", exc)
+
+    def is_rate_limited(self, model_name: str) -> bool:
+        unblock = self._rate_limited.get(model_name)
+        if unblock is None: return False
+        if time.time() < unblock: return True
+        del self._rate_limited[model_name]
+        self._rate_limit_hits.pop(model_name, None)
+        return False
+
+    def is_rate_limited_by_id(self, model_id: str) -> bool:
+        _, _, mn = _resolve_provider(model_id)
+        return self.is_rate_limited(mn)
 
     def call(
         self,
@@ -562,7 +576,25 @@ class ModelClient:
                 pass
             # Cache permanent failures so we don't retry them
             error_lower = error_body.lower()
-            if e.code in (404, 403) and "data policy" in error_lower:
+            if e.code == 429:
+                hits = self._rate_limit_hits.get(model_name, 0) + 1
+                self._rate_limit_hits[model_name] = hits
+                backoff_s = min(60 * (2 ** (hits - 1)), 1800)
+                self._rate_limited[model_name] = time.time() + backoff_s
+                logger.info(
+                    "Model %s 429 hit #%d -- cooldown %.0fs",
+                    model_name, hits, backoff_s,
+                )
+            if e.code == 429:
+                hits = self._rate_limit_hits.get(model_name, 0) + 1
+                self._rate_limit_hits[model_name] = hits
+                backoff_s = min(60 * (2 ** (hits - 1)), 1800)
+                self._rate_limited[model_name] = time.time() + backoff_s
+                logger.info(
+                    "Model %s 429 hit #%d -- cooldown %.0fs",
+                    model_name, hits, backoff_s,
+                )
+            elif e.code in (404, 403) and "data policy" in error_lower:
                 self._policy_blocked.add(model_name)
                 self._policy_blocked_expiry[model_name] = time.time() + _POLICY_BLOCKED_TTL_S
                 self._save_policy_blocked_cache()

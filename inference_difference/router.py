@@ -47,6 +47,7 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-04-19] CC Sonnet 4.6 -- #173: cascade avoidance (a-d)
 # [2026-03-25] Claude (Opus 4.6) — Router scoring from config (SVG Phase 3)
 #   What: Moved ~20 hardcoded scoring values to InferenceDifferenceConfig:
 #     consciousness_threshold, consciousness_boost_factor, venice_identity_bias,
@@ -219,6 +220,10 @@ class RoutingEngine:
         # Performance tracking
         self._decision_history: List[Dict[str, Any]] = []
         self._history_max = 500
+        self._model_success_stats = {}  # model_id -> list[bool]
+        self._SUCCESS_WINDOW = 50
+        self._SUCCESS_FLOOR = 0.20
+        self._SUCCESS_MIN_SAMPLES = 10
 
     def route(
         self,
@@ -492,6 +497,10 @@ class RoutingEngine:
         self._decision_history.append(outcome)
         if len(self._decision_history) > self._history_max:
             self._decision_history = self._decision_history[-self._history_max:]
+        st = self._model_success_stats.setdefault(decision.model_id, [])
+        st.append(success)
+        if len(st) > self._SUCCESS_WINDOW:
+            self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
 
         # Teach NG-Lite
         if self._ng_lite is not None and decision.classification is not None:
@@ -699,6 +708,36 @@ class RoutingEngine:
                     [m.model_id for m in candidates[:5]],
                 )
 
+        if candidates:
+            sf, pr = [], 0
+            for m in candidates:
+                ms = self._model_success_stats.get(m.model_id, [])
+                if len(ms) >= self._SUCCESS_MIN_SAMPLES and sum(ms)/len(ms) < self._SUCCESS_FLOOR:
+                    pr += 1; continue
+                sf.append(m)
+            if sf:
+                if pr: logger.info("Success-rate floor pruned %d model(s)", pr)
+                candidates = sf
+        if candidates:
+            sf, pr = [], 0
+            for m in candidates:
+                ms = self._model_success_stats.get(m.model_id, [])
+                if len(ms) >= self._SUCCESS_MIN_SAMPLES and sum(ms)/len(ms) < self._SUCCESS_FLOOR:
+                    pr += 1; continue
+                sf.append(m)
+            if sf:
+                if pr: logger.info("Success-rate floor pruned %d model(s)", pr)
+                candidates = sf
+        if candidates:
+            sf, pr = [], 0
+            for m in candidates:
+                ms = self._model_success_stats.get(m.model_id, [])
+                if len(ms) >= self._SUCCESS_MIN_SAMPLES and sum(ms)/len(ms) < self._SUCCESS_FLOOR:
+                    pr += 1; continue
+                sf.append(m)
+            if sf:
+                if pr: logger.info("Success-rate floor pruned %d model(s)", pr)
+                candidates = sf
         return candidates, quality_floor_bypassed
 
     # -------------------------------------------------------------------
@@ -730,7 +769,9 @@ class RoutingEngine:
         breakdown["learned_weight"] = learned_score
 
         # Cost efficiency (0.0-1.0, higher = cheaper)
-        cost_score = self._score_cost(model)
+        _ms = self._model_success_stats.get(model.model_id, [])
+        _sr = (sum(_ms)/len(_ms)) if len(_ms) >= self._SUCCESS_MIN_SAMPLES else 1.0
+        cost_score = self._score_cost(model, success_rate=_sr)
         breakdown["cost_efficiency"] = cost_score
 
         # Latency fit (0.0-1.0, higher = faster)
@@ -842,17 +883,22 @@ class RoutingEngine:
 
         return self.config.neutral_score
 
-    def _score_cost(self, model: ModelEntry) -> float:
-        """Score cost efficiency. Free = 1.0, expensive = lower."""
-        if model.cost_per_1k_tokens <= 0:
-            return 1.0  # Local models are free
+    def _score_cost(self, model: ModelEntry, success_rate: float = 1.0) -> float:
+        """Expected true cost = raw_price / success_rate (#173a).
+
+        Free models use 0.001/1k synthetic so low-success free models score correctly.
+        """
+        success_rate = max(success_rate, 0.01)
+        raw_cost = model.cost_per_1k_tokens if model.cost_per_1k_tokens > 0 else 0.001
+        effective_cost = raw_cost / success_rate
+        if model.cost_per_1k_tokens <= 0 and success_rate >= 0.99:
+            return 1.0  # local model with full success -- still free
 
         budget = self.config.cost_budget_per_request
         if budget <= 0:
             return self.config.neutral_score
 
-        # Score inversely proportional to cost as fraction of budget
-        cost_fraction = model.cost_per_1k_tokens / budget
+        cost_fraction = effective_cost / budget
         return max(0.0, 1.0 - cost_fraction)
 
     def _score_latency(
