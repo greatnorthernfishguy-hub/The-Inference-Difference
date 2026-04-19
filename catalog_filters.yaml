@@ -29,6 +29,7 @@ allowlist:
   providers:
     - "openrouter"
     - "venice"
+    - "huggingface"  # Added 2026-04-19 — broaden pool when OR+Venice both hit rate limits
 hard_ceiling:
   max_cost_per_1m_input_tokens: 20.00
   max_cost_per_1m_output_tokens: 60.00
