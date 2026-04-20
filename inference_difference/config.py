@@ -25,6 +25,9 @@ Changelog (Grok audit response, 2026-02-19):
   our enums inherit from str, TaskDomain("code") already works. Python's
   Enum(value) IS from_str(). No custom method needed.
 """
+# ---- Changelog ----
+# [2026-04-20] CC Sonnet 4.6 — #94: open_source_bias tiebreaker param
+# -------------------
 
 from __future__ import annotations
 
@@ -191,6 +194,7 @@ class InferenceDifferenceConfig:
     consciousness_threshold: float = 0.5     # Min score to trigger elevated routing
     consciousness_boost_factor: float = 0.3  # Boost multiplier (score * factor * priority)
     venice_identity_bias: float = 0.02       # Tie-break for Venice private models
+    open_source_bias: float = 0.02           # Tie-break for open-weights models at equal tier
 
     # Domain match scores (exact, secondary, general, none)
     domain_score_exact: float = 1.0

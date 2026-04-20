@@ -18,6 +18,12 @@ Key design decisions:
 - Backward compatibility: static tier_models.yaml entries (old format)
   remain valid alongside dynamic profile references (new format).
 """
+# ---- Changelog ----
+# [2026-04-20] CC Sonnet 4.6 — #94: Open-source bias
+#   What: is_open_source field on CatalogModel, populated from OpenRouter hugging_face_id.
+#         DB column + ALTER TABLE migration. Persisted in upsert, loaded from cache.
+#   Why:  Router needs a reliable open-weights signal for the #94 tiebreaker.
+# -------------------
 
 from __future__ import annotations
 
@@ -56,6 +62,7 @@ class CatalogModel:
     cost_per_1m_input: float = 0.0       # USD per 1M input tokens
     cost_per_1m_output: float = 0.0      # USD per 1M output tokens
     provider_tier: str = ""              # "frontier"|"performance"|"standard"|"budget"
+    is_open_source: bool = False             # True when hugging_face_id is set on OpenRouter
     capabilities: List[str] = field(default_factory=list)  # ["code","vision","tools"]
     is_active: bool = True
     last_seen: str = ""                  # ISO timestamp
@@ -159,6 +166,13 @@ class CatalogManager:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
 
+        # Migration: add is_open_source column to existing catalogs
+        try:
+            self._db.execute("ALTER TABLE model_catalog ADD COLUMN is_open_source INTEGER DEFAULT 0")
+            self._db.commit()
+        except Exception:
+            pass  # column already exists
+
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS model_catalog (
                 id TEXT PRIMARY KEY,
@@ -168,6 +182,7 @@ class CatalogManager:
                 cost_per_1m_input_tokens REAL,
                 cost_per_1m_output_tokens REAL,
                 provider_tier TEXT,
+                is_open_source INTEGER DEFAULT 0,
                 capabilities TEXT,
                 is_active INTEGER DEFAULT 1,
                 last_seen TEXT NOT NULL,
@@ -213,6 +228,7 @@ class CatalogManager:
                 cost_per_1m_output=row["cost_per_1m_output_tokens"] or 0.0,
                 provider_tier=row["provider_tier"] or "",
                 capabilities=caps,
+                is_open_source=bool(row["is_open_source"]),
                 is_active=bool(row["is_active"]),
                 last_seen=row["last_seen"] or "",
                 fetched_at=row["fetched_at"] or "",
@@ -433,6 +449,7 @@ class CatalogManager:
                 cost_per_1m_output=completion_price * 1_000_000,
                 provider_tier=tier,
                 capabilities=capabilities,
+                is_open_source=bool(item.get("hugging_face_id")),
                 is_active=True,
                 last_seen=now,
                 fetched_at=now,
@@ -948,9 +965,9 @@ class CatalogManager:
                 INSERT OR REPLACE INTO model_catalog
                     (id, provider, display_name, context_window,
                      cost_per_1m_input_tokens, cost_per_1m_output_tokens,
-                     provider_tier, capabilities, is_active,
+                     provider_tier, is_open_source, capabilities, is_active,
                      last_seen, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 model.id,
                 model.provider,
@@ -959,6 +976,7 @@ class CatalogManager:
                 model.cost_per_1m_input,
                 model.cost_per_1m_output,
                 model.provider_tier,
+                1 if model.is_open_source else 0,
                 json.dumps(model.capabilities),
                 1 if model.is_active else 0,
                 model.last_seen,

@@ -47,6 +47,13 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-04-20] CC Sonnet 4.6 — #94: Open-source bias in routing
+#   What: is_open_source field on ModelEntry (from hugging_face_id), open_source_bias
+#         tiebreaker in _score_model(), DB column + ALTER TABLE migration.
+#   Why:  At equal capability, prefer open-weights models for cost reasons.
+#         Not a cost optimizer — tiebreaker only. Closed models win when genuinely better.
+#   How:  OpenRouter hugging_face_id is set iff model is open-weights. +0.02 bias
+#         applied same pattern as venice_identity_bias. DB migrated in-place.
 # [2026-04-19] CC Sonnet 4.6 -- #173: cascade avoidance (a-d)
 # [2026-03-25] Claude (Opus 4.6) — Router scoring from config (SVG Phase 3)
 #   What: Moved ~20 hardcoded scoring values to InferenceDifferenceConfig:
@@ -817,6 +824,14 @@ class RoutingEngine:
             identity_bias = self.config.venice_identity_bias
             total += identity_bias
             breakdown["venice_identity_bias"] = identity_bias
+
+        # Open-source bias: tiebreaker for open-weights models.
+        # Not a cost optimization — applied only after tier/capability matching.
+        # Closed models win when genuinely better; this nudges equals toward open.
+        if getattr(model, "is_open_source", False):
+            os_bias = self.config.open_source_bias
+            total += os_bias
+            breakdown["open_source_bias"] = os_bias
 
         return total, breakdown
 
