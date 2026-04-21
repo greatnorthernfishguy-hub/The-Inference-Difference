@@ -16,7 +16,7 @@ from inference_difference.et_module import (
     HookPhase,
     ModuleRegistry,
 )
-from inference_difference.openclaw_adapter import (
+from inference_difference.compliance_adapter import (
     CompliancePolicy,
     ComplianceResult,
     OpenClawAdapter,
