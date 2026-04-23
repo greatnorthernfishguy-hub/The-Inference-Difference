@@ -2,6 +2,17 @@
 OpenClaw Adapter — E-T Systems Module Integration for OpenClaw Skills
 
 # ---- Changelog ----
+# [2026-04-19] CC (punchlist #5) -- Add NGTractBridge River drain to base adapter
+#   What: __init__ initializes NGTractBridge for all modules; _drain_river() drains
+#          tracts/*/neurograph.tract and calls overridable _on_river_events().
+#   Why:  Pulse loops had no drain path after SKIP_ECOSYSTEM removed the eco bridge.
+#   How:  NGTractBridge init unconditional (all modes). _drain_river() in base.
+# [2026-04-19] CC (punchlist #143) -- Module backflow deposit for SKIP_ECOSYSTEM modules
+#   What: When _eco is None (SKIP_ECOSYSTEM=True), deposit outcome directly to
+#          tracts/{module_id}/neurograph.tract via ng_tract (BTF, zero-copy).
+#   Why:  In-process modules had no deposit path with SKIP_ECOSYSTEM=True,
+#          leaving tracts/{module_id}/ permanently empty. River backflow broken.
+#   How:  Direct ng_tract.deposit_outcome() call, substrate-only (not fan-out).
 # [2026-03-26] Claude (Opus 4.6) — Domain-specific substrate outcomes (punchlist #18)
 #   What: on_message() now runs _module_on_message() BEFORE record_outcome().
 #     Modules can return _substrate_target_id and _substrate_success in their
@@ -153,6 +164,15 @@ class OpenClawAdapter(ABC):
             )
             logger.info("[%s] OpenClawAdapter ready (tier %d)", self.MODULE_ID, self._eco.tier)
 
+
+        # NGTractBridge — River drain for all modules (SKIP_ECOSYSTEM or not)
+        try:
+            from ng_tract_bridge import NGTractBridge as _NTB
+            self._tract_bridge: Any = _NTB(module_id=self.MODULE_ID)
+        except Exception as _exc:
+            self._tract_bridge = None
+            logger.debug("[%s] Tract bridge init skipped: %s", self.MODULE_ID, _exc)
+
         self._message_count = 0
         self._start_time = time.time()
 
@@ -186,6 +206,38 @@ class OpenClawAdapter(ABC):
     # -----------------------------------------------------------------
     # OpenClaw skill interface
     # -----------------------------------------------------------------
+
+    def _drain_river(self) -> int:
+        """Drain inbound River tracts and invoke _on_river_events with new events.
+
+        Call from each module pulse cycle to pull substrate signals.
+        Returns number of new events absorbed.
+        """
+        if self._tract_bridge is None:
+            return 0
+        events_before = len(getattr(self._tract_bridge, "_peer_events", []))
+        try:
+            self._tract_bridge._drain_all()
+        except Exception as _e:
+            logger.debug("[%s] River drain error: %s", self.MODULE_ID, _e)
+            return 0
+        events_after = len(getattr(self._tract_bridge, "_peer_events", []))
+        new_count = events_after - events_before
+        if new_count > 0:
+            new_events = list(self._tract_bridge._peer_events[events_before:])
+            try:
+                self._on_river_events(new_events)
+            except Exception as _e:
+                logger.debug("[%s] _on_river_events error: %s", self.MODULE_ID, _e)
+        return new_count
+
+    def _on_river_events(self, events: list) -> None:
+        """Override to process new River events through domain bucket.
+
+        events is a list of BTF peer-event objects drained from
+        tracts/neurograph/{module_id}.tract (and any other peer tracts).
+        """
+        logger.debug("[%s] River: %d new events", self.MODULE_ID, len(events))
 
     def on_message(self, text: str) -> Dict[str, Any]:
         """Process one OpenClaw conversation turn.
@@ -235,6 +287,34 @@ class OpenClawAdapter(ABC):
             )
             ctx = self._eco.get_context(embedding)
         else:
+            # Tract-only mode: deposit directly to NG substrate via BTF
+            try:
+                import ng_tract as _ng_tract
+                import time as _t
+                import os as _os
+                from pathlib import Path as _Path
+                _tracts_dir = _Path(
+                    _os.environ.get("ET_TRACTS_DIR", "~/.et_modules/tracts")
+                ).expanduser()
+                _tract_path = _tracts_dir / self.MODULE_ID / "neurograph.tract"
+                _tract_path.parent.mkdir(parents=True, exist_ok=True)
+                _meta = None
+                try:
+                    import msgpack as _mp
+                    _meta = _mp.packb({"source": "openclaw", "module": self.MODULE_ID})
+                except Exception:
+                    pass
+                _ng_tract.deposit_outcome(
+                    timestamp=_t.time(),
+                    module_id=self.MODULE_ID,
+                    target_id=substrate_target,
+                    success=substrate_success,
+                    embedding=np.asarray(embedding, dtype=np.float32),
+                    tract_paths=[str(_tract_path)],
+                    metadata=_meta,
+                )
+            except Exception as _e:
+                logger.debug("[%s] Tract deposit skipped: %s", self.MODULE_ID, _e)
             ctx = {"recommendations": [], "novelty": 0.0}
 
         result = {
