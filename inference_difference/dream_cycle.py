@@ -2,6 +2,17 @@
 Dream Cycle Enhancement for Dynamic Model Catalog Selection (§4.5.5).
 
 # ---- Changelog ----
+# [2026-04-29] CC (punchlist #227) — Add background pulse to trigger analysis
+#   What: DreamCycle.start_pulse(interval_seconds=300) starts a daemon thread
+#     that calls analyze_model_property_correlations() every 5 minutes.
+#     stop_pulse() signals graceful shutdown. app.py calls start_pulse() at
+#     startup so the DreamCycle actually fires in production.
+#   Why:  analyze_model_property_correlations() existed only in tests and the
+#     docstring example — never triggered in production. 4,573+ outcomes
+#     accumulated with insights=0, substrate_teaches=0.
+#   How:  threading.Event.wait(timeout) gives a free-running daemon with clean
+#     shutdown semantics. Thread is daemonized so it dies with the process.
+# -------------------
 # [2026-03-25] Claude (Opus 4.6) — Wire insights to substrate (punchlist #17)
 #   What: DreamCycle now teaches the substrate when it discovers insights.
 #     After analyze_model_property_correlations(), each high-confidence
@@ -42,6 +53,8 @@ routing outcomes and update profile requirements.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -141,6 +154,8 @@ class DreamCycle:
 
         self._outcomes: List[RoutingOutcome] = []
         self._insights: Dict[str, List[PropertyInsight]] = {}
+        self._pulse_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     def record_outcome(self, outcome: RoutingOutcome) -> None:
         """Record a routing outcome for later analysis."""
@@ -239,6 +254,41 @@ class DreamCycle:
             },
             "substrate_teach_count": self._substrate_teach_count,
         }
+
+    # -------------------------------------------------------------------
+    # Background pulse (#227)
+    # -------------------------------------------------------------------
+
+    def start_pulse(self, interval_seconds: float = 300.0) -> None:
+        """Start a daemon thread that runs analysis every interval_seconds."""
+        if self._pulse_thread is not None and self._pulse_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._pulse_thread = threading.Thread(
+            target=self._pulse_loop,
+            args=(interval_seconds,),
+            name="dream-cycle-pulse",
+            daemon=True,
+        )
+        self._pulse_thread.start()
+        logger.info("DreamCycle pulse started (interval=%.0fs)", interval_seconds)
+
+    def stop_pulse(self) -> None:
+        """Signal the pulse loop to stop after the current sleep."""
+        self._stop_event.set()
+
+    def _pulse_loop(self, interval_seconds: float) -> None:
+        # threading.Event.wait(timeout) returns True when set (stop), False on timeout
+        while not self._stop_event.wait(timeout=interval_seconds):
+            try:
+                insights = self.analyze_model_property_correlations()
+                total = sum(len(v) for v in insights.values())
+                logger.info(
+                    "DreamCycle pulse: %d outcomes → %d insights, substrate_teaches=%d",
+                    len(self._outcomes), total, self._substrate_teach_count,
+                )
+            except Exception as exc:
+                logger.warning("DreamCycle pulse analysis failed: %s", exc)
 
     # -------------------------------------------------------------------
     # Substrate teaching (#17)

@@ -61,6 +61,14 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-04-29] CC (punchlist #227) — Start DreamCycle background pulse at startup
+#   What: _state.dream_cycle.start_pulse() called after DreamCycle init.
+#     Daemon thread wakes every 300s, runs analyze_model_property_correlations(),
+#     logs outcomes/insights count and substrate_teach_count.
+#   Why:  analyze_model_property_correlations() was never called in production.
+#     4,573+ outcomes accumulated with insights=0, substrate_teaches=0.
+#   How:  One-liner after DreamCycle init. All logic lives in dream_cycle.py.
+# -------------------
 # [2026-04-19] CC (punchlist #173) -- TID cascade avoidance (app.py)
 #   What: (b) skip rate-limited fallbacks, (c) cascade_start_ms, (d) cascade metadata in report_outcome
 #   Why:  #173 -- surface cascade depth + wall-time to substrate for learning
@@ -709,6 +717,7 @@ async def lifespan(app: FastAPI):
         ng_ecosystem=_state.ng_ecosystem,
         embed_fn=_dc_embed_fn,
     )
+    _state.dream_cycle.start_pulse()  # (#227) fire analysis every 5 min
 
     # Create routing engine
     _state.engine = RoutingEngine(
