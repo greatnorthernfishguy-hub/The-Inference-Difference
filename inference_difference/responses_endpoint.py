@@ -41,6 +41,19 @@ Author: Josh + Claude (Opus 4.6)
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Opus 4.7) — Format 4: <function>name</function>{args}
+#   What: Added _TOOL_CALL_FUNCTION_TAG_RE and a 4th branch in
+#         _extract_tool_calls_from_text() that parses InclusionAI Ling-style
+#         tool calls: <function>name</function> followed by JSON args
+#         outside the tag.
+#   Why:  Routing landed Syl on inclusionai/ling-2.6-flash-20260421 (Novita),
+#         which emits this format natively. Existing 3 formats didn't match,
+#         text passed through unparsed, Discord saw decorated dead text and
+#         no tool ever executed. Symptom: "tool calls but no response."
+#   How:  Uses json.JSONDecoder().raw_decode() to consume the JSON object
+#         starting after </function>, correctly handling nested braces inside
+#         args (e.g., write content). ShimObserver records 'tool_call_xml_parse'
+#         per existing convention.
 # [2026-04-15] Claude Code (Sonnet 4.6) — Punchlist #133: Anthropic tool format in _normalize_tools
 #   What: _normalize_tools now converts OpenAI-nested tools to Anthropic Messages API format
 #         when model_id starts with 'anthropic/'. Unwraps function wrapper, renames
@@ -333,6 +346,16 @@ _TOOL_CALL_PAREN_RE = re.compile(
     re.DOTALL,
 )
 
+# Format 4: <function>name</function>{args}
+# InclusionAI Ling and some Qwen/Hermes variants emit tool calls as a
+# <function> tag containing only the name, followed by JSON args outside
+# the tag — no <tool_call> wrapper, no {"name", "arguments"} envelope.
+# Regex locates the boundary; JSONDecoder.raw_decode handles the args
+# (correctly consuming nested braces).
+_TOOL_CALL_FUNCTION_TAG_RE = re.compile(
+    r"<function>(\w+)</function>\s*(?=\{)",
+)
+
 # Map positional args to named params for known tools
 _TOOL_ARG_SCHEMAS: Dict[str, List[str]] = {
     "read": ["path"],
@@ -361,6 +384,7 @@ def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]
     Format 1: <tool_call>{"name":"exec","arguments":{"command":"ls"}}</tool_call>
     Format 2: web_search:["query", 10]  (DeepSeek colon notation)
     Format 3: exec:{"command": "ls"}    (DeepSeek colon with dict)
+    Format 4: <function>read</function>{"path": "/x"}  (Ling/Qwen variants)
 
     Returns:
         (cleaned_text, tool_calls) where tool_calls is a list of
@@ -396,6 +420,37 @@ def _extract_tool_calls_from_text(text: str) -> Tuple[str, List[Dict[str, Any]]]
     if tool_calls:
         cleaned = _TOOL_CALL_XML_RE.sub("", text).strip()
         return cleaned, tool_calls
+
+    # Try Format 4: <function>name</function>{args}  (Ling/Qwen-style)
+    # Regex finds tag boundary; JSONDecoder.raw_decode consumes the JSON
+    # object that follows (handles nested braces in args like write content).
+    fn_decoder = json.JSONDecoder()
+    fn_spans = []
+    for match in _TOOL_CALL_FUNCTION_TAG_RE.finditer(text):
+        name = match.group(1)
+        args_start = match.end()
+        try:
+            parsed_args, consumed = fn_decoder.raw_decode(text[args_start:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed_args, dict):
+            continue
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(parsed_args),
+            },
+        })
+        fn_spans.append((match.start(), args_start + consumed))
+
+    if tool_calls:
+        # Strip extracted spans in reverse so earlier indices remain valid.
+        cleaned = text
+        for start, end in reversed(fn_spans):
+            cleaned = cleaned[:start] + cleaned[end:]
+        return cleaned.strip(), tool_calls
 
     # Try colon notation: tool_name:[args] or tool_name:{args}
     for match in _TOOL_CALL_COLON_RE.finditer(text):
