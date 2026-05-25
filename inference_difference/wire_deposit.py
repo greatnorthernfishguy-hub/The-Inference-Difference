@@ -23,6 +23,17 @@ Drain path: NeuroGraph's wire-absorption path in wire_absorption.py
 Rust binding: ng_tract.deposit_experience (PyO3)
 
 # ---- Changelog ----
+# [2026-05-25] Claude Code (Opus 4.7) — Sync to new ng_tract.deposit_experience signature
+#   What: _write() now calls ng_tract.deposit_experience(raw_bytes, source, [tract_path])
+#         positionally, matching the new Rust API. content is UTF-8 encoded;
+#         tract_path is wrapped in a list.
+#   Why:  NeuroGraph commit 59c0703 (Sonnet 4.6, 2026-05-25 07:19 UTC) implemented
+#         the deposit_experience/deposit_topology Rust API on the producer side
+#         after AttributeError had been silently swallowed since 2026-04-28.
+#         Old kwargs (content=, tract_path=, content_type=) hit TypeError every
+#         call, severing TID's River feed. LAW 4: consumer side fix.
+#   How:  Three-arg positional call: content.encode("utf-8"), source, [_TRACT_PATH].
+#         No behavior change for callers; tract_path environment unchanged.
 # [2026-04-15] Claude Code (Opus 4.6) — Raw-wire-text rewrite (no JSON).
 #   What: Replaced JSON-wrapped payload with raw HTTP wire text format.
 #         Headers preserved by key-case. Body appended after blank line.
@@ -113,10 +124,9 @@ def _write(content: str, source: str) -> None:
         return
     try:
         ng_tract.deposit_experience(
-            content=content,
-            source=source,
-            tract_path=_TRACT_PATH,
-            content_type="text",
+            content.encode("utf-8"),  # raw: bytes
+            source,                    # source: str
+            [_TRACT_PATH],             # tract_paths: List[str]
         )
     except Exception as exc:
         logger.warning("Wire deposit failed (%s): %s", source, exc)
