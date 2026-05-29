@@ -61,6 +61,17 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-05-28] Claude Code (Sonnet 4.6) — systemd watchdog (WatchdogSec=60s)
+#   What: Added _sd_notify() helper and _watchdog_loop() async coroutine.
+#         Lifespan starts the loop as an asyncio task just before yield,
+#         sends READY=1 to systemd, and cancels the task on shutdown.
+#   Why:  TID's event loop hangs on slow model calls without notification.
+#         Port stays bound (process "alive") but connections queue up (579
+#         seen in production). WatchdogSec=60s in the service unit causes
+#         systemd to SIGKILL+restart automatically when pings stop for 60s.
+#   How:  _sd_notify() writes to $NOTIFY_SOCKET (UDP Unix socket). No extra
+#         deps — raw socket.AF_UNIX datagram. asyncio task pings every 30s.
+#         Service unit changes: WatchdogSec=60s + NotifyAccess=main.
 # [2026-04-29] CC (punchlist #227) — Start DreamCycle background pulse at startup
 #   What: _state.dream_cycle.start_pulse() called after DreamCycle init.
 #     Daemon thread wakes every 300s, runs analyze_model_property_correlations(),
@@ -125,6 +136,7 @@ try:
 except Exception:
     pass  # Never prevent module startup
 
+import asyncio
 import json
 import logging
 import os
@@ -169,6 +181,30 @@ from inference_difference.responses_endpoint import (
 import inference_difference.responses_endpoint as _resp_ep
 
 logger = logging.getLogger("inference_difference.app")
+
+
+def _sd_notify(state: str) -> None:
+    """Write to $NOTIFY_SOCKET — no-op outside systemd, non-fatal on any error."""
+    import socket as _sock
+    sock_path = os.environ.get("NOTIFY_SOCKET", "")
+    if not sock_path:
+        return
+    try:
+        with _sock.socket(_sock.AF_UNIX, _sock.SOCK_DGRAM) as s:
+            if sock_path.startswith("@"):
+                sock_path = "\0" + sock_path[1:]  # abstract namespace socket
+            s.connect(sock_path)
+            s.sendall(state.encode())
+    except Exception:
+        pass
+
+
+async def _watchdog_loop() -> None:
+    """Ping systemd watchdog every 30s. WatchdogSec=60s in service unit kills+restarts on hang."""
+    while True:
+        _sd_notify("WATCHDOG=1")
+        await asyncio.sleep(30)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models for API
@@ -792,7 +828,16 @@ async def lifespan(app: FastAPI):
         len(_state.module_registry.get_all_modules()),
     )
 
+    _watchdog_task = asyncio.create_task(_watchdog_loop())
+    _sd_notify("READY=1")
+
     yield
+
+    _watchdog_task.cancel()
+    try:
+        await _watchdog_task
+    except asyncio.CancelledError:
+        pass
 
     # Shutdown ET modules
     if _state.module_registry is not None:
