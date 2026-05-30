@@ -61,6 +61,10 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-05-30] Claude Code (Sonnet 4.6) — periodic NG-Lite state save (#264)
+#   What: _ng_save_loop() background task saves ng_ecosystem every 10 min.
+#   Why:  Save only happened on clean shutdown — SIGKILL lost all in-session
+#         learning including newly rebuilt receptor layer prototypes.
 # [2026-05-28] Claude Code (Sonnet 4.6) — systemd watchdog (WatchdogSec=60s)
 #   What: Added _sd_notify() helper and _watchdog_loop() async coroutine.
 #         Lifespan starts the loop as an asyncio task just before yield,
@@ -204,6 +208,18 @@ async def _watchdog_loop() -> None:
     while True:
         _sd_notify("WATCHDOG=1")
         await asyncio.sleep(30)
+
+
+async def _ng_save_loop() -> None:
+    """Periodically save NG-Lite state so SIGKILL doesn't lose in-session learning."""
+    while True:
+        await asyncio.sleep(600)  # every 10 minutes
+        if _state.ng_ecosystem is not None:
+            try:
+                _state.ng_ecosystem.save()
+                logger.debug("Periodic NG-Lite state save OK")
+            except Exception as e:
+                logger.warning("Periodic NG-Lite state save failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -829,13 +845,19 @@ async def lifespan(app: FastAPI):
     )
 
     _watchdog_task = asyncio.create_task(_watchdog_loop())
+    _ng_save_task = asyncio.create_task(_ng_save_loop())
     _sd_notify("READY=1")
 
     yield
 
     _watchdog_task.cancel()
+    _ng_save_task.cancel()
     try:
         await _watchdog_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await _ng_save_task
     except asyncio.CancelledError:
         pass
 
