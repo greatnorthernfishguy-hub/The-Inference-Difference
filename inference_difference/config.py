@@ -26,6 +26,11 @@ Changelog (Grok audit response, 2026-02-19):
   Enum(value) IS from_str(). No custom method needed.
 """
 # ---- Changelog ----
+# [2026-05-30] Claude Code (Sonnet 4.6) — #47: raise exploration_min_rate floor
+#   What: exploration_min_rate 0.01 → 0.05 (matches starting rate — constant 5% exploration)
+#   Why:  0.001 decay hits 1% floor after 40 requests; stays there for hundreds more.
+#         TID is always-on; model availability changes continuously — need sustained
+#         exploration to discover OSS models and recover from provider outages.
 # [2026-04-20] CC Sonnet 4.6 — #94: open_source_bias tiebreaker param
 # -------------------
 
@@ -186,7 +191,7 @@ class InferenceDifferenceConfig:
     #   new routing patterns. Decays toward exploration_min_rate over time.
     exploration_rate: float = 0.05
     exploration_decay: float = 0.001    # Subtracted per request from rate
-    exploration_min_rate: float = 0.01  # Floor — never fully greedy
+    exploration_min_rate: float = 0.05  # Floor — matches starting rate; sustained 5% exploration
     exploration_pool_size: int = 3      # Pick from top N alternatives
 
     # --- Router scoring (SVG Phase 3 — bootstrap scaffolding) ---
