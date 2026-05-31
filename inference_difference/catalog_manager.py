@@ -19,6 +19,12 @@ Key design decisions:
   remain valid alongside dynamic profile references (new format).
 """
 # ---- Changelog ----
+# [2026-05-31] Claude Code (Sonnet 4.6) — #94: OSS heuristic (provider + name patterns)
+#   What: _OSS_PROVIDERS set + _OSS_MODEL_RE + _is_known_oss() helper.
+#         _fetch_openrouter_catalog now uses heuristic alongside hugging_face_id.
+#         DB migration in _init_db() backfills is_open_source for existing rows.
+#   Why:  hugging_face_id missing from many OR variants (e.g. :exacto, :free suffixes),
+#         causing deepseek/meta-llama/allenai/etc. to score 0 bias despite being OSS.
 # [2026-04-20] CC Sonnet 4.6 — #94: Open-source bias
 #   What: is_open_source field on CatalogModel, populated from OpenRouter hugging_face_id.
 #         DB column + ALTER TABLE migration. Persisted in upsert, loaded from cache.
@@ -43,6 +49,55 @@ import yaml
 
 logger = logging.getLogger("inference_difference.catalog_manager")
 
+# ---------------------------------------------------------------------------
+# Open-source detection heuristics (#94)
+# hugging_face_id is unreliable — many open-weight models lack this field.
+# Provider-name list: ALL models from these OR providers are open-weight.
+# Pattern list: open-weight signals within mixed providers (e.g. mistralai, qwen).
+# ---------------------------------------------------------------------------
+
+_OSS_PROVIDERS: frozenset = frozenset({
+    "meta-llama",            # Llama 2/3/Guard — all open weights
+    "allenai",               # OLMo, MoLMo — all OSS
+    "deepseek",              # DeepSeek V/R series — open weights published
+    "nousresearch",          # Hermes fine-tunes — all OSS
+    "sao10k",                # OSS fine-tunes
+    "cognitivecomputations",  # Dolphin models
+    "teknium",               # Hermes
+    "huggingfaceh4",         # Zephyr, etc.
+    "tiiuae",                # Falcon
+    "openchat",              # OpenChat
+    "bigcode",               # StarCoder
+})
+
+_OSS_MODEL_RE = re.compile(
+    r"gemma-\d"             # Gemma (not Gemini)
+    r"|phi-\d"              # Microsoft Phi-3/4
+    r"|mistral-[0-9]"        # Mistral 7B, NeMo
+    r"|mistral-8x"           # Mixtral 8x7B/8x22B
+    r"|pixtral-12b"          # Pixtral 12B open weight
+    r"|mixtral"              # Mixtral
+    r"|codestral-mamba"      # Codestral Mamba (open)
+    r"|devstral-small"       # DevStral Small
+    r"|starcoder"            # StarCoder
+    r"|falcon"               # Falcon
+    r"|qwen[23]-\d"         # Qwen2/3 with size digit (qwen3-4b, qwen2-7b)
+    r"|qwen2\.5-"           # All Qwen2.5 variants (coder, vl, instruct…)
+    r"|qwen-2\.5-"          # Qwen-2.5 alt format
+    r"|llama",               # Any Llama variant
+    re.IGNORECASE,
+)
+
+
+def _is_known_oss(or_model_id: str) -> bool:
+    """Return True if the model is open-weight by provider or name heuristic."""
+    parts = or_model_id.split(":")[0].split("/")  # strip :variant suffix
+    if len(parts) < 3:
+        return False
+    provider = parts[1]
+    model_name = parts[2]
+    return provider in _OSS_PROVIDERS or bool(_OSS_MODEL_RE.search(model_name))
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -62,7 +117,7 @@ class CatalogModel:
     cost_per_1m_input: float = 0.0       # USD per 1M input tokens
     cost_per_1m_output: float = 0.0      # USD per 1M output tokens
     provider_tier: str = ""              # "frontier"|"performance"|"standard"|"budget"
-    is_open_source: bool = False             # True when hugging_face_id is set on OpenRouter
+    is_open_source: bool = False             # True when open-weight (hugging_face_id OR provider/name heuristic)
     capabilities: List[str] = field(default_factory=list)  # ["code","vision","tools"]
     is_active: bool = True
     last_seen: str = ""                  # ISO timestamp
@@ -172,6 +227,25 @@ class CatalogManager:
             self._db.commit()
         except Exception:
             pass  # column already exists
+
+        # Backfill is_open_source for existing rows using heuristics (#94)
+        try:
+            rows = self._db.execute(
+                "SELECT id FROM model_catalog WHERE is_open_source = 0"
+            ).fetchall()
+            updated = 0
+            for (model_id,) in rows:
+                if _is_known_oss(model_id):
+                    self._db.execute(
+                        "UPDATE model_catalog SET is_open_source = 1 WHERE id = ?",
+                        (model_id,),
+                    )
+                    updated += 1
+            if updated:
+                self._db.commit()
+                logger.info("OSS backfill: updated %d rows via heuristic", updated)
+        except Exception as exc:
+            logger.debug("OSS backfill skipped: %s", exc)
 
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS model_catalog (
@@ -449,7 +523,7 @@ class CatalogManager:
                 cost_per_1m_output=completion_price * 1_000_000,
                 provider_tier=tier,
                 capabilities=capabilities,
-                is_open_source=bool(item.get("hugging_face_id")),
+                is_open_source=bool(item.get("hugging_face_id")) or _is_known_oss(f"openrouter/{model_id}"),
                 is_active=True,
                 last_seen=now,
                 fetched_at=now,
