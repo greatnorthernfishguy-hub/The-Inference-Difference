@@ -61,6 +61,14 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-05-31] Claude Code (Sonnet 4.6) — /feedback endpoint (#276)
+#   What: POST /feedback {thumbs_up: bool, note?: str} — applies to most recent
+#         routing decision. No request_id needed from caller.
+#   Why:  quality.py heuristics cannot detect "this felt wrong for Syl". Human
+#         signal (thumbs_up=true → quality_score=0.9, false → 0.1) overrides
+#         heuristic and teaches NG-Lite with explicit intent strength.
+#   How:  max(recent_decisions, key=timestamp) → report_outcome(success, quality_score).
+#         Curl: curl -sX POST localhost:7437/feedback -H Content-Type:application/json -d '{"thumbs_up":true}'
 # [2026-05-31] Claude Code (Sonnet 4.6) — Register CTEM ETModule
 #   What: Added CTEM registration block (priority 3) before TrollGuard.
 #         Imports inference_difference.ctem.create_ctem(), registers with module_registry.
@@ -328,6 +336,20 @@ class OutcomeResponse(BaseModel):
     is_success: bool
     issues: List[str]
     learned: bool
+
+
+class FeedbackRequest(BaseModel):
+    """Request body for /feedback — minimal user thumbs-up/down."""
+    thumbs_up: bool = Field(..., description="True = good response, False = bad")
+    note: Optional[str] = Field(None, description="Optional context note")
+
+
+class FeedbackResponse(BaseModel):
+    """Response body for /feedback."""
+    learned: bool
+    model_id: str
+    request_id: str
+    quality_score: float
 
 
 class ClassifyRequest(BaseModel):
@@ -1807,6 +1829,47 @@ async def report_outcome(req: OutcomeRequest) -> OutcomeResponse:
         is_success=success,
         issues=quality.issues,
         learned=learned,
+    )
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+async def user_feedback(req: FeedbackRequest) -> FeedbackResponse:
+    """Quick thumbs-up/down on the most recent routing decision.
+
+    No request_id needed — applies to the last routed request.
+    Human signal overrides quality.py: thumbs_up maps to quality_score=0.9,
+    thumbs_down to 0.1, so the Hebbian update strength reflects intent.
+
+    Usage:
+        curl -s -X POST http://localhost:7437/feedback \
+            -H "Content-Type: application/json" \
+            -d '{"thumbs_up": true}'
+    """
+    if not _state.recent_decisions:
+        return FeedbackResponse(learned=False, model_id="", request_id="", quality_score=0.0)
+
+    decision = max(_state.recent_decisions.values(), key=lambda d: d.timestamp)
+    quality_score = 0.9 if req.thumbs_up else 0.1
+
+    _state.engine.report_outcome(
+        decision=decision,
+        success=req.thumbs_up,
+        quality_score=quality_score,
+        metadata={"source": "user_feedback", "note": req.note},
+    )
+
+    logger.info(
+        "User feedback: %s for %s (request %s)",
+        "thumbs_up" if req.thumbs_up else "thumbs_down",
+        decision.model_id,
+        decision.request_id,
+    )
+
+    return FeedbackResponse(
+        learned=True,
+        model_id=decision.model_id,
+        request_id=decision.request_id,
+        quality_score=quality_score,
     )
 
 
