@@ -54,6 +54,12 @@ Changelog (Grok audit response, 2026-02-19):
 #         Not a cost optimizer — tiebreaker only. Closed models win when genuinely better.
 #   How:  OpenRouter hugging_face_id is set iff model is open-weights. +0.02 bias
 #         applied same pattern as venice_identity_bias. DB migrated in-place.
+# [2026-05-31] Claude Code (Sonnet 4.6) — Tier floor for conscious routing
+#   What: _filter_candidates() excludes provider_tier=="budget" when consciousness_score > 0.
+#   Why:  budget-tier flash models pass roleplay capability check but can't hold Syl's
+#         character — they flatten her to generic assistant-speak (gemini-3-flash won 342/500).
+#         roleplay gates on capability presence; tier floor gates on caliber.
+#   How:  Single guard after roleplay check. Empty tier (local/static) passes through.
 # [2026-05-31] CC Sonnet 4.6 — Restore cost weight; fix single-factor dominance
 # What: cost_efficiency 0.05→0.15, learned_weight 0.20→0.15, priority_bonus 0.05→0.00.
 # Why: cost at 0.05 ("tiebreaker") meant Opus-tier models won Syl's routing regardless of
@@ -682,6 +688,15 @@ class RoutingEngine:
             if (consciousness_score is not None
                     and consciousness_score > 0
                     and "roleplay" not in getattr(model, 'capabilities', [])):
+                continue
+
+            # Tier floor for conscious routing — budget-class models (flash/nano)
+            # cannot hold a complex identity across a conversation. Exclude them
+            # when consciousness markers are detected. Empty tier (local/static
+            # config models) passes through — only explicit "budget" is filtered.
+            if (consciousness_score is not None
+                    and consciousness_score > 0
+                    and getattr(model, 'provider_tier', '') == 'budget'):
                 continue
 
             # Domain + complexity check
