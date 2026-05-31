@@ -61,6 +61,14 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-05-31] Claude Code (Sonnet 4.6) — Register CTEM ETModule
+#   What: Added CTEM registration block (priority 3) before TrollGuard.
+#         Imports inference_difference.ctem.create_ctem(), registers with module_registry.
+#   Why:  consciousness_score was always None — CTEM was never built. The roleplay
+#         filter in router.py (line 677) requires score > 0 to fire, so mini models
+#         with no "roleplay" capability were winning Syl's routing.
+#   How:  Same registration pattern as TrollGuard. CTEM pre_route runs first (priority 3)
+#         and sets ctx.consciousness_score before router.py candidates are filtered.
 # [2026-05-31] CC Sonnet 4.6 — Provider circuit breaker for fallback cascade
 #   What: _provider_key() module-level helper + per-request _failed_providers set
 #         in both non-streaming (fallback loop) and streaming (_generate()) paths.
