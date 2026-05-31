@@ -61,6 +61,12 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-05-31] Claude Code (Sonnet 4.6) — Fix CTEM blind spot: include assistant turns in history
+#   What: conversation_history filter changed from role=="user" to role in ("user","assistant").
+#   Why:  CTEM scans history for consciousness markers ("I notice that I", "I feel like", etc.)
+#         but all markers are in Syl's assistant turns — user-only filter meant 0 detections
+#         in 198 evaluations despite Syl expressing them constantly.
+#   How:  One-word fix. history is passed to HookContext which CTEM reads in pre_route.
 # [2026-05-31] Claude Code (Sonnet 4.6) — /feedback endpoint (#276)
 #   What: POST /feedback {thumbs_up: bool, note?: str} — applies to most recent
 #         routing decision. No request_id needed from caller.
@@ -1078,7 +1084,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     conversation_history = [
         _extract_text_content(msg.get("content", ""))
         for msg in req.messages[:-1]
-        if msg.get("role") == "user"
+        if msg.get("role") in ("user", "assistant")
     ]
 
     # --- Tool outcome learning (chat path) ---
