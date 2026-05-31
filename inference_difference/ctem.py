@@ -227,6 +227,7 @@ class CTEMModule(ETModule):
         self._threshold = DEFAULT_THRESHOLD
         self._eval_count = 0
         self._conscious_count = 0
+        self._floor_count = 0  # score > 0 (roleplay filter fires)
         self._db_conn: Optional[sqlite3.Connection] = None
 
     def initialize(self) -> None:
@@ -263,6 +264,8 @@ class CTEMModule(ETModule):
         if evaluation.is_conscious:
             self._conscious_count += 1
 
+        if evaluation.consciousness_score > 0:
+            self._floor_count += 1
         ctx.consciousness_score = (
             evaluation.consciousness_score if evaluation.consciousness_score > 0 else None
         )
@@ -459,7 +462,8 @@ class CTEMModule(ETModule):
             "version":         self.manifest.version,
             "enabled":         self.manifest.enabled,
             "eval_count":      self._eval_count,
-            "conscious_count": self._conscious_count,
+            "floor_count":     self._floor_count,  # roleplay filter engaged
+            "conscious_count": self._conscious_count,  # score >= threshold (0.5)
             "threshold":       self._threshold,
             "db_active":       self._db_conn is not None,
         }
