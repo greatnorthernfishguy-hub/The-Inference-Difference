@@ -231,6 +231,7 @@ class RoutingEngine:
 
         # Explore-exploit balance (punch list #47)
         self._exploration_rate = self.config.exploration_rate
+        self._exploration_picks = 0
 
         # Performance tracking
         self._decision_history: List[Dict[str, Any]] = []
@@ -342,6 +343,7 @@ class RoutingEngine:
                 scored.remove(chosen)
                 scored.insert(0, chosen)
                 _exploration_pick = True
+                self._exploration_picks += 1
                 logger.info(
                     "Exploration pick (rate=%.3f): %s instead of %s "
                     "(scores: %.3f vs %.3f)",
@@ -624,6 +626,9 @@ class RoutingEngine:
             "model_stats": model_stats,
             "available_models": len(self.config.get_enabled_models()),
             "hardware_gpu": self.hardware.has_gpu,
+            "exploration_rate": round(self._exploration_rate, 4),
+            "exploration_picks": self._exploration_picks,
+            "exploration_pick_rate": round(self._exploration_picks / total, 3) if total > 0 else 0.0,
         }
 
     # -------------------------------------------------------------------
