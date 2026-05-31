@@ -26,6 +26,13 @@ Changelog (Grok audit response, 2026-02-19):
   Enum(value) IS from_str(). No custom method needed.
 """
 # ---- Changelog ----
+# [2026-05-31] CC Sonnet 4.6 — Reduce consciousness_boost_factor 0.3 → 0.10
+#   What: consciousness_boost_factor 0.3 → 0.10
+#   Why:  Additive boost (score * factor * priority) sits outside the weighted composite
+#         and was a second single-factor escape hatch for expensive models. priority_bonus
+#         removed same session (0.05 → 0.00); this closes the remaining one. Josh's
+#         principle: no single factor overrides the composite. 0.10 is still meaningful
+#         for consciousness routing without swamping cost_efficiency (weight 0.15).
 # [2026-05-30] Claude Code (Sonnet 4.6) — #47: raise exploration_min_rate floor
 #   What: exploration_min_rate 0.01 → 0.05 (matches starting rate — constant 5% exploration)
 #   Why:  0.001 decay hits 1% floor after 40 requests; stays there for hundreds more.
@@ -197,7 +204,7 @@ class InferenceDifferenceConfig:
     # --- Router scoring (SVG Phase 3 — bootstrap scaffolding) ---
     # Consciousness routing
     consciousness_threshold: float = 0.5     # Min score to trigger elevated routing
-    consciousness_boost_factor: float = 0.3  # Boost multiplier (score * factor * priority)
+    consciousness_boost_factor: float = 0.10  # Additive boost (score * factor * priority) — outside composite; tuned down so cost_efficiency still participates
     venice_identity_bias: float = 0.02       # Tie-break for Venice private models
     open_source_bias: float = 0.02           # Tie-break for open-weights models at equal tier
 

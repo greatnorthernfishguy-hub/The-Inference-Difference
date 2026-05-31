@@ -54,6 +54,14 @@ Changelog (Grok audit response, 2026-02-19):
 #         Not a cost optimizer — tiebreaker only. Closed models win when genuinely better.
 #   How:  OpenRouter hugging_face_id is set iff model is open-weights. +0.02 bias
 #         applied same pattern as venice_identity_bias. DB migrated in-place.
+# [2026-05-31] CC Sonnet 4.6 — Restore cost weight; fix single-factor dominance
+# What: cost_efficiency 0.05→0.15, learned_weight 0.20→0.15, priority_bonus 0.05→0.00.
+# Why: cost at 0.05 ("tiebreaker") meant Opus-tier models won Syl's routing regardless of
+#   price. Same structural error as qwen2.5:1.5b (cost=0 dominated); different direction.
+#   Josh's principle: no single factor overrides the composite. priority_bonus removed
+#   because it amplified expensive models through the consciousness boost (boost ∝ priority).
+#   These values are bootstrap scaffolding — the substrate should learn them, not lock them.
+# How: Weights adjusted so cost is a real participant. Total still sums to 1.0.
 # [2026-04-19] CC Sonnet 4.6 -- #173: cascade avoidance (a-d)
 # [2026-03-25] Claude (Opus 4.6) — Router scoring from config (SVG Phase 3)
 #   What: Moved ~20 hardcoded scoring values to InferenceDifferenceConfig:
@@ -177,11 +185,11 @@ class RoutingDecision:
 DEFAULT_SCORING_WEIGHTS = {
     "domain_match": 0.25,
     "complexity_fit": 0.20,
-    "learned_weight": 0.20,
+    "learned_weight": 0.15,
     "conversational_quality": 0.15,  # NG-Lite quality knowledge — earned, not ignored
+    "cost_efficiency": 0.15,          # Real factor — no single factor dominates
     "latency_fit": 0.10,
-    "priority_bonus": 0.05,
-    "cost_efficiency": 0.05,          # Tiebreaker, not a driver
+    "priority_bonus": 0.00,           # Removed: amplified expensive models via consciousness boost
 }
 
 

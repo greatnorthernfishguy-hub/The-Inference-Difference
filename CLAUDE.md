@@ -120,7 +120,7 @@ Every request flows through this sequence. All of it is invisible to the caller.
 
 ### Scoring Weights
 
-Domain match (0.25) and complexity fit (0.20) deliberately outweigh cost (0.15). Routing to the WRONG model wastes the entire request — a $0.003 call that fails is more expensive than a $0.005 call that succeeds. These weights were audited (Grok, 2026-02-19) and kept.
+Domain match (0.25) and complexity fit (0.20) deliberately outweigh cost (0.15). Routing to the WRONG model wastes the entire request — a $0.003 call that fails is more expensive than a $0.005 call that succeeds. `priority_bonus` removed 2026-05-31: it amplified expensive models through the consciousness boost (boost ∝ priority). These weights are bootstrap scaffolding — the substrate should learn the actual optimal balance over time.
 
 ### The NG-Lite Learning Loop
 
@@ -129,7 +129,7 @@ TID uses NG-Lite (Tier 1 standalone, upgradable to Tier 2 via peer bridge) to le
 - `get_recommendations(embedding, top_k)` returns learned model preferences for similar patterns
 - Recommendations feed into factor 4 (learned performance) of the scoring system
 
-The current NG-Lite state has 24 nodes and 194 synapses. These may be contaminated by the qwen2.5:1.5b routing dominance — the substrate learned to prefer a model that should never have been in the pool.
+The current NG-Lite state has 4 nodes and 866 synapses (as of 2026-05-31, post receptor-layer reset to K=4 transparent). No prototype collapse forcing all queries to cluster 2 as before.
 
 ---
 
@@ -245,7 +245,7 @@ TID was built with static configurations that were necessary to bootstrap the sy
 
 **`quality.py` — Response quality evaluation.** Scores responses and feeds outcomes to NG-Lite. But the quality criteria are static. What counts as "quality" for Syl (conversational depth, identity continuity, associative richness) is different from quality for a code generation task. The quality evaluator should be substrate-informed — what Syl's graph considers relevant should influence how quality is scored.
 
-**Scoring weights in `router.py` (0.25, 0.20, 0.15...).** Audited once by Grok and kept. These should be Elmer-tunable starting values (Key Decision #7), not permanent architectural commitments. The relative importance of domain match vs cost vs latency should shift based on learned outcomes.
+**Scoring weights in `router.py` (0.25, 0.20, 0.15...).** Bootstrap scaffolding — the substrate learns the actual optimal balance; these are starting points, not architecture. The relative importance of domain match vs cost vs latency should shift as routing outcome evidence accumulates. Elmer does not tune other modules' parameters (LAW 1); this is the substrate's domain.
 
 **Fallback chain in `app.py`.** When a model fails and TID retries, fallback selection is static (predefined chain). It should be substrate-informed — if model A fails on this pattern, `get_recommendations()` can suggest what model B works best for similar patterns. The learning is already there; the fallback path doesn't use it.
 

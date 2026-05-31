@@ -61,6 +61,14 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-05-31] CC Sonnet 4.6 — Provider circuit breaker for fallback cascade
+#   What: _provider_key() module-level helper + per-request _failed_providers set
+#         in both non-streaming (fallback loop) and streaming (_generate()) paths.
+#         Arms after 2 failures from same provider key (openrouter/anthropic, venice…).
+#   Why:  Venice out of credits → 429 × N failures. 50+ fallback models all hit the
+#         same dead provider, hammering substrate with failure signals and blocking
+#         real fallbacks. 2-segment key prevents one bad OpenRouter sub-provider
+#         from tripping all of OpenRouter.
 # [2026-05-30] Claude Code (Sonnet 4.6) — periodic NG-Lite state save (#264)
 #   What: _ng_save_loop() background task saves ng_ecosystem every 10 min.
 #   Why:  Save only happened on clean shutdown — SIGKILL lost all in-session
@@ -1190,12 +1198,19 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     # not just which model eventually succeeded. (#19)
     _cascade_start_ms = time.monotonic() * 1000  # cascade wall-time (#173c)
     tried_models = [selected_model]
+    _failed_providers: set = set()
+    _prov_fail_n: dict = {}
     for fallback_id in fallback_chain:
         if model_response.success:
             break
 
         if _state.model_client and _state.model_client.is_rate_limited_by_id(fallback_id):
             logger.info("Fallback %s rate-limited -- skipping", fallback_id)
+            continue
+
+        _next_pkey = _provider_key(fallback_id)
+        if _next_pkey in _failed_providers:
+            logger.info("Provider circuit open (%s) — skipping %s", _next_pkey, fallback_id)
             continue
 
         # Record the failure BEFORE moving on (#19 — retry chain experience)
@@ -1212,6 +1227,12 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
                     "error": str(model_response.error)[:200],
                 },
             )
+
+        _failed_pkey = _provider_key(tried_models[-1])
+        _prov_fail_n[_failed_pkey] = _prov_fail_n.get(_failed_pkey, 0) + 1
+        if _prov_fail_n[_failed_pkey] >= 2:
+            _failed_providers.add(_failed_pkey)
+            logger.warning("Provider circuit armed: %s (2+ failures)", _failed_pkey)
 
         # If the model rejected tools, retry without them — better a
         # text-only response than total silence.
@@ -1372,6 +1393,23 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     return JSONResponse(content=response_dict)
 
 
+def _provider_key(model_id: str) -> str:
+    """Two-segment circuit-breaker key for the fallback cascade.
+
+    openrouter/anthropic/claude-opus-4 → "openrouter/anthropic"
+    venice/deepseek-v3.2               → "venice"
+    ollama/llama3.2:3b                 → "ollama"
+
+    Prevents one failing sub-provider (Venice out of credits, OpenRouter Anthropic
+    billing cap) from hammering the substrate with 50+ failure signals as the full
+    fallback chain exhausts every model on that provider.
+    """
+    parts = model_id.split('/')
+    if len(parts) >= 3 and parts[0] == 'openrouter':
+        return f'{parts[0]}/{parts[1]}'
+    return parts[0]
+
+
 def _stream_response(
     req: ChatCompletionRequest,
     selected_model: str,
@@ -1397,8 +1435,15 @@ def _stream_response(
         succeeded = False
         final_result = None
         winning_model = None
+        _failed_providers: set = set()
+        _prov_fail_n: dict = {}
 
         for i, model_id in enumerate(models_to_try):
+            _pkey = _provider_key(model_id)
+            if _pkey in _failed_providers:
+                logger.info("Provider circuit open (%s) — skipping %s", _pkey, model_id)
+                continue
+
             chunk_iter, stream_result = _state.model_client.call_stream(
                 model_id=model_id,
                 messages=req.messages,
@@ -1454,6 +1499,10 @@ def _stream_response(
                         decision, model_id, stream_result,
                         classification, False,
                     )
+                _prov_fail_n[_pkey] = _prov_fail_n.get(_pkey, 0) + 1
+                if _prov_fail_n[_pkey] >= 2:
+                    _failed_providers.add(_pkey)
+                    logger.warning("Provider circuit armed: %s (2+ stream failures)", _pkey)
 
         if not succeeded:
             # ALL models failed — yield error to client
