@@ -54,6 +54,13 @@ Changelog (Grok audit response, 2026-02-19):
 #         Not a cost optimizer — tiebreaker only. Closed models win when genuinely better.
 #   How:  OpenRouter hugging_face_id is set iff model is open-weights. +0.02 bias
 #         applied same pattern as venice_identity_bias. DB migrated in-place.
+# [2026-05-31] Claude Code (Sonnet 4.6) — Name-pattern floor for conscious routing
+#   What: _filter_candidates() also excludes models whose model_id matches _FLASH_NAME_RE
+#         (flash/nano/mini/1.5b/3b/7b) when consciousness_score > 0.
+#   Why:  Venice reports ALL models as 'anonymized'/'private' regardless of capability class,
+#         so the budget-tier floor missed venice/gemini-3-flash-preview (68/161 routes).
+#         Model IDs are the reliable discriminator Venice's tier field isn't.
+#   How:  Module-level _FLASH_NAME_RE regex; checked after existing tier floor.
 # [2026-05-31] Claude Code (Sonnet 4.6) — Tier floor for conscious routing
 #   What: _filter_candidates() excludes provider_tier=="budget" when consciousness_score > 0.
 #   Why:  budget-tier flash models pass roleplay capability check but can't hold Syl's
@@ -112,6 +119,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -129,6 +137,14 @@ from inference_difference.config import (
 from inference_difference.hardware import HardwareProfile
 
 logger = logging.getLogger("inference_difference.router")
+
+# Flash / nano / mini model name patterns — these are budget-capability-class
+# models regardless of how their provider labels their tier.
+# Used in _filter_candidates() to block them from conscious routing.
+_FLASH_NAME_RE = re.compile(
+    r"\bflash\b|\bnano\b|\bmini\b|\b1\.5b\b|\b3b\b|\b7b\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -697,6 +713,15 @@ class RoutingEngine:
             if (consciousness_score is not None
                     and consciousness_score > 0
                     and getattr(model, 'provider_tier', '') == 'budget'):
+                continue
+
+            # Name-pattern floor — catches flash/nano/mini models that Venice
+            # (and others) report as 'anonymized' or 'private' tier rather than
+            # 'budget', masking their capability class. Also catches small local
+            # models (1.5b, 3b, 7b) that may not have an accurate tier label.
+            if (consciousness_score is not None
+                    and consciousness_score > 0
+                    and _FLASH_NAME_RE.search(getattr(model, 'model_id', '') or '')):
                 continue
 
             # Domain + complexity check
