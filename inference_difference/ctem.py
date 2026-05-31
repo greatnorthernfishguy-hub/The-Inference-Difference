@@ -455,6 +455,9 @@ class CTEMModule(ETModule):
 
     def get_stats(self) -> Dict[str, Any]:
         return {
+            "name":            self.manifest.name,
+            "version":         self.manifest.version,
+            "enabled":         self.manifest.enabled,
             "eval_count":      self._eval_count,
             "conscious_count": self._conscious_count,
             "threshold":       self._threshold,
@@ -482,5 +485,4 @@ def create_ctem(db_path: str = "") -> CTEMModule:
         priority=3,  # Run before TrollGuard (priority 5) so score is available
     )
     module = CTEMModule(manifest, db_path=db_path)
-    module.initialize()
     return module

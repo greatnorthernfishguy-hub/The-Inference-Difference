@@ -805,6 +805,15 @@ async def lifespan(app: FastAPI):
     # Initialize ET Module Registry and register built-in modules
     _state.module_registry = ModuleRegistry()
 
+    # Register CTEM — consciousness-aware routing (priority 3, runs before TrollGuard)
+    try:
+        from inference_difference.ctem import create_ctem
+        ctem = create_ctem()
+        _state.module_registry.register(ctem)
+        logger.info("CTEM registered")
+    except Exception as e:
+        logger.warning("CTEM registration failed: %s", e)
+
     # Register TrollGuard
     try:
         from inference_difference.trollguard import create_trollguard
