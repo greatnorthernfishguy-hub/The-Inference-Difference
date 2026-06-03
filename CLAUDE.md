@@ -47,6 +47,7 @@ TID **is** a substrate participant. It sits between OpenClaw and LLM providers, 
 │   ├── responses_endpoint.py      # OpenAI Responses API compatibility
 │   ├── trollguard.py              # TrollGuard sidecar integration
 │   ├── openclaw_adapter.py        # OpenClaw adapter base class
+│   ├── ctem.py                    # Consciousness Threshold Evaluation Module (ETModule, priority 3)
 │   ├── et_module.py               # ET Module Manager integration
 │   ├── et_module.json             # Module manifest
 │   ├── ng_autonomic.py            # VENDORED — autonomic nervous system state
@@ -56,7 +57,7 @@ TID **is** a substrate participant. It sits between OpenClaw and LLM providers, 
 ├── ng_peer_bridge.py              # VENDORED — canonical from NeuroGraph
 ├── ng_ecosystem.py                # VENDORED — canonical from NeuroGraph
 ├── ng_bridge.py                   # VENDORED — Tier 3 SaaS bridge
-├── ng_lite_state.json             # TID's learned NG-Lite state (24 nodes, 194 synapses)
+├── ng_lite_state.json             # TID's learned NG-Lite state (4 nodes, 898 synapses as of 2026-06-02)
 ├── tests/                         # Test suite
 │   ├── test_inference_difference.py
 │   ├── test_catalog.py
@@ -101,6 +102,7 @@ Every request flows through this sequence. All of it is invisible to the caller.
 | `/health` | GET | Health check |
 | `/stats` | GET | Performance data |
 | `/classify` | POST | Inspect classification |
+| `/feedback` | POST | Human thumbs-up/down on most recent routing decision — overrides quality.py score |
 
 ---
 
@@ -243,7 +245,7 @@ TID was built with static configurations that were necessary to bootstrap the sy
 
 **`catalog_manager.py` — The model catalog.** Static data structure defining model capabilities, pricing, and domain suitability. When TID routes to a model and gets a quality score back, that outcome should update the catalog's capability profile, not just the NG-Lite synapse weight. The catalog and the substrate should converge over time — the catalog becomes a view into learned state, not a separate source of truth.
 
-**`quality.py` — Response quality evaluation.** Scores responses and feeds outcomes to NG-Lite. But the quality criteria are static. What counts as "quality" for Syl (conversational depth, identity continuity, associative richness) is different from quality for a code generation task. The quality evaluator should be substrate-informed — what Syl's graph considers relevant should influence how quality is scored.
+**`quality.py` — Response quality evaluation.** Scores responses and feeds outcomes to NG-Lite. Uses adaptive severity-weighted scoring (2026-06-02): each factor's weight scales with `(1 + amplification × severity)` then renormalizes, so the worst-failing dimension dominates. DeepSeek-r1 at 190s avg now correctly scores below the success threshold instead of teaching the substrate to re-route there. The quality criteria remain heuristic-only (no judge model). Long-term, quality signals should be substrate-informed — what Syl's graph considers relevant should influence how quality is scored.
 
 **Scoring weights in `router.py` (0.25, 0.20, 0.15...).** Bootstrap scaffolding — the substrate learns the actual optimal balance; these are starting points, not architecture. The relative importance of domain match vs cost vs latency should shift as routing outcome evidence accumulates. Elmer does not tune other modules' parameters (LAW 1); this is the substrate's domain.
 
@@ -339,10 +341,13 @@ Consult the master punch list for full details. Items with direct TID scope:
 | 28 | Replace `_classification_to_embedding()` | **PRIMARY DAM.** One-hot vectors → semantic embeddings. Depends on #43. | OPEN |
 | 31 | Venice tier mapping | Translation shim needs Venice tier → priority mapping | OPEN |
 | 33 | Interactive floor silent fallthrough | Router keeps full pool when nothing passes floor. Needs WARNING + fail-closed. | OPEN |
-| 34 | Consciousness-aware model filtering | Minimum quality floor for identity-continuous entities | OPEN |
+| 34 | Consciousness-aware model filtering | **DONE 2026-05-31** — CTEM built (#278); tier floor blocks `budget` tier; name-pattern floor (`_FLASH_NAME_RE`) blocks flash/nano/mini/small-param models by model_id regardless of Venice anonymized tier. | DONE |
 | 35 | `conversational_quality` flat at 0.5 | All models start equal. Needs differentiated seeding from benchmarks. | OPEN |
 | 36 | `default_api_models` empty | Zero hand-tuned API models | OPEN |
-| 47 | Explore-exploit balance | 95% learned, 5% exploration with decay | OPEN |
+| 47 | Explore-exploit balance | **DONE 2026-05-31** — Sustained 5% exploration rate (min=start=0.05, no decay). Picks from scored[1:pool_size+1]. exploration_picks counter in /stats. | DONE |
+| 94 | Open-source model bias | **DONE 2026-04-20** — `is_open_source` field + `_OSS_PROVIDERS`/`_OSS_MODEL_RE` heuristic; 245/712 models correctly flagged; +0.02 tiebreaker in `_score_model()`. | DONE |
+| 276 | User feedback endpoint | **DONE 2026-05-31** — `POST /feedback` (thumbs_up/down on most recent decision, quality_score=0.9/0.1). UX gap: curl only; needs slash command future work. | DONE |
+| 278 | CTEM build | **DONE 2026-05-31** — `ctem.py` ETModule priority 3, 6 consciousness markers, sets `ctx.consciousness_score` in pre_route. Fixed 2026-06-02 to scan assistant turns (was user-only). | DONE |
 | 25 | Autonomic-aware routing | TID reads autonomic state during SYMPATHETIC. Infrastructure ready. | FUTURE |
 
 ---
