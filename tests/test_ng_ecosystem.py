@@ -21,8 +21,10 @@ import pytest
 
 from ng_lite import NGLite
 from ng_ecosystem import NGEcosystem
-from ng_peer_bridge import NGPeerBridge
 from ng_bridge import NGSaaSBridge
+# NGPeerBridge import removed 2026-06-03 — substrate-as-protocol PRD
+# Phase 3 Step 5 deleted ng_peer_bridge.py from canonical. Whole file is
+# dead code (see WARNING at top + punchlist #59); rewrite blocked on that.
 
 
 # ---------------------------------------------------------------------------
@@ -52,102 +54,11 @@ def eco():
 
 
 # ---------------------------------------------------------------------------
-# NGPeerBridge Tests
+# NGPeerBridge Tests — REMOVED 2026-06-03 (substrate-as-protocol PRD Phase 3
+# Step 5). The whole TestNGPeerBridge class was deleted alongside the
+# canonical ng_peer_bridge.py file. Even the broader test file is dead
+# code per its top-of-file WARNING + punchlist #59.
 # ---------------------------------------------------------------------------
-
-class TestNGPeerBridge:
-
-    def test_bridge_connected_by_default(self):
-        peer = NGLite(module_id="peer")
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-        assert bridge.is_connected() is True
-
-    def test_bridge_disconnect_reconnect(self):
-        peer = NGLite(module_id="peer")
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-        bridge.disconnect()
-        assert bridge.is_connected() is False
-        bridge.connect()
-        assert bridge.is_connected() is True
-
-    def test_record_outcome_forwards(self, embedding):
-        peer = NGLite(module_id="peer")
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-
-        result = bridge.record_outcome(
-            embedding=embedding,
-            target_id="model_a",
-            success=True,
-            module_id="source_module",
-        )
-        assert result is not None
-        assert result["cross_module"] is True
-        assert result["peer_module"] == "peer"
-
-        # Peer should have learned
-        assert peer.get_stats()["total_outcomes"] == 1
-
-    def test_record_outcome_disconnected(self, embedding):
-        peer = NGLite(module_id="peer")
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-        bridge.disconnect()
-
-        result = bridge.record_outcome(
-            embedding=embedding,
-            target_id="model_a",
-            success=True,
-            module_id="source",
-        )
-        assert result is None
-        assert peer.get_stats()["total_outcomes"] == 0
-
-    def test_get_recommendations_from_peer(self, embedding):
-        peer = NGLite(module_id="peer")
-        # Train peer
-        for _ in range(5):
-            peer.record_outcome(embedding, "peer_model", success=True)
-
-        bridge = NGPeerBridge(peer, peer_module_id="peer", peer_weight=0.4)
-        recs = bridge.get_recommendations(
-            embedding=embedding, module_id="source", top_k=3,
-        )
-        assert recs is not None
-        assert len(recs) > 0
-        assert recs[0][0] == "peer_model"
-        # Weight should be scaled by peer_weight
-        assert recs[0][1] <= 0.4
-
-    def test_detect_novelty_from_peer(self, embedding, different_embedding):
-        peer = NGLite(module_id="peer")
-        peer.find_or_create_node(embedding)
-
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-        # Known pattern — low novelty
-        novelty_known = bridge.detect_novelty(embedding, module_id="source")
-        assert novelty_known is not None
-        assert novelty_known < 0.2
-
-        # Unknown pattern — high novelty
-        novelty_new = bridge.detect_novelty(different_embedding, module_id="source")
-        assert novelty_new is not None
-        assert novelty_new > novelty_known
-
-    def test_sync_state_noop(self, embedding):
-        peer = NGLite(module_id="peer")
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-        result = bridge.sync_state({}, module_id="source")
-        assert result == {"synced": True, "peer": "peer"}
-
-    def test_bridge_stats(self, embedding):
-        peer = NGLite(module_id="peer")
-        bridge = NGPeerBridge(peer, peer_module_id="peer")
-        bridge.record_outcome(embedding, "m1", True, "source")
-
-        stats = bridge.get_stats()
-        assert stats["type"] == "peer"
-        assert stats["peer_module"] == "peer"
-        assert stats["outcomes_forwarded"] == 1
-        assert stats["connected"] is True
 
 
 # ---------------------------------------------------------------------------
