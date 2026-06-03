@@ -27,6 +27,16 @@ Changelog (Grok audit response, 2026-02-19):
 - KEPT: Weighted scoring (audit: "avg — weighted by importance?"). The code
   already uses QUALITY_WEIGHTS for weighted scoring. The audit misread the
   implementation — it's not a simple average.
+
+# [2026-06-02] Claude Code (Sonnet 4.6) — Adaptive severity-weighted scoring
+#   What: Fixed-weight composite replaced with adaptive weights that scale by
+#         (1 + amplification * severity) per factor, then renormalize.
+#   Why:  latency weight 0.10 was too weak for catastrophic failures. DeepSeek-r1
+#         at 190s avg scored 0.807 (success) — substrate learned to re-route there.
+#         Adaptive weights make the worst-failing dimension dominate the composite.
+#         amplification=4.0: 190s latency fails (0.696); 10s still passes (0.792).
+#   How:  raw_weight = base * (1 + amp * (1 - score)); renormalize to sum=1.
+#         quality_severity_amplification is configurable in config.py (LAW 5).
 """
 
 from __future__ import annotations
@@ -182,11 +192,22 @@ def evaluate_quality(
         "latency": latency,
     }
 
+    # --- Adaptive weighted scoring ---
+    # effective_weight = base_weight * (1 + amplification * severity)
+    # severity = 1 - score. Worst-failing dimension steals weight from others.
     weights = quality_weights or DEFAULT_QUALITY_WEIGHTS
-    overall = sum(
-        evaluation.breakdown[k] * weights[k]
-        for k in weights
+    amplification = (
+        getattr(config, 'quality_severity_amplification', 4.0)
+        if config else 4.0
     )
+    scores = evaluation.breakdown
+    raw_weights = {
+        k: weights[k] * (1.0 + amplification * (1.0 - scores[k]))
+        for k in weights
+    }
+    total_w = sum(raw_weights.values())
+    adaptive_weights = {k: v / total_w for k, v in raw_weights.items()}
+    overall = sum(scores[k] * adaptive_weights[k] for k in weights)
     evaluation.overall_score = overall
     evaluation.is_success = overall >= quality_threshold
     evaluation.issues = issues

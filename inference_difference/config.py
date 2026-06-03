@@ -207,6 +207,7 @@ class InferenceDifferenceConfig:
     consciousness_boost_factor: float = 0.10  # Additive boost (score * factor * priority) — outside composite; tuned down so cost_efficiency still participates
     venice_identity_bias: float = 0.02       # Tie-break for Venice private models
     open_source_bias: float = 0.02           # Tie-break for open-weights models at equal tier
+    quality_severity_amplification: float = 4.0  # Adaptive quality weight scaling — worst metric dominates (LAW 5: tune via config, not hardcoded)
 
     # Domain match scores (exact, secondary, general, none)
     domain_score_exact: float = 1.0
