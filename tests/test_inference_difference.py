@@ -1194,3 +1194,52 @@ class TestExploreExploit:
         assert stats["total_requests"] == 1
         assert stats["success_rate"] == 1.0
         assert ng.get_stats()["total_outcomes"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Complexity config corrections (#282)
+# ---------------------------------------------------------------------------
+
+class TestComplexityConfig:
+    """Verify corrected config defaults from the routing realignment spec."""
+
+    def test_standard_tier_complexity_ceiling(self):
+        """Standard tier should map to HIGH (0.75), not MEDIUM (0.5)."""
+        config = InferenceDifferenceConfig()
+        assert config.tier_complexity_standard == 0.75
+
+    def test_complexity_words_high_threshold(self):
+        """500-word threshold for HIGH — 300 misclassified normal conversation as EXTREME."""
+        config = InferenceDifferenceConfig()
+        assert config.complexity_words_high == 500
+
+    def test_venice_identity_bias_zero(self):
+        """No thumb on the scale for Venice — bias should be 0.0."""
+        config = InferenceDifferenceConfig()
+        assert config.venice_identity_bias == 0.0
+
+    def test_venice_failover_priority(self):
+        """All Venice static entries must be priority=3 (failover only)."""
+        models = default_api_models()
+        for mid in [
+            "venice/deepseek-v3.2",
+            "venice/venice-uncensored",
+            "venice/grok-4-20-multi-agent-beta",
+        ]:
+            assert models[mid].priority == 3, (
+                f"{mid}: expected priority=3, got {models[mid].priority}"
+            )
+
+    def test_standard_tier_model_handles_high_complexity(self):
+        """A model with max_complexity=HIGH (what 0.75 maps to) passes can_handle for HIGH."""
+        model = ModelEntry(
+            model_id="test/standard-capable",
+            model_type=ModelType.API,
+            domains={TaskDomain.GENERAL},
+            max_complexity=ComplexityTier.HIGH,
+            context_window=8192,
+            cost_per_1k_tokens=0.001,
+            avg_latency_ms=2000,
+        )
+        assert model.can_handle(TaskDomain.GENERAL, ComplexityTier.HIGH)
+        assert not model.can_handle(TaskDomain.GENERAL, ComplexityTier.EXTREME)
