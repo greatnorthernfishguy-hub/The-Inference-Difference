@@ -13,6 +13,14 @@ Changelog (Grok audit response, 2026-02-19):
 - ADDED: Negative latency edge case test (audit: "zero latency=1.0").
 
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: Routing realignment tests
+# What: New TestComplexityConfig class — 5 tests covering tier_complexity_standard,
+#   complexity_words_high, venice_identity_bias, Venice failover priority, and
+#   can_handle behavior at HIGH complexity.
+# Why: Spec requires test coverage for all four config value changes (#282).
+# How: Config instantiated fresh per test. default_api_models() called directly
+#   for Venice priority assertions. ModelEntry constructed inline for can_handle.
+# -------------------
 # [2026-03-18] Claude (CC) — Added explore-exploit balance tests
 # What: New TestExploreExploit class covering exploration picks,
 #   decay behavior, config defaults, serialization, and statistical
