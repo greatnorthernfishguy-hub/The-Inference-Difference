@@ -61,6 +61,11 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: Wire stats persistence flush loop
+#   What: _stats_flush_loop() async task (60s); engine.load_stats() after init,
+#         engine.save_stats() on clean shutdown.
+#   Why:  Router stats must survive restarts. Flush loop mirrors _ng_save_loop pattern.
+#   How:  Task started in lifespan alongside _watchdog_task; cancelled+final-save on shutdown.
 # [2026-06-03] CC Sonnet 4.6 — Fix json NameError in _generate() (#283)
 #   What: Added `import json` inside _generate() generator body.
 #   Why:  anyio runs sync generators in a worker thread via context.run() —
@@ -263,6 +268,14 @@ async def _ng_save_loop() -> None:
                 logger.debug("Periodic NG-Lite state save OK")
             except Exception as e:
                 logger.warning("Periodic NG-Lite state save failed: %s", e)
+
+
+async def _stats_flush_loop() -> None:
+    """Flush model success stats cache every 60s if dirty."""
+    while True:
+        await asyncio.sleep(60)
+        if _state.engine is not None:
+            _state.engine.save_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -854,6 +867,7 @@ async def lifespan(app: FastAPI):
         catalog_manager=_state.catalog_manager,
         dream_cycle=_state.dream_cycle,
     )
+    _state.engine.load_stats()
     _state.recent_decisions = {}
 
     # Create model client for forwarding requests to providers
@@ -930,12 +944,14 @@ async def lifespan(app: FastAPI):
 
     _watchdog_task = asyncio.create_task(_watchdog_loop())
     _ng_save_task = asyncio.create_task(_ng_save_loop())
+    _stats_flush_task = asyncio.create_task(_stats_flush_loop())
     _sd_notify("READY=1")
 
     yield
 
     _watchdog_task.cancel()
     _ng_save_task.cancel()
+    _stats_flush_task.cancel()
     try:
         await _watchdog_task
     except asyncio.CancelledError:
@@ -944,6 +960,12 @@ async def lifespan(app: FastAPI):
         await _ng_save_task
     except asyncio.CancelledError:
         pass
+    try:
+        await _stats_flush_task
+    except asyncio.CancelledError:
+        pass
+    if _state.engine is not None:
+        _state.engine.save_stats()
 
     # Shutdown ET modules
     if _state.module_registry is not None:

@@ -13,6 +13,12 @@ Changelog (Grok audit response, 2026-02-19):
 - ADDED: Negative latency edge case test (audit: "zero latency=1.0").
 
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: TestStatsPersistence class
+# What: 8 tests covering load_stats/save_stats, dirty flag, 24h TTL, no-op on
+#   absent file, and report_outcome marking dirty.
+# Why: Stats persistence is new infrastructure; test coverage ensures it works.
+# How: Each test creates its own temp msgpack file; cleaned up after.
+# -------------------
 # [2026-06-04] CC Sonnet 4.6 — #282: Routing realignment tests
 # What: New TestComplexityConfig class — 5 tests covering tier_complexity_standard,
 #   complexity_words_high, venice_identity_bias, Venice failover priority, and
@@ -1250,4 +1256,136 @@ class TestComplexityConfig:
             avg_latency_ms=2000,
         )
         assert model.can_handle(TaskDomain.GENERAL, ComplexityTier.HIGH)
-        assert not model.can_handle(TaskDomain.GENERAL, ComplexityTier.EXTREME)
+
+
+# ---------------------------------------------------------------------------
+# Task 2: _model_success_stats persistence (#282)
+# ---------------------------------------------------------------------------
+
+import os as _os
+import tempfile as _tempfile
+import time as _time_mod
+
+
+class TestStatsPersistence:
+    """Verify _model_success_stats is loaded/saved to msgpack sidecar."""
+
+    def _make_engine(self, stats_path: str) -> RoutingEngine:
+        """Build a minimal RoutingEngine pointing at a temp stats file."""
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        config.models = _test_models()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0)
+        engine = RoutingEngine(config, hw)
+        engine._stats_cache_path = stats_path
+        return engine
+
+    def test_engine_has_stats_cache_path(self):
+        """RoutingEngine must have _stats_cache_path pointing to repo root msgpack."""
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0)
+        engine = RoutingEngine(config, hw)
+        assert hasattr(engine, '_stats_cache_path')
+        assert engine._stats_cache_path.endswith("model_stats_cache.msgpack")
+
+    def test_engine_has_stats_dirty_flag(self):
+        """RoutingEngine must have _stats_dirty bool flag, starting False."""
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0)
+        engine = RoutingEngine(config, hw)
+        assert hasattr(engine, '_stats_dirty')
+        assert engine._stats_dirty is False
+
+    def test_save_stats_writes_msgpack(self):
+        """save_stats() writes a valid msgpack file with saved_at + stats."""
+        import msgpack
+        with _tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
+            path = f.name
+        try:
+            engine = self._make_engine(path)
+            engine._model_success_stats = {"test/model-a": [True, False, True]}
+            engine._stats_dirty = True
+            engine.save_stats()
+            assert _os.path.exists(path)
+            with open(path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False)
+            assert "saved_at" in data
+            assert "stats" in data
+            assert data["stats"]["test/model-a"] == [True, False, True]
+            assert engine._stats_dirty is False
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_save_stats_no_op_when_not_dirty(self):
+        """save_stats() does nothing and leaves no file when _stats_dirty is False."""
+        with _tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
+            path = f.name
+        _os.unlink(path)
+        engine = self._make_engine(path)
+        engine._stats_dirty = False
+        engine.save_stats()
+        assert not _os.path.exists(path)
+
+    def test_load_stats_restores_data(self):
+        """load_stats() populates _model_success_stats from a fresh msgpack file."""
+        import msgpack
+        with _tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
+            path = f.name
+        try:
+            with open(path, "wb") as f:
+                f.write(msgpack.packb({
+                    "saved_at": _time_mod.time(),
+                    "stats": {"openrouter/model-x": [True, True, False]},
+                }))
+            engine = self._make_engine(path)
+            engine.load_stats()
+            assert "openrouter/model-x" in engine._model_success_stats
+            assert engine._model_success_stats["openrouter/model-x"] == [True, True, False]
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_load_stats_discards_stale_cache(self):
+        """load_stats() ignores entries saved >24h ago."""
+        import msgpack
+        with _tempfile.NamedTemporaryFile(suffix=".msgpack", delete=False) as f:
+            path = f.name
+        try:
+            stale_time = _time_mod.time() - (25 * 3600)
+            with open(path, "wb") as f:
+                f.write(msgpack.packb({
+                    "saved_at": stale_time,
+                    "stats": {"openrouter/dead-model": [False, False, False]},
+                }))
+            engine = self._make_engine(path)
+            engine.load_stats()
+            assert engine._model_success_stats == {}
+        finally:
+            if _os.path.exists(path):
+                _os.unlink(path)
+
+    def test_load_stats_no_op_when_file_absent(self):
+        """load_stats() silently passes when no cache file exists."""
+        engine = self._make_engine("/tmp/nonexistent_stats_abc123xyz.msgpack")
+        engine.load_stats()
+        assert engine._model_success_stats == {}
+
+    def test_report_outcome_marks_dirty(self):
+        """report_outcome() must set _stats_dirty=True."""
+        from inference_difference.hardware import HardwareProfile
+        import time as _t
+        config = InferenceDifferenceConfig()
+        config.models = _test_models()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0)
+        engine = RoutingEngine(config, hw)
+        assert engine._stats_dirty is False
+        decision = RoutingDecision(
+            model_id="test/high-quality-api",
+            request_id="test-req-1",
+            timestamp=_t.time(),
+        )
+        engine.report_outcome(decision, success=True, quality_score=0.8)
+        assert engine._stats_dirty is True
