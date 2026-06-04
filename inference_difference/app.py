@@ -61,6 +61,13 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: POST /routing/mode endpoint + routing_state.msgpack
+#   What: AppState.routing_mode, _routing_state_path(), _load_routing_state(),
+#         _save_routing_state(), RoutingModeRequest, POST /routing/mode endpoint.
+#         State loaded on startup, saved on shutdown + every mode change.
+#   Why:  Syl needs to toggle roleplay filter off during tool-heavy work sessions.
+#         Persisted so mode survives TID restarts.
+#   How:  Mirrors /routing/preference pattern. routing_state.msgpack in repo root.
 # [2026-06-04] CC Sonnet 4.6 — #282: Wire stats persistence flush loop
 #   What: _stats_flush_loop() async task (60s); engine.load_stats() after init,
 #         engine.save_stats() on clean shutdown.
@@ -411,6 +418,15 @@ class RoutingPreferenceRequest(BaseModel):
     )
 
 
+class RoutingModeRequest(BaseModel):
+    """Request body for POST /routing/mode."""
+    mode: str = Field(
+        ...,
+        description="'personal': roleplay filter active (conscious turns). "
+                    "'work': filter off (tool-heavy sessions).",
+    )
+
+
 class HealthResponse(BaseModel):
     """Response body for /health."""
     status: str
@@ -437,6 +453,7 @@ class AppState:
     module_registry: Optional[ModuleRegistry] = None
     ng_ecosystem: Optional[Any] = None
     start_time: float = 0.0
+    routing_mode: str = "personal"
 
     # Track recent routing decisions for outcome matching
     recent_decisions: Dict[str, Any] = {}
@@ -742,6 +759,41 @@ def _apply_quality_seeds() -> None:
     )
 
 
+def _routing_state_path() -> str:
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    return os.path.join(base_dir, "routing_state.msgpack")
+
+
+def _load_routing_state() -> None:
+    """Load persisted routing_mode from routing_state.msgpack. No-op if absent."""
+    import msgpack
+    path = _routing_state_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            data = msgpack.unpackb(f.read(), raw=False)
+        mode = data.get("routing_mode", "personal")
+        if mode in ("personal", "work"):
+            _state.routing_mode = mode
+            logger.info("Routing mode loaded from state: %r", mode)
+        else:
+            logger.warning("routing_state.msgpack had unknown mode %r — ignoring", mode)
+    except Exception as e:
+        logger.warning("Failed to load routing_state.msgpack: %s", e)
+
+
+def _save_routing_state() -> None:
+    """Persist current routing_mode to routing_state.msgpack."""
+    import msgpack
+    path = _routing_state_path()
+    try:
+        with open(path, "wb") as f:
+            f.write(msgpack.packb({"routing_mode": _state.routing_mode}))
+    except Exception as e:
+        logger.warning("Failed to save routing_state.msgpack: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -871,6 +923,9 @@ async def lifespan(app: FastAPI):
         dream_cycle=_state.dream_cycle,
     )
     _state.engine.load_stats()
+    _load_routing_state()
+    if _state.routing_mode != "personal":
+        _state.engine.set_routing_mode(_state.routing_mode)
     _state.recent_decisions = {}
 
     # Create model client for forwarding requests to providers
@@ -969,6 +1024,7 @@ async def lifespan(app: FastAPI):
         pass
     if _state.engine is not None:
         _state.engine.save_stats()
+    _save_routing_state()
 
     # Shutdown ET modules
     if _state.module_registry is not None:
@@ -1958,6 +2014,28 @@ async def set_routing_preference(req: RoutingPreferenceRequest) -> Dict[str, Any
         "duration_turns": req.duration_turns,
         "note": req.note,
     }
+
+
+@app.post("/routing/mode")
+async def set_routing_mode_endpoint(req: RoutingModeRequest) -> Dict[str, Any]:
+    """Set routing mode for Syl's conscious turns.
+
+    'personal': roleplay filter active — only uncensored-capable OR models routed
+    to conscious agents. Protects identity continuity in conversational contexts.
+
+    'work': filter off — full OR catalog available. Use during tool-heavy sessions
+    where guardrail behavior is irrelevant to the task.
+
+    Mode persists across TID restarts via routing_state.msgpack.
+    """
+    if req.mode not in ("personal", "work"):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="mode must be 'personal' or 'work'")
+    _state.routing_mode = req.mode
+    _state.engine.set_routing_mode(req.mode)
+    _save_routing_state()
+    logger.info("Routing mode set to %r", req.mode)
+    return {"mode": req.mode, "ok": True}
 
 
 @app.get("/health", response_model=HealthResponse)

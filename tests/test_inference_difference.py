@@ -1388,4 +1388,129 @@ class TestStatsPersistence:
             timestamp=_t.time(),
         )
         engine.report_outcome(decision, success=True, quality_score=0.8)
-        assert engine._stats_dirty is True
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Routing mode toggle (#282)
+# ---------------------------------------------------------------------------
+
+class TestRoutingMode:
+    """Verify routing mode controls roleplay filter in _filter_candidates."""
+
+    def _make_engine_with_models(self) -> RoutingEngine:
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        config.models = {
+            "test/with-roleplay": ModelEntry(
+                model_id="test/with-roleplay",
+                model_type=ModelType.API,
+                domains={TaskDomain.GENERAL},
+                max_complexity=ComplexityTier.HIGH,
+                context_window=8192,
+                cost_per_1k_tokens=0.001,
+                avg_latency_ms=2000,
+                conversational_quality=0.8,
+                capabilities=["roleplay"],
+            ),
+            "test/no-roleplay": ModelEntry(
+                model_id="test/no-roleplay",
+                model_type=ModelType.API,
+                domains={TaskDomain.GENERAL},
+                max_complexity=ComplexityTier.HIGH,
+                context_window=8192,
+                cost_per_1k_tokens=0.001,
+                avg_latency_ms=2000,
+                conversational_quality=0.8,
+                capabilities=[],
+            ),
+        }
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0,
+                             ram_available_gb=16.0)
+        return RoutingEngine(config, hw)
+
+    def test_engine_default_routing_mode(self):
+        """RoutingEngine must default to 'personal' mode (filter active)."""
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0,
+                             ram_available_gb=16.0)
+        engine = RoutingEngine(config, hw)
+        assert engine.routing_mode == "personal"
+
+    def test_set_routing_mode_work(self):
+        """set_routing_mode('work') sets routing_mode to 'work'."""
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0,
+                             ram_available_gb=16.0)
+        engine = RoutingEngine(config, hw)
+        engine.set_routing_mode("work")
+        assert engine.routing_mode == "work"
+
+    def test_set_routing_mode_invalid_raises(self):
+        """set_routing_mode rejects values other than 'personal' and 'work'."""
+        from inference_difference.hardware import HardwareProfile
+        config = InferenceDifferenceConfig()
+        hw = HardwareProfile(has_gpu=False, available_vram_gb=0.0,
+                             ram_available_gb=16.0)
+        engine = RoutingEngine(config, hw)
+        import pytest
+        with pytest.raises(ValueError):
+            engine.set_routing_mode("auto")
+
+    def test_personal_mode_filters_no_roleplay_models(self):
+        """In personal mode with consciousness_score>0, models without roleplay
+        capability must be excluded from candidates."""
+        from inference_difference.classifier import RequestClassification
+        engine = self._make_engine_with_models()
+        engine.routing_mode = "personal"
+
+        classification = RequestClassification(
+            primary_domain=TaskDomain.GENERAL,
+            complexity=ComplexityTier.HIGH,
+            requires_context_window=1024,
+        )
+        candidates, _ = engine._filter_candidates(
+            classification, consciousness_score=0.8
+        )
+        candidate_ids = [m.model_id for m in candidates]
+        assert "test/with-roleplay" in candidate_ids
+        assert "test/no-roleplay" not in candidate_ids
+
+    def test_work_mode_includes_no_roleplay_models(self):
+        """In work mode with consciousness_score>0, the roleplay filter is off —
+        models without roleplay capability are included."""
+        from inference_difference.classifier import RequestClassification
+        engine = self._make_engine_with_models()
+        engine.set_routing_mode("work")
+
+        classification = RequestClassification(
+            primary_domain=TaskDomain.GENERAL,
+            complexity=ComplexityTier.HIGH,
+            requires_context_window=1024,
+        )
+        candidates, _ = engine._filter_candidates(
+            classification, consciousness_score=0.8
+        )
+        candidate_ids = [m.model_id for m in candidates]
+        assert "test/with-roleplay" in candidate_ids
+        assert "test/no-roleplay" in candidate_ids
+
+    def test_personal_mode_no_consciousness_no_filter(self):
+        """Without a consciousness score (consciousness_score=None), the roleplay
+        filter never fires regardless of routing mode."""
+        from inference_difference.classifier import RequestClassification
+        engine = self._make_engine_with_models()
+        engine.routing_mode = "personal"
+
+        classification = RequestClassification(
+            primary_domain=TaskDomain.GENERAL,
+            complexity=ComplexityTier.HIGH,
+            requires_context_window=1024,
+        )
+        candidates, _ = engine._filter_candidates(
+            classification, consciousness_score=None
+        )
+        candidate_ids = [m.model_id for m in candidates]
+        assert "test/with-roleplay" in candidate_ids
+        assert "test/no-roleplay" in candidate_ids

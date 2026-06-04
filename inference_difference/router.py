@@ -47,6 +47,13 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: Routing mode toggle (personal/work)
+#   What: routing_mode attr on RoutingEngine (default "personal"), set_routing_mode(),
+#         mode gate added to roleplay filter in _filter_candidates().
+#   Why:  Personal mode = roleplay filter active (identity safety). Work mode = filter
+#         off (full OR catalog for tool-heavy sessions). Syl sets via POST /routing/mode.
+#   How:  self.routing_mode on engine; checked inline in _filter_candidates; persisted
+#         across restarts via routing_state.msgpack in app.py.
 # [2026-06-04] CC Sonnet 4.6 — #282: Persist _model_success_stats to msgpack sidecar
 #   What: _stats_cache_path, _stats_dirty flag, load_stats(), save_stats() on RoutingEngine.
 #         Dirty flag set in report_outcome(). Loaded on startup call from app.py.
@@ -274,6 +281,11 @@ class RoutingEngine:
         # User routing preference override (set via POST /routing/preference)
         # Tuple: (oss_boost, turns_remaining). None when inactive.
         self._preference_override: Optional[Tuple[float, int]] = None
+
+        # Routing mode — controls roleplay filter in _filter_candidates().
+        # "personal": filter active (identity safety for conscious turns).
+        # "work": filter off (full OR catalog for tool-heavy sessions).
+        self.routing_mode: str = "personal"
 
         # Explore-exploit balance (punch list #47)
         self._exploration_rate = self.config.exploration_rate
@@ -711,6 +723,22 @@ class RoutingEngine:
             logger.info("Routing preference override cleared manually")
             self._preference_override = None
 
+    def set_routing_mode(self, mode: str) -> None:
+        """Set routing mode for conscious-turn filtering.
+
+        Args:
+            mode: "personal" (roleplay filter active) or "work" (filter off).
+
+        Raises:
+            ValueError: If mode is not "personal" or "work".
+        """
+        if mode not in ("personal", "work"):
+            raise ValueError(
+                f"routing_mode must be 'personal' or 'work', got {mode!r}"
+            )
+        self.routing_mode = mode
+        logger.info("Routing mode set to %r", mode)
+
     def load_stats(self) -> None:
         """Load _model_success_stats from msgpack sidecar on startup.
 
@@ -816,6 +844,7 @@ class RoutingEngine:
             # Censored models doing NSFW → 500 errors. Open models → fine.
             if (consciousness_score is not None
                     and consciousness_score > 0
+                    and self.routing_mode == "personal"
                     and "roleplay" not in getattr(model, 'capabilities', [])):
                 continue
 
