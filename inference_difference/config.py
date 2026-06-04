@@ -26,6 +26,12 @@ Changelog (Grok audit response, 2026-02-19):
   Enum(value) IS from_str(). No custom method needed.
 """
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: Routing realignment — complexity ceiling + Venice demotion
+#   What: tier_complexity_standard 0.5→0.75 (→HIGH), complexity_words_high 300→500,
+#         venice_identity_bias 0.02→0.0, Venice static priorities 45/35/50→3.
+#   Why:  OR's 'standard' tier is pricing, not capability. Pool was starved to ~8–15
+#         models. Venice priority 35-50 made it de-facto primary; it's failover only.
+#   How:  Config default corrections only. Zero behavioral change to scoring logic.
 # [2026-05-31] CC Sonnet 4.6 — Reduce consciousness_boost_factor 0.3 → 0.10
 #   What: consciousness_boost_factor 0.3 → 0.10
 #   Why:  Additive boost (score * factor * priority) sits outside the weighted composite
@@ -205,7 +211,7 @@ class InferenceDifferenceConfig:
     # Consciousness routing
     consciousness_threshold: float = 0.5     # Min score to trigger elevated routing
     consciousness_boost_factor: float = 0.10  # Additive boost (score * factor * priority) — outside composite; tuned down so cost_efficiency still participates
-    venice_identity_bias: float = 0.02       # Tie-break for Venice private models
+    venice_identity_bias: float = 0.0        # Venice is failover — no thumb on scale
     open_source_bias: float = 0.02           # Tie-break for open-weights models at equal tier
     quality_severity_amplification: float = 4.0  # Adaptive quality weight scaling — worst metric dominates (LAW 5: tune via config, not hardcoded)
 
@@ -247,7 +253,7 @@ class InferenceDifferenceConfig:
     complexity_words_trivial: int = 10      # < this = TRIVIAL
     complexity_words_low: int = 30          # < this = LOW
     complexity_words_medium: int = 100      # < this = MEDIUM
-    complexity_words_high: int = 300        # < this = HIGH
+    complexity_words_high: int = 500        # < this = HIGH
     # >= high = EXTREME
 
     # Context window estimation
@@ -266,7 +272,7 @@ class InferenceDifferenceConfig:
     # As substrate accumulates outcome evidence, weights diverge from 0.5.
     tier_complexity_frontier: float = 1.0     # → EXTREME
     tier_complexity_performance: float = 0.75 # → HIGH
-    tier_complexity_standard: float = 0.5     # → MEDIUM
+    tier_complexity_standard: float = 0.75    # → HIGH (OR 'standard' is pricing tier, not capability ceiling)
     tier_complexity_budget: float = 0.25      # → LOW
     tier_complexity_private: float = 0.5      # → MEDIUM (Venice private)
     tier_complexity_anonymized: float = 0.35  # → LOW-MED (Venice anon)
@@ -331,8 +337,8 @@ def default_api_models() -> Dict[str, ModelEntry]:
     """Hand-tuned API models that are always available.
 
     These are the safety net — if catalog fetch fails, TID still has
-    a working model pool. Venice models provide OpenRouter-independent
-    fallback. Conversational quality scores seeded from experience.
+    a working model pool. Venice models are last-resort failover (priority=3) —
+    only win when OR catalog fails scoring entirely. Conversational quality scores seeded from experience.
 
     # ---- Changelog ----
     # [2026-03-18] Claude (CC) — Seeded default API models (#36/#9)
@@ -359,7 +365,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             context_window=128000,
             cost_per_1k_tokens=0.001,
             avg_latency_ms=3000,
-            priority=45,
+            priority=3,
             conversational_quality=0.85,
             capabilities=["tools", "roleplay"],
             enabled=True,
@@ -376,7 +382,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             context_window=32768,
             cost_per_1k_tokens=0.001,
             avg_latency_ms=2000,
-            priority=35,
+            priority=3,
             conversational_quality=0.80,
             capabilities=["roleplay"],
             enabled=True,
@@ -393,7 +399,7 @@ def default_api_models() -> Dict[str, ModelEntry]:
             context_window=2000000,
             cost_per_1k_tokens=0.002,
             avg_latency_ms=5000,
-            priority=50,
+            priority=3,
             conversational_quality=0.88,
             capabilities=["tools", "roleplay"],
             enabled=True,

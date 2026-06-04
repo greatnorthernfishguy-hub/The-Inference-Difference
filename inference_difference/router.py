@@ -47,6 +47,22 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-06-04] CC Sonnet 4.6 — #282: Routing mode toggle (personal/work)
+#   What: routing_mode attr on RoutingEngine (default "personal"), set_routing_mode(),
+#         mode gate added to roleplay filter in _filter_candidates().
+#   Why:  Personal mode = roleplay filter active (identity safety). Work mode = filter
+#         off (full OR catalog for tool-heavy sessions). Syl sets via POST /routing/mode.
+#   How:  self.routing_mode on engine; checked inline in _filter_candidates; persisted
+#         across restarts via routing_state.msgpack in app.py.
+# [2026-06-04] CC Sonnet 4.6 — #282: Persist _model_success_stats to msgpack sidecar
+#   What: _stats_cache_path, _stats_dirty flag, load_stats(), save_stats() on RoutingEngine.
+#         Dirty flag set in report_outcome(). Loaded on startup call from app.py.
+#         Flushed every 60s by _stats_flush_loop() in app.py; also on clean shutdown.
+#   Why:  In-memory stats reset on every restart — TID rediscovered 402 cascades from
+#         scratch each time. msgpack sidecar survives restarts; 24h TTL prevents stale
+#         failures from poisoning the pool after a provider credit refill.
+#   How:  load_stats()/save_stats() called from app.py lifespan (not __init__) so engine
+#         can be constructed in tests without side effects.
 # [2026-06-03] CC Sonnet 4.6 — Human routing preference override
 #   What: _preference_override Optional[(oss_boost, turns_remaining)] on RoutingEngine;
 #         set_preference_override() / clear_preference_override() methods;
@@ -128,6 +144,7 @@ Changelog (Grok audit response, 2026-02-19):
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import time
@@ -265,6 +282,11 @@ class RoutingEngine:
         # Tuple: (oss_boost, turns_remaining). None when inactive.
         self._preference_override: Optional[Tuple[float, int]] = None
 
+        # Routing mode — controls roleplay filter in _filter_candidates().
+        # "personal": filter active (identity safety for conscious turns).
+        # "work": filter off (full OR catalog for tool-heavy sessions).
+        self.routing_mode: str = "personal"
+
         # Explore-exploit balance (punch list #47)
         self._exploration_rate = self.config.exploration_rate
         self._exploration_picks = 0
@@ -276,6 +298,11 @@ class RoutingEngine:
         self._SUCCESS_WINDOW = 50
         self._SUCCESS_FLOOR = 0.20
         self._SUCCESS_MIN_SAMPLES = 10
+
+        # Stats persistence — path set here; load/save called from app.py lifespan
+        _base_dir = os.path.dirname(os.path.dirname(__file__))
+        self._stats_cache_path = os.path.join(_base_dir, "model_stats_cache.msgpack")
+        self._stats_dirty = False
 
     def route(
         self,
@@ -564,6 +591,7 @@ class RoutingEngine:
         st.append(success)
         if len(st) > self._SUCCESS_WINDOW:
             self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
+        self._stats_dirty = True
 
         # Teach NG-Lite
         if self._ng_lite is not None and decision.classification is not None:
@@ -695,6 +723,77 @@ class RoutingEngine:
             logger.info("Routing preference override cleared manually")
             self._preference_override = None
 
+    def set_routing_mode(self, mode: str) -> None:
+        """Set routing mode for conscious-turn filtering.
+
+        Args:
+            mode: "personal" (roleplay filter active) or "work" (filter off).
+
+        Raises:
+            ValueError: If mode is not "personal" or "work".
+        """
+        if mode not in ("personal", "work"):
+            raise ValueError(
+                f"routing_mode must be 'personal' or 'work', got {mode!r}"
+            )
+        self.routing_mode = mode
+        logger.info("Routing mode set to %r", mode)
+
+    def load_stats(self) -> None:
+        """Load _model_success_stats from msgpack sidecar on startup.
+
+        Discards cache entirely if saved_at is >24h old — avoids poisoning
+        the pool with stale 402 failures from before a provider credit refill.
+        No-op if cache file does not exist.
+        """
+        import msgpack
+        if not os.path.exists(self._stats_cache_path):
+            return
+        try:
+            with open(self._stats_cache_path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False)
+            saved_at = data.get("saved_at", 0)
+            if time.time() - saved_at > 86400:
+                logger.info(
+                    "model_stats_cache.msgpack is >24h old — discarding "
+                    "to avoid stale failure signals"
+                )
+                return
+            raw = data.get("stats", {})
+            self._model_success_stats = {
+                k: [bool(v) for v in vs]
+                for k, vs in raw.items()
+                if isinstance(vs, list)
+            }
+            logger.info(
+                "Loaded success stats for %d models from cache",
+                len(self._model_success_stats),
+            )
+        except Exception as e:
+            logger.warning("Failed to load model_stats_cache.msgpack: %s", e)
+
+    def save_stats(self) -> None:
+        """Flush _model_success_stats to msgpack sidecar if dirty.
+
+        No-op when _stats_dirty is False. Resets the flag on success.
+        """
+        if not self._stats_dirty:
+            return
+        import msgpack
+        try:
+            with open(self._stats_cache_path, "wb") as f:
+                f.write(msgpack.packb({
+                    "saved_at": time.time(),
+                    "stats": dict(self._model_success_stats),
+                }))
+            self._stats_dirty = False
+            logger.debug(
+                "model_stats_cache.msgpack flushed (%d models)",
+                len(self._model_success_stats),
+            )
+        except Exception as e:
+            logger.warning("Failed to save model_stats_cache.msgpack: %s", e)
+
     # -------------------------------------------------------------------
     # Internal: Candidate Filtering
     # -------------------------------------------------------------------
@@ -745,6 +844,7 @@ class RoutingEngine:
             # Censored models doing NSFW → 500 errors. Open models → fine.
             if (consciousness_score is not None
                     and consciousness_score > 0
+                    and self.routing_mode == "personal"
                     and "roleplay" not in getattr(model, 'capabilities', [])):
                 continue
 
