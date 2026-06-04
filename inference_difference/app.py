@@ -61,6 +61,13 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-06-03] CC Sonnet 4.6 — Fix json NameError in _generate() (#283)
+#   What: Added `import json` inside _generate() generator body.
+#   Why:  anyio runs sync generators in a worker thread via context.run() —
+#         module-level globals are not visible in that execution context on
+#         Python 3.12, causing NameError when all models fail and the error
+#         SSE chunk is never yielded (client gets a connection reset instead).
+#   How:  Inline import at top of _generate(). One line.
 # [2026-06-03] CC Sonnet 4.6 — POST /routing/preference endpoint
 #   What: RoutingPreferenceRequest model + POST /routing/preference endpoint;
 #         calls engine.set_preference_override(oss_boost, duration_turns).
@@ -1500,6 +1507,7 @@ def _stream_response(
     """
 
     def _generate():
+        import json  # anyio worker-thread context isolation hides module globals
         models_to_try = [selected_model] + list(fallback_chain)
         succeeded = False
         final_result = None
