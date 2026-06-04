@@ -47,6 +47,16 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-06-03] CC Sonnet 4.6 — Human routing preference override
+#   What: _preference_override Optional[(oss_boost, turns_remaining)] on RoutingEngine;
+#         set_preference_override() / clear_preference_override() methods;
+#         open_source_bias in _score_model uses override boost when active;
+#         counter decrements per routing decision and auto-expires.
+#   Why:  Josh wants to say "use more OSS models" in natural language and have it register
+#         as a routing signal. Anima detects the phrase and POSTs to TID /routing/preference;
+#         TID amplifies open_source_bias for N turns then returns to the config default.
+#   How:  Override replaces (not compounds) config.open_source_bias — one OSS factor,
+#         user-amplified. POST /routing/preference endpoint in app.py feeds this path.
 # [2026-04-20] CC Sonnet 4.6 — #94: Open-source bias in routing
 #   What: is_open_source field on ModelEntry (from hugging_face_id), open_source_bias
 #         tiebreaker in _score_model(), DB column + ALTER TABLE migration.
@@ -251,6 +261,10 @@ class RoutingEngine:
         self._dream_cycle = dream_cycle
         self._request_counter = 0
 
+        # User routing preference override (set via POST /routing/preference)
+        # Tuple: (oss_boost, turns_remaining). None when inactive.
+        self._preference_override: Optional[Tuple[float, int]] = None
+
         # Explore-exploit balance (punch list #47)
         self._exploration_rate = self.config.exploration_rate
         self._exploration_picks = 0
@@ -421,6 +435,16 @@ class RoutingEngine:
             classification.primary_domain.value,
             classification.complexity.value,
         )
+
+        # Decrement preference override turn counter; clear when exhausted
+        if self._preference_override is not None:
+            oss_boost, turns_remaining = self._preference_override
+            turns_remaining -= 1
+            if turns_remaining <= 0:
+                self._preference_override = None
+                logger.info("Routing preference override expired (oss_boost=%.3f)", oss_boost)
+            else:
+                self._preference_override = (oss_boost, turns_remaining)
 
         return decision
 
@@ -653,6 +677,24 @@ class RoutingEngine:
             "exploration_pick_rate": round(self._exploration_picks / total, 3) if total > 0 else 0.0,
         }
 
+    def set_preference_override(self, oss_boost: float, duration_turns: int) -> None:
+        """Temporarily amplify open-source model bias from user feedback.
+
+        Called by POST /routing/preference when Anima detects natural language
+        routing preferences. Persists for duration_turns routing decisions.
+        """
+        self._preference_override = (max(0.0, oss_boost), max(1, duration_turns))
+        logger.info(
+            "Routing preference override set: oss_boost=%.3f for %d turns",
+            oss_boost, duration_turns,
+        )
+
+    def clear_preference_override(self) -> None:
+        """Clear any active routing preference override."""
+        if self._preference_override is not None:
+            logger.info("Routing preference override cleared manually")
+            self._preference_override = None
+
     # -------------------------------------------------------------------
     # Internal: Candidate Filtering
     # -------------------------------------------------------------------
@@ -878,11 +920,14 @@ class RoutingEngine:
             total += identity_bias
             breakdown["venice_identity_bias"] = identity_bias
 
-        # Open-source bias: tiebreaker for open-weights models.
-        # Not a cost optimization — applied only after tier/capability matching.
-        # Closed models win when genuinely better; this nudges equals toward open.
+        # Open-source bias: permanent tiebreaker, amplified when user preference override
+        # is active. Override replaces (not compounds) the config default — one OSS factor.
         if getattr(model, "is_open_source", False):
-            os_bias = self.config.open_source_bias
+            os_bias = (
+                self._preference_override[0]
+                if self._preference_override is not None
+                else self.config.open_source_bias
+            )
             total += os_bias
             breakdown["open_source_bias"] = os_bias
 

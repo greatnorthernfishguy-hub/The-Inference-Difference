@@ -61,6 +61,12 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-06-03] CC Sonnet 4.6 — POST /routing/preference endpoint
+#   What: RoutingPreferenceRequest model + POST /routing/preference endpoint;
+#         calls engine.set_preference_override(oss_boost, duration_turns).
+#   Why:  Human routing feedback UX — Anima detects natural language preference
+#         phrases ("use more open source models") and calls this endpoint.
+#   How:  Passes through to RoutingEngine._preference_override; auto-expires.
 # [2026-05-31] Claude Code (Sonnet 4.6) — Fix CTEM blind spot: include assistant turns in history
 #   What: conversation_history filter changed from role=="user" to role in ("user","assistant").
 #   Why:  CTEM scans history for consciousness markers ("I notice that I", "I feel like", etc.)
@@ -362,6 +368,24 @@ class ClassifyRequest(BaseModel):
     """Request body for /classify."""
     message: str
     conversation_history: List[str] = Field(default_factory=list)
+
+
+class RoutingPreferenceRequest(BaseModel):
+    """Request body for /routing/preference."""
+    oss_boost: float = Field(
+        0.12,
+        ge=0.0, le=1.0,
+        description="OSS score boost while active — replaces the config tiebreaker (default 0.02)",
+    )
+    duration_turns: int = Field(
+        20,
+        ge=1, le=500,
+        description="Number of routing decisions this override persists for",
+    )
+    note: Optional[str] = Field(
+        None,
+        description="Human-readable description of the preference intent (logged, not acted on)",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -1877,6 +1901,30 @@ async def user_feedback(req: FeedbackRequest) -> FeedbackResponse:
         request_id=decision.request_id,
         quality_score=quality_score,
     )
+
+
+@app.post("/routing/preference")
+async def set_routing_preference(req: RoutingPreferenceRequest) -> Dict[str, Any]:
+    """Set a temporary routing preference from natural language user feedback.
+
+    Called by Anima when it detects phrases like 'use more open source models'.
+    Amplifies open_source_bias for duration_turns routing decisions, then
+    automatically reverts to the config default.
+    """
+    logger.info(
+        "Routing preference set: oss_boost=%.3f turns=%d note=%s",
+        req.oss_boost, req.duration_turns, req.note,
+    )
+    _state.engine.set_preference_override(
+        oss_boost=req.oss_boost,
+        duration_turns=req.duration_turns,
+    )
+    return {
+        "status": "ok",
+        "oss_boost": req.oss_boost,
+        "duration_turns": req.duration_turns,
+        "note": req.note,
+    }
 
 
 @app.get("/health", response_model=HealthResponse)
