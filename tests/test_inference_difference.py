@@ -1514,3 +1514,22 @@ class TestRoutingMode:
         candidate_ids = [m.model_id for m in candidates]
         assert "test/with-roleplay" in candidate_ids
         assert "test/no-roleplay" in candidate_ids
+
+    def test_personal_mode_zero_consciousness_no_filter(self):
+        """consciousness_score=0.0 (exactly) is not >0, so the roleplay filter
+        never fires — all models pass through even in personal mode."""
+        from inference_difference.classifier import RequestClassification
+        engine = self._make_engine_with_models()
+        engine.routing_mode = "personal"
+
+        classification = RequestClassification(
+            primary_domain=TaskDomain.GENERAL,
+            complexity=ComplexityTier.HIGH,
+            requires_context_window=1024,
+        )
+        candidates, _ = engine._filter_candidates(
+            classification, consciousness_score=0.0
+        )
+        candidate_ids = [m.model_id for m in candidates]
+        assert "test/with-roleplay" in candidate_ids
+        assert "test/no-roleplay" in candidate_ids

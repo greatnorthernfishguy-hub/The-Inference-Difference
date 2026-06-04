@@ -2029,7 +2029,6 @@ async def set_routing_mode_endpoint(req: RoutingModeRequest) -> Dict[str, Any]:
     Mode persists across TID restarts via routing_state.msgpack.
     """
     if req.mode not in ("personal", "work"):
-        from fastapi import HTTPException
         raise HTTPException(status_code=422, detail="mode must be 'personal' or 'work'")
     _state.routing_mode = req.mode
     _state.engine.set_routing_mode(req.mode)
