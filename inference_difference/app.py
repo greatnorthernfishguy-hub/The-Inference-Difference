@@ -275,7 +275,10 @@ async def _stats_flush_loop() -> None:
     while True:
         await asyncio.sleep(60)
         if _state.engine is not None:
-            _state.engine.save_stats()
+            try:
+                _state.engine.save_stats()
+            except Exception as e:
+                logger.warning("Periodic stats flush failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
