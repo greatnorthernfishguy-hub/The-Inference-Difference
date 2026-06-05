@@ -12,6 +12,10 @@ build/
 ng_lite_state.json
 inference_difference_ng.json
 
+# Router runtime persistence (generated at runtime; self-expiring cache)
+routing_state.msgpack
+model_stats_cache.msgpack
+
 # In-place install artifacts (created by install.sh)
 venv/
 data/
