@@ -33,6 +33,19 @@ Date: February 2026
 License: AGPL-3.0
 
 Changelog:
+    [2026-06-07] CC (Opus 4.8) — #TID-402: provider-level credit block + refund probe
+        What: A 402 "insufficient balance" now blocks the WHOLE provider (persisted to
+            data/provider_blocked_cache.json), not just fires a Discord alert. call() instant-skips
+            every model of a blocked provider with NO network call. After _PROVIDER_PROBE_INTERVAL_S
+            the next real call to that provider is allowed through as a refund probe; a successful
+            call clears the block automatically (provider restored as failover).
+        Why: Learning was per-model, but a 402 is provider-wide. With 86 Venice models, failures
+            spread below the per-model success-floor sample threshold, so TID never learned to stop
+            using an unfunded provider. Provider-block makes the deliberate "unfund Venice → use
+            OpenRouter" teaching signal land immediately, and self-heals on refund via the probe.
+        How: _provider_blocked dict + _load/_save_provider_blocked_cache (atomic). 402 branch sets
+            the block; call() checks it (instant-skip within interval, probe after); success clears it.
+            _provider_from_base_url() maps endpoint→provider key.
     [2026-04-19] Claude Code (Sonnet 4.6) — Punchlist #174: credit exhaustion alert + sticky 404 exclusions
         What: (a) 402 credit exhaustion now fires a Discord alert via ET_DISCORD_DEVLOG_WEBHOOK
             and does NOT add individual models to _policy_blocked (account-level failure, not model-level).
@@ -96,6 +109,33 @@ _POLICY_BLOCKED_CACHE_PATH = os.path.join(
 )
 _POLICY_BLOCKED_TTL_S = 86400   # 24h for data-policy account exclusions
 _CREDIT_ALERT_COOLDOWN_S = 300  # 5 min between Discord credit alerts
+
+# Provider-level credit block (#TID-402): a 402 "insufficient balance" is an
+# ACCOUNT-level failure — the entire provider is unusable, not one model. We
+# block the whole provider (persisted across restarts) and re-probe for a
+# refund: after the interval, the next real call to that provider is allowed
+# through AS the probe; success clears the block (refund detected).
+_PROVIDER_BLOCKED_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "provider_blocked_cache.json"
+)
+_PROVIDER_PROBE_INTERVAL_S = 600  # 10 min between refund probes for a blocked provider
+
+
+def _provider_from_base_url(base_url: str) -> str:
+    """Map an API base_url to its provider key (matches model_id prefixes)."""
+    b = base_url or ""
+    if "venice" in b:
+        return "venice"
+    if "openrouter" in b:
+        return "openrouter"
+    if "anthropic" in b:
+        return "anthropic"
+    if "huggingface" in b or "/hf" in b:
+        return "huggingface"
+    if "11434" in b or "localhost" in b or "127.0.0.1" in b:
+        return "ollama"
+    return "unknown"
+
 
 _credit_alert_lock = threading.Lock()
 _last_credit_alert_ts: float = 0.0
@@ -337,6 +377,8 @@ class ModelClient:
         self._policy_blocked: set = set()
         self._policy_blocked_expiry: Dict[str, float] = {}
         self._load_policy_blocked_cache()
+        self._provider_blocked: Dict[str, float] = {}  # provider -> blocked_since_ts (402 credit exhaustion)
+        self._load_provider_blocked_cache()
         self._rate_limited = {}   # model_name -> unblock_timestamp (#173b)
         self._rate_limit_hits = {}  # consecutive 429 count per model
 
@@ -369,6 +411,31 @@ class ModelClient:
             os.replace(tmp, _POLICY_BLOCKED_CACHE_PATH)
         except Exception as exc:
             logger.warning("Policy-blocked cache save failed: %s", exc)
+
+    def _load_provider_blocked_cache(self) -> None:
+        """Load persisted provider-level credit blocks (survives restart)."""
+        try:
+            with open(_PROVIDER_BLOCKED_CACHE_PATH) as f:
+                raw: Dict[str, float] = json.load(f)
+            self._provider_blocked = {p: float(ts) for p, ts in raw.items()}
+            if self._provider_blocked:
+                logger.info(
+                    "Provider-blocked cache loaded: %s (probe each on next request after %ds)",
+                    list(self._provider_blocked), _PROVIDER_PROBE_INTERVAL_S,
+                )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("Provider-blocked cache load failed: %s", exc)
+
+    def _save_provider_blocked_cache(self) -> None:
+        try:
+            tmp = _PROVIDER_BLOCKED_CACHE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._provider_blocked, f, indent=2)
+            os.replace(tmp, _PROVIDER_BLOCKED_CACHE_PATH)
+        except Exception as exc:
+            logger.warning("Provider-blocked cache save failed: %s", exc)
 
     def is_rate_limited(self, model_name: str) -> bool:
         unblock = self._rate_limited.get(model_name)
@@ -417,6 +484,27 @@ class ModelClient:
                 error="Skipped: data policy blocked (cached)",
             )
 
+        # Provider-level credit block (#TID-402): skip ALL of a provider's
+        # models while it is credit-blocked. After the probe interval, let one
+        # call through to test for a refund (cleared in the success path below).
+        _provider = _provider_from_base_url(base_url)
+        if _provider in self._provider_blocked:
+            _elapsed = time.time() - self._provider_blocked[_provider]
+            if _elapsed < _PROVIDER_PROBE_INTERVAL_S:
+                return ModelResponse(
+                    model=model_name,
+                    latency_ms=0.0,
+                    success=False,
+                    error=(
+                        f"Skipped: provider '{_provider}' credit-blocked (402); "
+                        f"refund probe in {int(_PROVIDER_PROBE_INTERVAL_S - _elapsed)}s"
+                    ),
+                )
+            logger.info(
+                "Provider '%s' refund probe: interval elapsed, allowing one call to test",
+                _provider,
+            )
+
         # Merge tools/tool_choice into extra_params
         if tools is not None or tool_choice is not None:
             extra_params = dict(extra_params or {})
@@ -445,6 +533,16 @@ class ModelClient:
             resp.usage["estimated"] = True
             logger.debug(
                 "Provider returned zero usage, estimated: %s", estimated,
+            )
+
+        # Refund probe succeeded — a successful call clears the provider's
+        # credit block (#TID-402). Failover provider auto-restored.
+        if resp.success and _provider in self._provider_blocked:
+            self._provider_blocked.pop(_provider, None)
+            self._save_provider_blocked_cache()
+            logger.info(
+                "Provider '%s' refund probe SUCCEEDED — credit block cleared",
+                _provider,
             )
 
         return resp
@@ -603,7 +701,14 @@ class ModelClient:
                     model_name,
                 )
             elif e.code == 402 and ("insufficient" in error_lower or "credits" in error_lower):
-                logger.warning("OpenRouter 402 credit exhaustion — sending Discord alert")
+                _prov = _provider_from_base_url(base_url)
+                self._provider_blocked[_prov] = time.time()
+                self._save_provider_blocked_cache()
+                logger.warning(
+                    "Provider '%s' 402 credit exhaustion — PROVIDER-BLOCKED; "
+                    "skipping all its models, refund probe in %ds",
+                    _prov, _PROVIDER_PROBE_INTERVAL_S,
+                )
                 _post_credit_alert(error_body)
             logger.warning(
                 "Model call failed: %s %d — %s",
