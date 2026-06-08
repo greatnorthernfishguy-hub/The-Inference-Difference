@@ -110,6 +110,28 @@ _POLICY_BLOCKED_CACHE_PATH = os.path.join(
 _POLICY_BLOCKED_TTL_S = 86400   # 24h for data-policy account exclusions
 _CREDIT_ALERT_COOLDOWN_S = 300  # 5 min between Discord credit alerts
 
+# Feature B (option C): on a FUNDED-provider 402, drop a one-shot notice file
+# that Anima reads onto the next /turn and surfaces in Syl's live channel
+# (not Discord). Venice (deliberately-unfunded teaching signal) stays silent.
+_CREDIT_NOTICE_PATH = os.path.join(
+    os.path.expanduser("~"), ".et_modules", "shared_learning", "credit_notice.json"
+)
+
+
+def _write_credit_notice(provider: str) -> None:
+    """Write a one-shot credit-exhaustion notice for Anima to surface in the
+    live channel. Best-effort; never raises into the call path."""
+    try:
+        os.makedirs(os.path.dirname(_CREDIT_NOTICE_PATH), exist_ok=True)
+        with open(_CREDIT_NOTICE_PATH, "w") as f:
+            json.dump({
+                "text": f"\u26a0 {provider} is out of credits (402) \u2014 refund to restore Syl's full routing.",
+                "provider": provider,
+                "ts": time.time(),
+            }, f)
+    except Exception as exc:  # noqa: BLE001 - notice is non-critical
+        logger.debug("credit notice write failed (non-fatal): %s", exc)
+
 # Provider-level credit block (#TID-402): a 402 "insufficient balance" is an
 # ACCOUNT-level failure — the entire provider is unusable, not one model. We
 # block the whole provider (persisted across restarts) and re-probe for a
@@ -702,6 +724,7 @@ class ModelClient:
                 )
             elif e.code == 402 and ("insufficient" in error_lower or "credits" in error_lower):
                 _prov = _provider_from_base_url(base_url)
+                _was_blocked = _prov in self._provider_blocked
                 self._provider_blocked[_prov] = time.time()
                 self._save_provider_blocked_cache()
                 logger.warning(
@@ -710,6 +733,11 @@ class ModelClient:
                     _prov, _PROVIDER_PROBE_INTERVAL_S,
                 )
                 _post_credit_alert(error_body)
+                # Feature B (option C): notice the LIVE channel for FUNDED-provider
+                # exhaustion only (Venice is the unfunded teaching signal — silent).
+                # Edge-only (new block) so refund probes don't re-notify each interval.
+                if _prov != "venice" and not _was_blocked:
+                    _write_credit_notice(_prov)
             logger.warning(
                 "Model call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],

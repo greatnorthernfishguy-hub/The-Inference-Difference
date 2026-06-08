@@ -75,3 +75,14 @@ def test_provider_blocked_cache_roundtrip(tmp_path, monkeypatch):
     assert json.load(open(p)) == {"venice": 12345.0}
     c2 = ModelClient()  # loads from the patched path on init
     assert c2._provider_blocked.get("venice") == 12345.0
+
+
+def test_write_credit_notice(tmp_path, monkeypatch):
+    # Funded-provider 402 drops a one-shot notice file for Anima to surface.
+    p = str(tmp_path / "credit_notice.json")
+    monkeypatch.setattr(mc, "_CREDIT_NOTICE_PATH", p)
+    mc._write_credit_notice("openrouter")
+    d = json.load(open(p))
+    assert d["provider"] == "openrouter"
+    assert "out of credits" in d["text"]
+    assert d["text"].startswith("⚠")
