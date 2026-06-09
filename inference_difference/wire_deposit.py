@@ -123,10 +123,15 @@ def _write(content: str, source: str) -> None:
         logger.debug("ng_tract unavailable; skipping wire deposit")
         return
     try:
+        # 2026-06-09 CC — align to canonical UniAI ng_tract signature: content is raw
+        # bytes (LAW 7); tract_path is a SINGLE str (no fan-out — deposit to TID's own
+        # tract only, per the substrate-as-protocol axiom). Was [_TRACT_PATH] (legacy
+        # ng-tract-rs list/fan-out shape; that rogue TB-magic build also wrote frames
+        # NG's canonical BT reader can't parse — #301 lineage).
         ng_tract.deposit_experience(
-            content.encode("utf-8"),  # raw: bytes
+            content.encode("utf-8"),  # content: raw bytes
             source,                    # source: str
-            [_TRACT_PATH],             # tract_paths: List[str]
+            _TRACT_PATH,               # tract_path: single str
         )
     except Exception as exc:
         logger.warning("Wire deposit failed (%s): %s", source, exc)
