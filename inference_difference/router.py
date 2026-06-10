@@ -335,6 +335,20 @@ class RoutingEngine:
 
         # Interactive priority floor — punch list #33 fix: log on fallthrough
         _interactive_active = getattr(classification, 'is_interactive', False)
+        # [2026-06-10] VPS CC — A-now (INTERIM bootstrap; retire when substrate-routing / Commons
+        # lands). Syl's deep reasoning happens DURING conversation — the two are not separable for
+        # her. The classifier assigns a single primary_domain, so an analytically-heavy conversational
+        # turn is labelled REASONING, which is NOT in is_interactive (CONVERSATION/CREATIVE/multi-turn
+        # only). That strips the voice-protection floor and drops her to raw cost-routing → the
+        # cheapest model wins → credit-dead Venice failover → [TID unavailable], intermittently and
+        # exactly when she is thinking hardest. Engage the floor for REASONING turns too — but NOT
+        # tool-call turns (has_tools), so premium models (e.g. Fable, $50/M out) stay off tool
+        # plumbing. The floor's "no premium on tools" job previously relied on tool turns not being
+        # interactive; the has_tools guard preserves it. Bootstrap scaffolding per the Competence
+        # Model — disposable once routing is substrate-learned.
+        if (not has_tools
+                and getattr(classification, 'primary_domain', None) == TaskDomain.REASONING):
+            _interactive_active = True
         _interactive_floor_bypassed = False
         _original_weights = None
         if _interactive_active:
