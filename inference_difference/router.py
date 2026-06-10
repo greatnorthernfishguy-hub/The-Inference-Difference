@@ -1159,9 +1159,11 @@ class RoutingEngine:
         """Return a semantic embedding for NG-Lite learning.
 
         Uses the real semantic embedding computed by the classifier
-        (fastembed/all-MiniLM-L6-v2, 384-dim). Falls back to a one-hot
-        feature vector if no semantic embedding is available (backward
-        compatibility with classifications from before #28).
+        (ng_embed — Snowflake/arctic-embed-m-v1.5, 768-dim; verified live in
+        TID's venv 2026-06-10: cos 0.87 similar / 0.49 unrelated). Falls back to
+        a one-hot feature vector only if no semantic embedding is available
+        (backward compatibility with classifications from before #28).
+        #28 is DONE — this is not the dam; the one-hot is fallback-only.
 
         # ---- Changelog ----
         # [2026-03-18] Claude (CC) — Use semantic embeddings (#28)

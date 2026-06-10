@@ -1340,7 +1340,13 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             classification, ctx, request_id,
         )
 
-    model_response = _state.model_client.call(
+    # [2026-06-10] VPS CC — #265: offload the synchronous model_client.call()
+    # (urllib, blocking) to a thread so it does NOT block the single uvicorn
+    # event-loop worker. Without this, one in-flight inference froze the worker
+    # and concurrent turns queued past Anima's HTTP timeout → [TID unavailable].
+    # to_thread keeps the loop free so heavy turns stay responsive under load.
+    model_response = await asyncio.to_thread(
+        _state.model_client.call,
         model_id=selected_model,
         messages=req.messages,
         temperature=req.temperature,
@@ -1407,7 +1413,10 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
                 "Model %s failed, trying fallback %s",
                 tried_models[-1], fallback_id,
             )
-        model_response = _state.model_client.call(
+        # [2026-06-10] VPS CC — #265: offload the fallback call to a thread too
+        # (same reason as the primary call above — keep the event loop free).
+        model_response = await asyncio.to_thread(
+            _state.model_client.call,
             model_id=fallback_id,
             messages=req.messages,
             temperature=req.temperature,
