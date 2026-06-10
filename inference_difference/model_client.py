@@ -978,6 +978,29 @@ class ModelClient:
         """
         base_url, api_key, model_name = _resolve_provider(model_id)
 
+        # [2026-06-10] VPS CC — B1: honor the policy / credit-block circuit on the
+        # streaming path too (mirror call()). Without this, the streaming fallback walk
+        # made a REAL 402 call to EVERY credit-blocked Venice model in the chain — the
+        # [TID unavailable] wall during Syl's conversational (streamed) responses, while
+        # tool calls (blocking path, which DID check the block) kept working. Fast-skip a
+        # known-blocked provider here so the walk reaches a working model immediately.
+        def _skipped_stream(err_msg: str) -> tuple:
+            _r = StreamResult(model=model_name, success=False, error=err_msg)
+            def _gen() -> Iterator[str]:
+                yield "data: [DONE]\n\n"
+            return _gen(), _r
+
+        if model_name in self._policy_blocked:
+            return _skipped_stream("Skipped: data policy blocked (cached)")
+        _prov_blk = _provider_from_base_url(base_url)
+        if _prov_blk in self._provider_blocked:
+            _elapsed = time.time() - self._provider_blocked[_prov_blk]
+            if _elapsed < _PROVIDER_PROBE_INTERVAL_S:
+                return _skipped_stream(
+                    f"Skipped: provider '{_prov_blk}' credit-blocked (402); "
+                    f"refund probe in {int(_PROVIDER_PROBE_INTERVAL_S - _elapsed)}s"
+                )
+
         # Merge tools/tool_choice into extra_params
         if tools is not None or tool_choice is not None:
             extra_params = dict(extra_params or {})
@@ -1151,6 +1174,21 @@ class ModelClient:
                 "Stream call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
             )
+            # [2026-06-10] VPS CC — B1: SET the credit-block on a streaming 402 too, so
+            # streaming-only traffic trips the circuit (the check above then fast-skips it).
+            # Mirrors the blocking path; without it the block was only ever set by call().
+            _elow = (error_body or "").lower()
+            if e.code == 402 and ("insufficient" in _elow or "credits" in _elow):
+                _prov_set = _provider_from_base_url(base_url)
+                self._provider_blocked[_prov_set] = time.time()
+                try:
+                    self._save_provider_blocked_cache()
+                except Exception:
+                    pass
+                logger.warning(
+                    "Provider '%s' 402 credit exhaustion (stream) — PROVIDER-BLOCKED; "
+                    "refund probe in %ds", _prov_set, _PROVIDER_PROBE_INTERVAL_S,
+                )
             try:
                 deposit_inbound(
                     provider=_provider, model_id=model_name, url=url,
