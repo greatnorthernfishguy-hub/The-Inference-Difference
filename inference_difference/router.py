@@ -298,15 +298,6 @@ class RoutingEngine:
         self._SUCCESS_WINDOW = 50
         self._SUCCESS_FLOOR = 0.20
         self._SUCCESS_MIN_SAMPLES = 10
-        # Per-model penalty box (Layer B) — escalating-backoff veto; supersedes the
-        # primitive _SUCCESS_FLOOR (#291). VETO-ONLY: only excludes candidates, never scores.
-        from inference_difference.model_penalty import ModelPenaltyBox
-        self._model_penalty = ModelPenaltyBox(
-            ladder_seconds=getattr(self.config, 'model_penalty_ladder_seconds',
-                                   (30, 300, 3600, 86400, 604800, 5184000)),
-            time_fn=time.time,
-            on_blacklist=self._on_model_blacklist,
-        )
 
         # Stats persistence — path set here; load/save called from app.py lifespan
         _base_dir = os.path.dirname(os.path.dirname(__file__))
@@ -616,14 +607,6 @@ class RoutingEngine:
             self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
         self._stats_dirty = True
 
-        # Penalty box (Layer B): descend on success; climb on a MODEL-attributable
-        # failure. Provider-wide failures (402/credit) belong to the provider breaker
-        # and must NOT climb the model ladder.
-        if success:
-            self._model_penalty.record_success(decision.model_id)
-        elif not self._is_provider_failure(metadata):
-            self._model_penalty.record_failure(decision.model_id)
-
         # Teach NG-Lite
         if self._ng_lite is not None and decision.classification is not None:
             embedding = self._classification_to_embedding(
@@ -770,43 +753,6 @@ class RoutingEngine:
         self.routing_mode = mode
         logger.info("Routing mode set to %r", mode)
 
-    def _on_model_blacklist(self, model_id: str) -> None:
-        """Best-effort dev-log notice when a model hits L7 blacklist. Never raises."""
-        logger.warning("MODEL BLACKLISTED (penalty box L7): %s", model_id)
-        if not getattr(self.config, 'model_penalty_blacklist_notify', True):
-            return
-        try:
-            url = os.environ.get('ET_DISCORD_DEVLOG_WEBHOOK', '')
-            if not url:
-                return
-            import json as _json, urllib.request as _u
-            body = _json.dumps({'content': 'TID penalty box: model **' + str(model_id)
-                + '** blacklisted (L7) after repeated model-attributable failures. '
-                + 'Clear via POST /routing/penalty/clear.'}).encode()
-            _r = _u.Request(url, data=body, headers={'Content-Type': 'application/json'}, method='POST')
-            _u.urlopen(_r, timeout=5)
-        except Exception as e:
-            logger.debug('blacklist notify failed (non-fatal): %s', e)
-
-    def _is_provider_failure(self, metadata) -> bool:
-        """True if a failure is provider-wide (402/credit) — must NOT climb the model ladder."""
-        if not metadata:
-            return False
-        if metadata.get('provider_blocked') is True:
-            return True
-        err = str(metadata.get('error', '')).lower()
-        return ('402' in err) or ('insufficient' in err) or ('credit' in err)
-
-    def clear_penalty(self, model_id=None) -> int:
-        """Manual penalty clear (the /routing/penalty/clear endpoint). Returns count cleared."""
-        if model_id:
-            n = 1 if self._model_penalty.clear(model_id) else 0
-        else:
-            n = self._model_penalty.clear_all()
-        if n:
-            self._stats_dirty = True
-        return n
-
     def load_stats(self) -> None:
         """Load _model_success_stats from msgpack sidecar on startup.
 
@@ -820,10 +766,6 @@ class RoutingEngine:
         try:
             with open(self._stats_cache_path, "rb") as f:
                 data = msgpack.unpackb(f.read(), raw=False)
-            # Penalty/blacklist state is TTL-EXEMPT — load it UNCONDITIONALLY, BEFORE the
-            # >24h stale-stats discard, or long-box/blacklist entries evaporate on a
-            # quiet-day restart (the recurring bug this feature exists to kill).
-            self._model_penalty.from_dict(data.get("penalty"))
             saved_at = data.get("saved_at", 0)
             if time.time() - saved_at > 86400:
                 logger.info(
@@ -857,7 +799,6 @@ class RoutingEngine:
                 f.write(msgpack.packb({
                     "saved_at": time.time(),
                     "stats": dict(self._model_success_stats),
-                    "penalty": self._model_penalty.to_dict(),
                 }))
             self._stats_dirty = False
             logger.debug(
@@ -983,27 +924,36 @@ class RoutingEngine:
                     [m.model_id for m in candidates[:5]],
                 )
 
-        # Per-model penalty box veto (Layer B) — supersedes the former triplicated
-        # _SUCCESS_FLOOR block (#291): the escalating, persistent, asymmetric version.
-        # VETO-ONLY: excludes in-penalty / blacklisted models; never contributes a score.
         if candidates:
-            eligible = [m for m in candidates
-                        if not self._model_penalty.is_penalized(m.model_id)]
-            if eligible:
-                pruned = len(candidates) - len(eligible)
-                if pruned:
-                    logger.info("Penalty box excluded %d model(s)", pruned)
-                candidates = eligible
-            else:
-                # All candidates penalized — never hard-fail purely from the box.
-                # Fallthrough ORDER: least-penalized first; a blacklisted (L7) model is
-                # the absolute last resort (law-enforcer HIGH).
-                candidates = sorted(
-                    candidates, key=lambda m: self._model_penalty.level(m.model_id))
-                logger.warning(
-                    "Penalty box would exclude ALL %d candidates — keeping pool, "
-                    "least-penalized first (blacklist last), to avoid routing failure",
-                    len(candidates))
+            sf, pr = [], 0
+            for m in candidates:
+                ms = self._model_success_stats.get(m.model_id, [])
+                if len(ms) >= self._SUCCESS_MIN_SAMPLES and sum(ms)/len(ms) < self._SUCCESS_FLOOR:
+                    pr += 1; continue
+                sf.append(m)
+            if sf:
+                if pr: logger.info("Success-rate floor pruned %d model(s)", pr)
+                candidates = sf
+        if candidates:
+            sf, pr = [], 0
+            for m in candidates:
+                ms = self._model_success_stats.get(m.model_id, [])
+                if len(ms) >= self._SUCCESS_MIN_SAMPLES and sum(ms)/len(ms) < self._SUCCESS_FLOOR:
+                    pr += 1; continue
+                sf.append(m)
+            if sf:
+                if pr: logger.info("Success-rate floor pruned %d model(s)", pr)
+                candidates = sf
+        if candidates:
+            sf, pr = [], 0
+            for m in candidates:
+                ms = self._model_success_stats.get(m.model_id, [])
+                if len(ms) >= self._SUCCESS_MIN_SAMPLES and sum(ms)/len(ms) < self._SUCCESS_FLOOR:
+                    pr += 1; continue
+                sf.append(m)
+            if sf:
+                if pr: logger.info("Success-rate floor pruned %d model(s)", pr)
+                candidates = sf
         return candidates, quality_floor_bypassed
 
     # -------------------------------------------------------------------
