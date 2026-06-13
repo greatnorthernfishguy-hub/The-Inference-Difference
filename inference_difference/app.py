@@ -2046,6 +2046,31 @@ async def set_routing_mode_endpoint(req: RoutingModeRequest) -> Dict[str, Any]:
     return {"mode": req.mode, "ok": True}
 
 
+class PenaltyClearRequest(BaseModel):
+    """Request body for POST /routing/penalty/clear."""
+    model_id: str = ""
+    all: bool = False
+
+
+@app.post("/routing/penalty/clear")
+async def clear_penalty_endpoint(req: PenaltyClearRequest) -> Dict[str, Any]:
+    """Clear a model's penalty-box state (manual operator override / Anima GUI).
+
+    {"model_id": "<id>"} clears one; {"all": true} clears all penalties + blacklists.
+    """
+    if _state.engine is None:
+        raise HTTPException(status_code=503, detail="engine not initialized")
+    if req.all:
+        n = _state.engine.clear_penalty(None)
+    elif req.model_id:
+        n = _state.engine.clear_penalty(req.model_id)
+    else:
+        raise HTTPException(status_code=422, detail="model_id or all=true required")
+    _state.engine.save_stats()
+    logger.info("Penalty cleared via endpoint: %d entr(ies)", n)
+    return {"cleared": n, "ok": True}
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Health check with hardware and model status."""

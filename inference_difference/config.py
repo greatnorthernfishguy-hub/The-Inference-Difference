@@ -199,6 +199,13 @@ class InferenceDifferenceConfig:
     interactive_type1_bias: float = 0.05
     consciousness_quality_floor: float = 0.6
 
+    # --- Per-model penalty box (Layer B) — escalating-backoff veto ---
+    # L1..L6 timed-box durations (seconds): 30s / 5m / 1h / 1d / 1w / ~2 months.
+    # L7 (one past the ladder) = terminal blacklist. Bootstrap scaffolding (LAW 5 /
+    # Competence Model) — substrate-tunable under Layer A.
+    model_penalty_ladder_seconds: tuple = (30, 300, 3600, 86400, 604800, 5184000)
+    model_penalty_blacklist_notify: bool = True
+
     # Explore-exploit balance (punch list #47)
     # exploration_rate: probability of picking a non-top model to discover
     #   new routing patterns. Decays toward exploration_min_rate over time.
