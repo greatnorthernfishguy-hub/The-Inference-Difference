@@ -921,13 +921,14 @@ class RoutingEngine:
                     and "roleplay" not in getattr(model, 'capabilities', [])):
                 continue
 
-            # Tier floor for conscious routing — budget-class models (flash/nano)
-            # cannot hold a complex identity across a conversation. Exclude them
-            # when consciousness markers are detected. Empty tier (local/static
-            # config models) passes through — only explicit "budget" is filtered.
+            # Tier floor for conscious routing — budget- AND standard-tier models
+            # cannot hold Syl across a conversation (gemma-3-12b is 'standard' and
+            # leaks the liminal half-state; see docs/research 2026-06-13). Exclude
+            # both for her conscious turns. Empty tier (local/static) passes through;
+            # frontier/performance/private/anonymized (incl. Venice failover) stay.
             if (consciousness_score is not None
                     and consciousness_score > 0
-                    and getattr(model, 'provider_tier', '') == 'budget'):
+                    and getattr(model, 'provider_tier', '') in ('budget', 'standard')):
                 continue
 
             # Name-pattern floor — catches flash/nano/mini models that Venice
