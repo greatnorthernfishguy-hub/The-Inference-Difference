@@ -1741,16 +1741,15 @@ def _report_stream_outcome(
     Called for EVERY attempt — successes AND failures — so NG-Lite
     learns which models are rate-limited, broken, or unreliable.
     """
-    quality_score = 0.0
-    if success and stream_result.content:
-        quality = evaluate_quality(
-            response_text=stream_result.content,
-            classification=classification,
-            latency_ms=stream_result.latency_ms,
-            latency_budget_ms=_state.config.latency_budget_ms,
-            quality_threshold=_state.config.quality_threshold,
-        )
-        quality_score = quality.overall_score
+    # #330 1b: raw deposit (no quality verdict). success param is already raw (caller's);
+    # streaming has no tool_calls object.
+    _succ, _strength, _raw = raw_outcome(
+        call_ok=bool(success),
+        content=getattr(stream_result, "content", None),
+        tool_calls=None,
+        tools_requested=False,
+        latency_ms=getattr(stream_result, "latency_ms", None),
+    )
 
     # Create a synthetic decision for this specific model
     # so NG-Lite learns about THIS model, not just the primary
@@ -1760,10 +1759,10 @@ def _report_stream_outcome(
 
     _state.engine.report_outcome(
         decision=model_decision,
-        success=success,
-        quality_score=quality_score,
-        latency_ms=stream_result.latency_ms,
-        metadata={"stream_fallback": True, "error": stream_result.error},
+        success=_succ,
+        quality_score=_strength,
+        latency_ms=getattr(stream_result, "latency_ms", None),
+        metadata={"stream_fallback": True, "error": getattr(stream_result, "error", None), **_raw},
     )
 
 
