@@ -8,6 +8,9 @@ version: 1
 blocklist:
   providers: []
   models:
+    # Gov-shutdown / dead 2026 (US export restriction). OpenRouter still LISTS it but
+    # every call 404s "no endpoints". Reversible: delete these two lines if it returns. (#331 1a)
+    - "openrouter/anthropic/claude-fable-5"
     # Removed from pool — qwen2.5:1.5b routing catastrophe (punch list #1)
     - "ollama/qwen2.5:1.5b"
     - "openrouter/openai/gpt-4o-mini-search-preview"
