@@ -632,6 +632,9 @@ class RoutingEngine:
             # Quality score modulates learning strength (#20):
             # A 0.95 quality response teaches more strongly than 0.60.
             # Minimum 0.1 so even low-quality successes still register.
+            # #330/#331 1b: `quality_score` is now a UNIFORM raw strength (1.0), not a quality
+            # verdict — the deposit no longer carries evaluate_quality's surface+latency judgment.
+            # max(0.1, 1.0)=1.0 on success, 1.0 on failure -> uniform; behavior unchanged here.
             outcome_strength = max(0.1, quality_score) if success else 1.0
             self._ng_lite.record_outcome(
                 embedding=embedding,
