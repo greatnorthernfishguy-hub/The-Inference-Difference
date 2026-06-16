@@ -228,6 +228,7 @@ from inference_difference.et_module import (
 from inference_difference.hardware import HardwareProfile, detect_hardware
 from inference_difference.model_client import ModelClient, ModelResponse, StreamResult
 from inference_difference.quality import evaluate_quality
+from inference_difference.outcome import raw_outcome
 from inference_difference.router import RoutingEngine
 from inference_difference.translation_shim import translate_request
 from inference_difference.responses_endpoint import (
@@ -1467,15 +1468,24 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
 
     # Teach NG-Lite from outcome (caller never sees this)
     if decision is not None:
+        _succ, _strength, _raw = raw_outcome(
+            call_ok=model_response.success,
+            content=model_response.content,
+            tool_calls=model_response.tool_calls,
+            tools_requested=bool(req.tools),
+            latency_ms=model_response.latency_ms,
+            finish_reason=getattr(model_response, "finish_reason", None),
+        )
         _state.engine.report_outcome(
             decision=decision,
-            success=model_response.success and quality.is_success,
-            quality_score=quality.overall_score,
+            success=_succ,
+            quality_score=_strength,
             latency_ms=model_response.latency_ms,
             metadata={
                 "cascade_depth": len(tried_models) - 1,
                 "cascade_total_ms": time.monotonic() * 1000 - _cascade_start_ms,
                 "models_tried": tried_models,
+                **_raw,
             },
         )
 

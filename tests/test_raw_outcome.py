@@ -27,3 +27,11 @@ def test_slow_usable_response_is_still_success():
     ok, strength, _ = raw_outcome(call_ok=True, content="A thorough, correct answer.",
                                   tool_calls=None, tools_requested=False, latency_ms=99999.0)
     assert ok is True and strength == 1.0
+
+
+def test_nonstreaming_deposit_uses_raw_success():
+    # The deposit keys on raw usability, NOT quality.is_success: slow+usable -> success.
+    ok, strength, meta = raw_outcome(call_ok=True, content="answer", tool_calls=None,
+                                     tools_requested=True, latency_ms=90000.0)
+    assert ok is True
+    assert meta["tools_requested"] is True
