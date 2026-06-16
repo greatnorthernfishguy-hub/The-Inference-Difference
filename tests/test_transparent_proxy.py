@@ -30,6 +30,7 @@ class MockModelResponse:
         success: bool = True,
         error: str = "",
         latency_ms: float = 150.0,
+        tool_calls = None,
     ):
         self.id = f"chatcmpl-mock-{int(time.time())}"
         self.model = model
@@ -42,6 +43,7 @@ class MockModelResponse:
         }
         self.latency_ms = latency_ms
         self.raw = {}
+        self.tool_calls = tool_calls  # mirrors real ModelResponse.tool_calls (default None)
         self.success = success
         self.error = error
 
