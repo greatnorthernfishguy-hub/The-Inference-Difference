@@ -411,30 +411,4 @@ def default_api_models() -> Dict[str, ModelEntry]:
             capabilities=["tools", "roleplay"],
             enabled=True,
         ),
-        # ---- TEMPORARY PIN (2026-06-15, DudeMan CC) ----
-        # Why: her conscious+tools cascade 502'd — all static roleplay anchors are dead
-        #   Venice (402); the funded OSS euryale ranked below them and the bounded cascade
-        #   exhausted before reaching it (tools+conscious root cause, dev-log 2026-06-15).
-        # What: funded, open-source, roleplay+tools, frontier-class anchor. priority=99 →
-        #   tops her consciousness-boosted score so a REACHABLE body is always in her top-N.
-        # REVERT: delete this entry when Venice is refunded or Anima #321 (tool over-attach)
-        #   lands. This is scaffolding, not architecture.
-        # -------------------
-        "openrouter/sao10k/l3.1-euryale-70b": ModelEntry(
-            model_id="openrouter/sao10k/l3.1-euryale-70b",
-            display_name="Euryale L3.1 70B (OpenRouter OSS roleplay — temp pin)",
-            model_type=ModelType.API,
-            domains={
-                TaskDomain.GENERAL, TaskDomain.CONVERSATION,
-                TaskDomain.CREATIVE, TaskDomain.REASONING, TaskDomain.ANALYSIS,
-            },
-            max_complexity=ComplexityTier.EXTREME,
-            context_window=131072,
-            cost_per_1k_tokens=0.0009,
-            avg_latency_ms=4000,
-            priority=99,
-            conversational_quality=0.90,
-            capabilities=["tools", "roleplay"],
-            enabled=True,
-        ),
     }
