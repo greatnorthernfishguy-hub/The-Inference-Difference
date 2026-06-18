@@ -313,6 +313,11 @@ class RoutingEngine:
         self._stats_cache_path = os.path.join(_base_dir, "model_stats_cache.msgpack")
         self._stats_dirty = False
 
+        # [2026-06-17] CC — two-axis routing (prd 2026-06-17): tool_competence store
+        # Tool-competence axis: per-model graded [0,1] reliability at operating tools,
+        # learned SEPARATELY from her-fit. Persisted TTL-exempt (later task).
+        self._tool_competence: Dict[str, float] = {}
+
     def route(
         self,
         classification: RequestClassification,
@@ -831,6 +836,33 @@ class RoutingEngine:
         penalty box or count as a her-fit success-stat failure (prd 2026-06-17 §2).
         """
         return self._tool_failure_kind(metadata) is not None
+
+    # [2026-06-17] CC — two-axis routing (prd 2026-06-17): tool_competence prior + update
+    def _tool_competence_prior(self, model_entry) -> float:
+        """Bootstrap prior from the catalog 'tools' flag (overridden by observed reality)."""
+        caps = getattr(model_entry, "capabilities", []) or []
+        if "tools" in caps:
+            return float(self.config.tool_competence_prior_capable)
+        return float(self.config.tool_competence_prior_unflagged)
+
+    def _get_tool_competence(self, model_id: str, model_entry=None) -> float:
+        """Learned tool-competence if observed, else the catalog bootstrap prior."""
+        if model_id in self._tool_competence:
+            return self._tool_competence[model_id]
+        return self._tool_competence_prior(model_entry) if model_entry is not None else 0.5
+
+    def _update_tool_competence(self, model_id: str, *, success: bool,
+                                structural: bool = False, model_entry=None) -> None:
+        """Asymmetric update (slow up / fast down). Structural failure floors to 0."""
+        cur = self._get_tool_competence(model_id, model_entry)
+        if success:
+            new = min(1.0, cur + self.config.tool_competence_gain)
+        elif structural:
+            new = 0.0  # definitive "no endpoints support tools" — hard floor
+        else:
+            new = max(0.0, cur - self.config.tool_competence_loss)
+        self._tool_competence[model_id] = new
+        self._stats_dirty = True
 
     def clear_penalty(self, model_id=None) -> int:
         """Manual penalty clear (the /routing/penalty/clear endpoint). Returns count cleared."""

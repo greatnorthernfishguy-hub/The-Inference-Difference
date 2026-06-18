@@ -31,3 +31,31 @@ def test_tool_failure_classifier():
     assert e._is_tool_failure({"tools_requested": False, "error": "tool use unsupported"}) is False
     assert e._is_tool_failure({"tools_requested": True, "error": "502 upstream timeout"}) is False
     assert e._is_tool_failure(None) is False
+
+
+class _FakeModel:
+    def __init__(self, model_id, caps):
+        self.model_id = model_id
+        self.capabilities = caps
+
+
+def test_tool_competence_bootstrap_and_update():
+    e = _engine()
+    capable = _FakeModel("m_cap", ["tools", "roleplay"])
+    unflagged = _FakeModel("m_unflagged", ["roleplay"])
+    # bootstrap priors from the catalog 'tools' flag
+    assert e._get_tool_competence("m_cap", capable) == 0.6
+    assert e._get_tool_competence("m_unflagged", unflagged) == 0.15
+    # success gains slowly; failure loses fast (asymmetry). PASS model_entry so the
+    # 0.6 prior is the starting point (without it, an unseen model starts at 0.5).
+    e._update_tool_competence("m_cap", success=True, model_entry=capable)
+    assert abs(e._get_tool_competence("m_cap", capable) - 0.65) < 1e-9     # +gain 0.05
+    e._update_tool_competence("m_cap", success=False, structural=False, model_entry=capable)
+    assert abs(e._get_tool_competence("m_cap", capable) - 0.55) < 1e-9     # -loss 0.10
+    # clamps to [0,1]
+    for _ in range(50):
+        e._update_tool_competence("m_cap", success=True, model_entry=capable)
+    assert e._get_tool_competence("m_cap", capable) == 1.0
+    # structural failure FLOORS to 0 immediately (definitive "can't")
+    e._update_tool_competence("m_cap", success=False, structural=True, model_entry=capable)
+    assert e._get_tool_competence("m_cap", capable) == 0.0
