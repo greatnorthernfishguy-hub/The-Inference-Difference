@@ -222,6 +222,16 @@ class InferenceDifferenceConfig:
     open_source_bias: float = 0.02           # Tie-break for open-weights models at equal tier
     quality_severity_amplification: float = 4.0  # Adaptive quality weight scaling — worst metric dominates (LAW 5: tune via config, not hardcoded)
 
+    # [2026-06-18] CC — two-axis routing: tool_competence config params (prd 2026-06-17)
+    # --- Two-axis routing (her-fit × tool-competence) — prd 2026-06-17 ---
+    # Bootstrap scaffolding (LAW 5 / Competence Model) — the substrate is meant to outgrow these.
+    tool_competence_gain: float = 0.05          # asymmetric: slow to earn (Elmer TuningSocket gain)
+    tool_competence_loss: float = 0.10          # asymmetric: fast to lose (2:1)
+    tool_competence_prior_capable: float = 0.6  # bootstrap prior when catalog flags 'tools'
+    tool_competence_prior_unflagged: float = 0.15  # bootstrap prior when catalog does not
+    tool_withhold_floor: float = 0.15           # < floor => withhold tools from the provider call
+    tool_competence_weight: float = 0.10        # secondary score weight; MUST stay below her-fit weights
+
     # Domain match scores (exact, secondary, general, none)
     domain_score_exact: float = 1.0
     domain_score_secondary: float = 0.6
