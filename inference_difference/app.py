@@ -1389,6 +1389,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
                     "failed_model": tried_models[-1],
                     "fallback_to": fallback_id,
                     "error": str(model_response.error)[:200],
+                    "tools_requested": bool(req.tools),  # [2026-06-17] CC — two-axis routing (prd 2026-06-17): enable tool-failure classifier
                 },
             )
 

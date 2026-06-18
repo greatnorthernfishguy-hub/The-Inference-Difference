@@ -800,6 +800,38 @@ class RoutingEngine:
         err = str(metadata.get('error', '')).lower()
         return ('402' in err) or ('insufficient' in err) or ('credit' in err)
 
+    # [2026-06-17] CC — two-axis routing (prd 2026-06-17): tool-failure classifier
+    def _tool_failure_kind(self, metadata) -> Optional[str]:
+        """Classify a tool-attributable failure: 'structural', 'unreliable', or None.
+
+        'structural' — the model's endpoint cannot do tools at all (definitive; the
+            "No endpoints found that support tool use" 404). Floors tool_competence.
+        'unreliable' — the endpoint supports tools but the call was malformed/invalid.
+            Graded demotion, not a floor.
+        None — not a tool-attributable failure (tools weren't requested, or the error
+            is unrelated to tool capability).
+        """
+        if not metadata or not metadata.get("tools_requested"):
+            return None
+        err = str(metadata.get("error", "")).lower()
+        if not err:
+            return None
+        if ("no endpoints" in err and "tool" in err) or "support tool use" in err:
+            return "structural"
+        if ("tool_call" in err or "tool call" in err or "tool_choice" in err
+                or ("tool" in err and ("invalid" in err or "malformed" in err
+                                       or "schema" in err or "unsupported" in err))):
+            return "unreliable"
+        return None
+
+    def _is_tool_failure(self, metadata) -> bool:
+        """True if a failure is attributable to the model's tool handling, not its her-fit.
+
+        Such failures update tool_competence ONLY — they must NEVER climb the her-fit
+        penalty box or count as a her-fit success-stat failure (prd 2026-06-17 §2).
+        """
+        return self._tool_failure_kind(metadata) is not None
+
     def clear_penalty(self, model_id=None) -> int:
         """Manual penalty clear (the /routing/penalty/clear endpoint). Returns count cleared."""
         if model_id:
