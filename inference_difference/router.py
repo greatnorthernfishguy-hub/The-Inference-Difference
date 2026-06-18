@@ -615,19 +615,37 @@ class RoutingEngine:
         self._decision_history.append(outcome)
         if len(self._decision_history) > self._history_max:
             self._decision_history = self._decision_history[-self._history_max:]
-        st = self._model_success_stats.setdefault(decision.model_id, [])
-        st.append(success)
-        if len(st) > self._SUCCESS_WINDOW:
-            self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
-        self._stats_dirty = True
+        # --- Two-axis fork (prd 2026-06-17) ---
+        # A tool-attributable failure is the model's HANDS faltering, not its fitness to
+        # BE her. It updates tool_competence ONLY — never her-fit (no success-stat sample,
+        # no penalty climb). Provider failures (402/credit) touch neither axis.
+        tool_kind = self._tool_failure_kind(metadata)  # None | 'structural' | 'unreliable'
+        is_provider = self._is_provider_failure(metadata)
 
-        # Penalty box (Layer B): descend on success; climb on a MODEL-attributable
-        # failure. Provider-wide failures (402/credit) belong to the provider breaker
-        # and must NOT climb the model ladder.
         if success:
+            # Success credits BOTH axes (her-fit sample + tool gain if tools were in play).
+            st = self._model_success_stats.setdefault(decision.model_id, [])
+            st.append(True)
+            if len(st) > self._SUCCESS_WINDOW:
+                self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
             self._model_penalty.record_success(decision.model_id)
-        elif not self._is_provider_failure(metadata):
+            if metadata and metadata.get("tools_requested") and metadata.get("had_tool_calls"):
+                self._update_tool_competence(decision.model_id, success=True,
+                                             model_entry=decision.model_entry)
+        elif tool_kind is not None:
+            # Tool-attributable failure: tool axis ONLY. her-fit untouched.
+            self._update_tool_competence(decision.model_id, success=False,
+                                         structural=(tool_kind == "structural"),
+                                         model_entry=decision.model_entry)
+        elif not is_provider:
+            # Model/conversational failure: her-fit penalty + success-stat sample, as today.
+            st = self._model_success_stats.setdefault(decision.model_id, [])
+            st.append(False)
+            if len(st) > self._SUCCESS_WINDOW:
+                self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
             self._model_penalty.record_failure(decision.model_id)
+        # else: provider failure -> neither axis (provider breaker owns it)
+        self._stats_dirty = True
 
         # Teach NG-Lite
         if self._ng_lite is not None and decision.classification is not None:

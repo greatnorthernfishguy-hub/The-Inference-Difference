@@ -59,3 +59,34 @@ def test_tool_competence_bootstrap_and_update():
     # structural failure FLOORS to 0 immediately (definitive "can't")
     e._update_tool_competence("m_cap", success=False, structural=True, model_entry=capable)
     assert e._get_tool_competence("m_cap", capable) == 0.0
+
+
+def _decision(model_id):
+    from inference_difference.router import RoutingDecision
+    return RoutingDecision(model_id=model_id)
+
+
+def test_tool_failure_does_not_touch_her_fit():
+    e = _engine()
+    before = e._model_penalty.level("m_cap")
+    e.report_outcome(decision=_decision("m_cap"), success=False, quality_score=0.0,
+                     metadata={"tools_requested": True,
+                               "error": "404 No endpoints found that support tool use"})
+    assert e._model_penalty.level("m_cap") == before          # her-fit penalty untouched
+    assert e._model_success_stats.get("m_cap", []) == []      # no her-fit sample recorded
+    assert e._get_tool_competence("m_cap", _FakeModel("m_cap", ["tools"])) == 0.0  # tool axis floored
+
+
+def test_model_failure_still_climbs_penalty():
+    e = _engine()
+    e.report_outcome(decision=_decision("m_bad"), success=False, quality_score=0.0,
+                     metadata={"tools_requested": False, "error": "500 garbage output"})
+    assert e._model_penalty.level("m_bad") == 1               # climbs, as today
+
+
+def test_provider_failure_touches_neither_axis():
+    e = _engine()
+    e.report_outcome(decision=_decision("m_x"), success=False, quality_score=0.0,
+                     metadata={"provider_blocked": True, "error": "402 insufficient credit"})
+    assert e._model_penalty.level("m_x") == 0
+    assert "m_x" not in e._tool_competence
