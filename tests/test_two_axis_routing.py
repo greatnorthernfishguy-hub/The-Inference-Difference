@@ -145,3 +145,11 @@ def test_tool_competence_persists_round_trip(tmp_path):
     e2.load_stats()
     assert e2._get_tool_competence("m_cap", _FakeModel("m_cap", ["tools"])) == 0.0
     assert e2._get_tool_competence("m_good", _FakeModel("m_good", ["tools"])) == 0.85
+
+
+def test_should_withhold_tools():
+    e = _engine()
+    e._tool_competence = {"floored": 0.0, "fine": 0.5}
+    assert e.should_withhold_tools("floored") is True     # below floor 0.15
+    assert e.should_withhold_tools("fine") is False
+    assert e.should_withhold_tools("unknown") is False    # no entry -> 0.5 default -> keep tools

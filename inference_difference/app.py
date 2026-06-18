@@ -1330,6 +1330,16 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     if req.tools:
         req.tools = _normalize_tools(req.tools, selected_model)
 
+    # --- Tool withhold (prd 2026-06-17) ---
+    # A model proven tool-incapable still carries her voice, but we strip tools from the
+    # call rather than offer a wrench it can't hold (no wasted 404). Single point covers
+    # both the blocking and streaming paths (both read req.tools / req.tool_choice).
+    if req.tools and decision is not None and _state.engine.should_withhold_tools(decision.model_id):
+        logger.info("Withholding tools from %s (proven tool-incapable) — routing for her voice",
+                    decision.model_id)
+        req.tools = None
+        req.tool_choice = None
+
     # --- Step 5: Forward to provider ---
     # Branch: streaming vs blocking. Most chat UIs send stream=true
     # by default — without this path, the client hangs waiting for SSE

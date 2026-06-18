@@ -801,6 +801,11 @@ class RoutingEngine:
         self.routing_mode = mode
         logger.info("Routing mode set to %r", mode)
 
+    def should_withhold_tools(self, model_id: str, model_entry=None) -> bool:
+        """True if this model is proven tool-incapable — route to it but strip tools (prd 2026-06-17)."""
+        # [2026-06-17] CC — two-axis routing: withhold (not exclude) tools from floored models.
+        return self._get_tool_competence(model_id, model_entry) < self.config.tool_withhold_floor
+
     def _on_model_blacklist(self, model_id: str) -> None:
         """Best-effort dev-log notice when a model hits L7 blacklist. Never raises."""
         logger.warning("MODEL BLACKLISTED (penalty box L7): %s", model_id)
