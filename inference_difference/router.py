@@ -909,6 +909,21 @@ class RoutingEngine:
             # >24h stale-stats discard, or long-box/blacklist entries evaporate on a
             # quiet-day restart (the recurring bug this feature exists to kill).
             self._model_penalty.from_dict(data.get("penalty"))
+            # tool_competence is learned capability, NOT stale stats — load it
+            # UNCONDITIONALLY (TTL-exempt), same rationale as penalty (prd 2026-06-17 §4).
+            # ---- Changelog ----
+            # [2026-06-18] CC — Task 5: persist tool_competence (TTL-exempt)
+            # What: Restore tool_competence dict from sidecar on startup.
+            # Why: A model proven tool-incapable must survive restart; TTL discard
+            #   only applies to volatile success-rate samples, not structural capability.
+            # How: Load before the >24h stale-stats guard, same as penalty restore.
+            # -------------------
+            _tc = data.get("tool_competence")
+            if isinstance(_tc, dict):
+                self._tool_competence = {
+                    str(k): float(v) for k, v in _tc.items()
+                    if isinstance(v, (int, float))
+                }
             saved_at = data.get("saved_at", 0)
             if time.time() - saved_at > 86400:
                 logger.info(
@@ -943,6 +958,14 @@ class RoutingEngine:
                     "saved_at": time.time(),
                     "stats": dict(self._model_success_stats),
                     "penalty": self._model_penalty.to_dict(),
+                    # ---- Changelog ----
+                    # [2026-06-18] CC — Task 5: persist tool_competence (TTL-exempt)
+                    # What: Include learned tool capability scores in the sidecar.
+                    # Why: Survival across restart — a model proven tool-incapable
+                    #   must stay known so the pool can't re-collapse on cold start.
+                    # How: Dict snapshot alongside penalty; loaded TTL-exempt in load_stats.
+                    # -------------------
+                    "tool_competence": dict(self._tool_competence),
                 }))
             self._stats_dirty = False
             logger.debug(

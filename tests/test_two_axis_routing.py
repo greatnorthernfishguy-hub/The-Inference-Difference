@@ -90,3 +90,16 @@ def test_provider_failure_touches_neither_axis():
                      metadata={"provider_blocked": True, "error": "402 insufficient credit"})
     assert e._model_penalty.level("m_x") == 0
     assert "m_x" not in e._tool_competence
+
+
+def test_tool_competence_persists_round_trip(tmp_path):
+    e = _engine()
+    e._tool_competence = {"m_cap": 0.0, "m_good": 0.85}
+    e._stats_cache_path = str(tmp_path / "stats.msgpack")
+    e._stats_dirty = True
+    e.save_stats()
+    e2 = _engine()
+    e2._stats_cache_path = e._stats_cache_path
+    e2.load_stats()
+    assert e2._get_tool_competence("m_cap", _FakeModel("m_cap", ["tools"])) == 0.0
+    assert e2._get_tool_competence("m_good", _FakeModel("m_good", ["tools"])) == 0.85
