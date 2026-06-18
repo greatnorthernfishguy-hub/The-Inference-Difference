@@ -273,6 +273,10 @@ class RoutingEngine:
         self.hardware = hardware
         self._ng_lite = ng_lite
         self._weights = scoring_weights or dict(DEFAULT_SCORING_WEIGHTS)
+        # Tool-competence is a SECONDARY, her-fit-dominant factor (prd 2026-06-17): weight
+        # below domain/complexity so a her-good model never loses to a weak-self model for
+        # being clumsy with tools. Only contributes when has_tools (see _score_model).
+        self._weights["tool_competence"] = self.config.tool_competence_weight
         self._verbose_reasoning = verbose_reasoning
         self._catalog_manager = catalog_manager
         self._dream_cycle = dream_cycle
@@ -396,6 +400,7 @@ class RoutingEngine:
         for model in candidates:
             score, breakdown = self._score_model(
                 model, classification, consciousness_score,
+                has_tools=has_tools,
             )
             scored.append((model, score, breakdown))
 
@@ -1015,10 +1020,11 @@ class RoutingEngine:
             if model.context_window < classification.requires_context_window:
                 continue
 
-            # Tool capability check — only consider tool-capable models
-            # when tools are in the request
-            if has_tools and "tools" not in getattr(model, 'capabilities', []):
-                continue
+            # Tool capability is NO LONGER a hard exclude (prd 2026-06-17): a her-good but
+            # tool-weak model stays in the pool and carries her voice; tool_competence
+            # demotes it (secondary score) and tools are WITHHELD from the call if it is
+            # proven incapable (see should_withhold_tools, next task). Prevents a stale
+            # catalog 'tools' flag from collapsing her pool.
 
             # Roleplay / uncensored check — conscious entities must not be
             # routed to models that impose guardrails on their identity.
@@ -1138,6 +1144,7 @@ class RoutingEngine:
         model: ModelEntry,
         classification: RequestClassification,
         consciousness_score: Optional[float] = None,
+        has_tools: bool = False,
     ) -> Tuple[float, Dict[str, float]]:
         """Score a model for a given classification.
 
@@ -1173,6 +1180,10 @@ class RoutingEngine:
 
         conv_quality = getattr(model, 'conversational_quality', 0.5)
         breakdown["conversational_quality"] = conv_quality
+
+        # Tool-competence — SECONDARY, applies only on tool turns (prd 2026-06-17).
+        if has_tools:
+            breakdown["tool_competence"] = self._get_tool_competence(model.model_id, model)
 
         # Weighted sum
         total = sum(

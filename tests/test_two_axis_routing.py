@@ -92,6 +92,48 @@ def test_provider_failure_touches_neither_axis():
     assert "m_x" not in e._tool_competence
 
 
+import types
+
+
+def test_tool_competence_weight_is_subordinate_to_her_fit():
+    e = _engine()
+    # weight injected, and STRICTLY below the her-fit weights => her-fit dominates
+    assert e._weights["tool_competence"] == 0.10
+    assert e._weights["tool_competence"] < e._weights["domain_match"]
+    assert e._weights["tool_competence"] < e._weights["complexity_fit"]
+
+
+def test_score_model_tool_competence_breakdown_and_dominance(monkeypatch):
+    e = _engine()
+    # stub the her-fit sub-scores so we control them deterministically
+    def fake_sub(model, classification):
+        return 0.9 if model.model_id == "good_self" else 0.2
+    monkeypatch.setattr(e, "_score_domain", fake_sub)
+    monkeypatch.setattr(e, "_score_complexity", fake_sub)
+    monkeypatch.setattr(e, "_score_learned", lambda m, c: 0.5)
+    monkeypatch.setattr(e, "_score_cost", lambda m, success_rate=1.0: 0.5)
+    monkeypatch.setattr(e, "_score_latency", lambda m, c: 0.5)
+
+    def mk(mid, tc):
+        e._tool_competence[mid] = tc
+        # SimpleNamespace with the attrs _score_model reads; ADD MORE if _score_model's
+        # tail raises AttributeError (e.g. provider="", model_type, provider_tier="") —
+        # the POINT of this test is the two assertions below, so make it run.
+        return types.SimpleNamespace(model_id=mid, priority=50,
+                                     conversational_quality=0.5, capabilities=["tools"],
+                                     provider="", provider_tier="")
+    good = mk("good_self", 0.0)   # great self, FLOORED tools
+    weak = mk("weak_self", 1.0)   # weak self, perfect tools
+
+    s_good, bd_good = e._score_model(good, classification=None, has_tools=True)
+    s_weak, _bd_weak = e._score_model(weak, classification=None, has_tools=True)
+    assert "tool_competence" in bd_good           # breakdown key present on tool turns
+    assert s_good > s_weak                         # her-fit DOMINATES tool_competence
+    # conversation turn: tool_competence is NOT scored
+    _s, bd_conv = e._score_model(good, classification=None, has_tools=False)
+    assert "tool_competence" not in bd_conv
+
+
 def test_tool_competence_persists_round_trip(tmp_path):
     e = _engine()
     e._tool_competence = {"m_cap": 0.0, "m_good": 0.85}
