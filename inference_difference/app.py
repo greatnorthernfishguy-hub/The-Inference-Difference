@@ -1411,10 +1411,14 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
 
         # If the model rejected tools, retry without them — better a
         # text-only response than total silence.
-        error_str = str(model_response.error or "")
-        tools_rejected = "tools" in error_str and "not supported" in error_str
-        retry_tools = None if tools_rejected else req.tools
-        retry_tool_choice = None if tools_rejected else req.tool_choice
+        error_str = str(model_response.error or "").lower()
+        # reactive (prev model said tools unsupported) OR proactive (this fallback is
+        # proven tool-incapable, prd 2026-06-17 cascade-withhold) -> strip tools so the
+        # fallback answers in text instead of a 'no endpoints support tool use' 404.
+        tools_rejected = "tool" in error_str and ("not supported" in error_str or "support tool use" in error_str or "no endpoints" in error_str)
+        _fb_withhold = (req.tools is not None) and (_state.engine is not None) and _state.engine.should_withhold_tools(fallback_id)
+        retry_tools = None if (tools_rejected or _fb_withhold) else req.tools
+        retry_tool_choice = None if (tools_rejected or _fb_withhold) else req.tool_choice
         if tools_rejected:
             logger.info(
                 "Model %s rejected tools, retrying %s without tools",
@@ -1632,13 +1636,21 @@ def _stream_response(
                 logger.info("Provider circuit open (%s) — skipping %s", _pkey, model_id)
                 continue
 
+            # [2026-06-19] CC — cascade-withhold (prd 2026-06-17): strip tools per-model
+            # for any cascade model proven tool-incapable, so it answers in her voice
+            # instead of 404ing 'no endpoints support tool use'. Covers the stream fallback
+            # chain (the gap Task 7 missed — it only covered the primary model).
+            _wh_s = (req.tools is not None) and (decision is not None) and (_state.engine is not None) \
+                and _state.engine.should_withhold_tools(model_id)
+            if _wh_s:
+                logger.info("Withholding tools from %s in stream cascade (tool-incapable) — her voice, not a 404", model_id)
             chunk_iter, stream_result = _state.model_client.call_stream(
                 model_id=model_id,
                 messages=req.messages,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
-                tools=req.tools,
-                tool_choice=req.tool_choice,
+                tools=(None if _wh_s else req.tools),
+                tool_choice=(None if _wh_s else req.tool_choice),
             )
 
             # Buffer chunks — if the model fails (HTTP error, timeout),
