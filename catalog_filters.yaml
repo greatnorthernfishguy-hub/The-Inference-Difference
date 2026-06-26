@@ -31,7 +31,8 @@ blocklist:
 allowlist:
   providers:
     - "openrouter"
-    - "venice"
+    # - "venice"   # [2026-06-25] DISCONNECTED (Josh): unfunded last-ditch. floor=30 kept its
+    #              # prio-35 private-tier models over funded OR -> malforms. Re-add this line to reconnect.
     - "huggingface"  # Added 2026-04-19 — broaden pool when OR+Venice both hit rate limits
 hard_ceiling:
   max_cost_per_1m_input_tokens: 20.00
