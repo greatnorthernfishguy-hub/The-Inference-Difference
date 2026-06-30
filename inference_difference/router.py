@@ -1348,8 +1348,8 @@ class RoutingEngine:
             if commons_score is not None:
                 trust = self._commons_competence.overall()
                 # Blend: at trust=0 pure NG-Lite; at trust=1 pure Commons.
-                # 0.05 floor ensures local substrate never goes silent.
-                trust = max(trust, 0.05)
+                # Ceiling at 0.95 ensures local substrate always contributes ≥5%.
+                trust = min(max(trust, 0.0), 0.95)
                 return ng_score * (1.0 - trust) + commons_score * trust
 
         return ng_score
