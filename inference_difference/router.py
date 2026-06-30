@@ -47,6 +47,14 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-06-30] Claude Code (Sonnet 4.6) — #97 TID Commons valence routing: peninsula body-side
+#   What: Wire TIDPeninsulaBody into RoutingEngine. deposit() called in report_outcome() after
+#     local NG-Lite record. _score_learned() blends enhanced peninsula score with NG-Lite score,
+#     weighted by CommonsCompetence.overall(). CommonsCompetence lives on the engine instance.
+#   Why: Gives TID routing decisions access to SNN-salted Commons intelligence via the
+#     intra-module peninsula (no second NGLite, no cross-module bridge, LAW-1 clean).
+#   How: _peninsula started lazily on first report_outcome() (fail-soft). Enhanced score from
+#     _peninsula.get_enhanced_score() blended into _score_learned() at Commons trust weight.
 # [2026-06-04] CC Sonnet 4.6 — #282: Routing mode toggle (personal/work)
 #   What: routing_mode attr on RoutingEngine (default "personal"), set_routing_mode(),
 #         mode gate added to roleplay filter in _filter_candidates().
@@ -281,6 +289,16 @@ class RoutingEngine:
         self._catalog_manager = catalog_manager
         self._dream_cycle = dream_cycle
         self._request_counter = 0
+
+        # TID peninsula — Commons-side connection for substrate-enriched routing.
+        # Started lazily on first report_outcome(); None until then or if unavailable.
+        try:
+            from inference_difference.tid_peninsula_body import start_tid_peninsula, CommonsCompetence
+            self._peninsula = start_tid_peninsula()
+            self._commons_competence = CommonsCompetence()
+        except Exception:
+            self._peninsula = None
+            self._commons_competence = None
 
         # User routing preference override (set via POST /routing/preference)
         # Tuple: (oss_boost, turns_remaining). None when inactive.
@@ -671,6 +689,31 @@ class RoutingEngine:
                 strength=outcome_strength,
                 metadata=metadata,
             )
+
+        # Peninsula deposit — send raw outcome to Commons-side for SNN enrichment.
+        if self._peninsula is not None and decision.classification is not None:
+            try:
+                dep_emb = self._classification_to_embedding(decision.classification)
+                her_fit = float(getattr(decision.model_entry, 'conversational_quality', 0.5)
+                                if decision.model_entry else 0.5)
+                cost_eff = (self._score_cost(decision.model_entry)
+                            if decision.model_entry else 0.5)
+                self._peninsula.deposit(
+                    embedding=dep_emb,
+                    model_id=decision.model_id,
+                    success=success,
+                    quality_score=quality_score,
+                    her_fit=her_fit,
+                    cost_efficiency=cost_eff,
+                )
+                # Update per-axis competence based on whether our her_fit estimate was right.
+                if self._commons_competence is not None:
+                    self._commons_competence.update("her_fit", success == (her_fit >= 0.5))
+                    self._commons_competence.update("reliability", success)
+                    self._commons_competence.update("quality", quality_score >= 0.6)
+                    self._commons_competence.update("efficiency", cost_eff >= 0.5)
+            except Exception:  # noqa: BLE001
+                pass
 
         if (
             getattr(decision.classification, 'is_interactive', False)
@@ -1286,18 +1329,30 @@ class RoutingEngine:
         model: ModelEntry,
         classification: RequestClassification,
     ) -> float:
-        """Score from NG-Lite learned weights."""
-        if self._ng_lite is None:
-            return self.config.neutral_score
+        """Score from NG-Lite learned weights, blended with Commons-enhanced recs."""
+        neutral = self.config.neutral_score
 
-        embedding = self._classification_to_embedding(classification)
-        recs = self._ng_lite.get_recommendations(embedding, top_k=self.config.learned_top_k)
+        # Local NG-Lite score (Tier 1/2 substrate).
+        ng_score = neutral
+        if self._ng_lite is not None:
+            embedding = self._classification_to_embedding(classification)
+            recs = self._ng_lite.get_recommendations(embedding, top_k=self.config.learned_top_k)
+            for target_id, weight, _reasoning in recs:
+                if target_id == model.model_id:
+                    ng_score = weight
+                    break
 
-        for target_id, weight, _reasoning in recs:
-            if target_id == model.model_id:
-                return weight
+        # Commons-enhanced score (peninsula; blended by competence trust).
+        if self._peninsula is not None and self._commons_competence is not None:
+            commons_score = self._peninsula.get_enhanced_score(model.model_id)
+            if commons_score is not None:
+                trust = self._commons_competence.overall()
+                # Blend: at trust=0 pure NG-Lite; at trust=1 pure Commons.
+                # 0.05 floor ensures local substrate never goes silent.
+                trust = max(trust, 0.05)
+                return ng_score * (1.0 - trust) + commons_score * trust
 
-        return self.config.neutral_score
+        return ng_score
 
     def _score_cost(self, model: ModelEntry, success_rate: float = 1.0) -> float:
         """Expected true cost = raw_price / success_rate (#173a).
