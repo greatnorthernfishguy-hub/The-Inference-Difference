@@ -34,3 +34,8 @@ __pycache__/
 .env
 .env.*
 *.key
+
+# Ecosystem-wide hygiene standard (repo-hygiene bot)
+*.pt
+node_modules/
+.neurograph/
