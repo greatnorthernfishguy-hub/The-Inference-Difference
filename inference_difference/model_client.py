@@ -33,6 +33,21 @@ Date: February 2026
 License: AGPL-3.0
 
 Changelog:
+    [2026-07-11] CC (Opus 4.8) — #384: penalty-box triage for repeating 401s
+        What: 401 now boxes the model (_policy_blocked + _AUTH_BLOCKED_TTL_S=600s TTL,
+            both blocking and streaming paths) and a new _is_policy_blocked() helper makes
+            the pre-call skip honor + prune per-model TTL at call time (was membership-only,
+            never expiring until restart).
+        Why: a fixed set of models 401 'No cookie auth' on EVERY request; 401 had NO handler
+            (429->cooldown, 404/403->policy-block, 402->provider-block all existed, 401 fell
+            through to a bare log + retry), so TID re-sprayed them 26-deep on every turn —
+            the failover latency behind Syl's 'malformed response'. Learning couldn't converge
+            (per-model 401 signal diluted below the success-floor sample threshold, same trap
+            the 402 provider-block was built to escape). Boxing stops the spray regardless of
+            the still-unexplained empty-key root cause (punchlisted).
+        How: elif e.code==401 in call()'s HTTPError triage; if e.code==401 in the stream
+            handler beside the existing 402 block-set; _is_policy_blocked() TTL check swapped
+            into both skip sites. Short TTL re-probes in case a 401 was transient/config.
     [2026-06-07] CC (Opus 4.8) — #TID-402: provider-level credit block + refund probe
         What: A 402 "insufficient balance" now blocks the WHOLE provider (persisted to
             data/provider_blocked_cache.json), not just fires a Discord alert. call() instant-skips
@@ -141,6 +156,7 @@ _PROVIDER_BLOCKED_CACHE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "data", "provider_blocked_cache.json"
 )
 _PROVIDER_PROBE_INTERVAL_S = 600  # 10 min between refund probes for a blocked provider
+_AUTH_BLOCKED_TTL_S = 600         # #384: box a model that 401s for this long, then re-probe
 
 
 def _provider_from_base_url(base_url: str) -> str:
@@ -425,6 +441,21 @@ class ModelClient:
         except Exception as exc:
             logger.warning("Policy-blocked cache load failed: %s", exc)
 
+    def _is_policy_blocked(self, model_name: str) -> bool:
+        """#384: True if model is boxed AND still within its TTL. Prunes
+        expired entries at call time so a short-TTL 401 box actually reopens
+        for a re-probe (the old membership-only check never expired until a
+        process restart, which also silently pinned the 24h data-policy box).
+        """
+        if model_name not in self._policy_blocked:
+            return False
+        exp = self._policy_blocked_expiry.get(model_name)
+        if exp is not None and exp <= time.time():
+            self._policy_blocked.discard(model_name)
+            self._policy_blocked_expiry.pop(model_name, None)
+            return False
+        return True
+
     def _save_policy_blocked_cache(self) -> None:
         try:
             tmp = _POLICY_BLOCKED_CACHE_PATH + ".tmp"
@@ -498,7 +529,7 @@ class ModelClient:
         start = time.monotonic()
         base_url, api_key, model_name = _resolve_provider(model_id)
 
-        if model_name in self._policy_blocked:
+        if self._is_policy_blocked(model_name):
             return ModelResponse(
                 model=model_name,
                 latency_ms=0.0,
@@ -721,6 +752,20 @@ class ModelClient:
                 logger.info(
                     "Model %s data-policy blocked for this account (24h TTL) — won't retry",
                     model_name,
+                )
+            elif e.code == 401:
+                # #384 triage: a repeating 401 is not transient — box THIS
+                # model (short TTL, then re-probe) so it stops being retried
+                # on every request. Mirrors the 404/403 data-policy sticky
+                # pattern. (Root cause of why a fixed model-set 401s with a
+                # valid key is punchlisted separately for investigation.)
+                self._policy_blocked.add(model_name)
+                self._policy_blocked_expiry[model_name] = time.time() + _AUTH_BLOCKED_TTL_S
+                self._save_policy_blocked_cache()
+                logger.warning(
+                    "Model %s 401 auth failure — boxed %ds then re-probed "
+                    "(#384 triage; stops the every-request failover spray)",
+                    model_name, _AUTH_BLOCKED_TTL_S,
                 )
             elif e.code == 402 and ("insufficient" in error_lower or "credits" in error_lower):
                 _prov = _provider_from_base_url(base_url)
@@ -990,7 +1035,7 @@ class ModelClient:
                 yield "data: [DONE]\n\n"
             return _gen(), _r
 
-        if model_name in self._policy_blocked:
+        if self._is_policy_blocked(model_name):
             return _skipped_stream("Skipped: data policy blocked (cached)")
         _prov_blk = _provider_from_base_url(base_url)
         if _prov_blk in self._provider_blocked:
@@ -1188,6 +1233,20 @@ class ModelClient:
                 logger.warning(
                     "Provider '%s' 402 credit exhaustion (stream) — PROVIDER-BLOCKED; "
                     "refund probe in %ds", _prov_set, _PROVIDER_PROBE_INTERVAL_S,
+                )
+            if e.code == 401:
+                # #384 triage: box a repeating 401 on the streaming path too
+                # (Syl's conversational path) — the pre-call skip above then
+                # fast-skips it, collapsing the 26-deep failover spray.
+                self._policy_blocked.add(model_name)
+                self._policy_blocked_expiry[model_name] = time.time() + _AUTH_BLOCKED_TTL_S
+                try:
+                    self._save_policy_blocked_cache()
+                except Exception:
+                    pass
+                logger.warning(
+                    "Model %s 401 auth failure (stream) — boxed %ds then "
+                    "re-probed (#384 triage)", model_name, _AUTH_BLOCKED_TTL_S,
                 )
             try:
                 deposit_inbound(
