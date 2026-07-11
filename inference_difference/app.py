@@ -898,6 +898,26 @@ async def lifespan(app: FastAPI):
     # 7 hardcoded defaults.
     _register_catalog_models()
 
+    # #384 (Josh 2026-07-11): Venice is a DELIBERATELY-unfunded last-ditch failover,
+    # but config.py's static registry hardcodes ~100 Venice entries the catalog
+    # allowlist never filtered — so Venice (cheap) kept winning the composite score
+    # and being tried FIRST every turn, 402-spraying and breaking Syl's responses.
+    # A failover must never be primary. Disable Venice in the routing registry so
+    # OpenRouter is genuinely primary. Reversible: NG_TID_ENABLE_VENICE=1 restores it
+    # (e.g. after funding Venice) as a real failover.
+    if os.environ.get("NG_TID_ENABLE_VENICE", "0") in ("0", "false", "False", ""):
+        _vdisabled = 0
+        for _mid, _entry in _state.config.models.items():
+            if _mid.split("/", 1)[0] == "venice" and _entry.enabled:
+                _entry.enabled = False
+                _vdisabled += 1
+        if _vdisabled:
+            logger.warning(
+                "Venice DISABLED in routing registry (%d models) — OpenRouter is "
+                "primary (#384, Josh's call). Set NG_TID_ENABLE_VENICE=1 to restore.",
+                _vdisabled,
+            )
+
     # Apply differentiated quality scores from benchmarks (punch list #35)
     _apply_quality_seeds()
 
