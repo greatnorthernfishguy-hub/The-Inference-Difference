@@ -19,6 +19,22 @@ recommendation lists cross the boundary.
 #      deposit() sends routing outcomes to Commons-side (fail-soft, non-blocking).
 #      CommonsCompetence: per-axis [0,1] asymmetric trust, gain=0.05/loss=0.10,
 #      mirrors Elmer's TuningSocket reference implementation.
+#
+# [2026-07-21] Claude Code (Sonnet 5) — #80 wire → Commons: deposit_wire() send method (Task 3)
+# What: New TIDPeninsulaBody.deposit_wire(content, target_id, metadata=None) — sends a
+#       "wire_experience" frame (raw content string, not a pre-computed embedding) to the
+#       Commons-side peninsula. Mirrors deposit()'s connection-check / fail-soft / send_lock
+#       shape exactly; the only difference is payload shape (content vs. embedding+scoring
+#       fields) because embedding now happens Commons-side (see tid_peninsula_commons.py
+#       _forward_wire_experience, Task 2).
+# Why:  Design v4 / implementation plan Task 3 — gives wire_deposit.py (Task 4) a body-side
+#       call to route through instead of the ng_tract-based experience-tract write, which fed
+#       NeuroGraph's wire_absorption.py drain path into Syl's cognitive _memory graph as
+#       per-call orphan nodes (60,142 observed — the motivating churn problem). Still inert
+#       until Task 4 calls it.
+# How:  Same fire-and-forget contract as deposit(): no connection -> silent no-op, no queueing,
+#       no fallback. TID running standalone (NeuroGraph down) simply drops wire deposits rather
+#       than blocking or erroring — matches the peninsula's existing degrade-gracefully posture.
 # -------------------
 """
 
@@ -275,6 +291,38 @@ class TIDPeninsulaBody:
         with self._recs_lock:
             rec = self._current_recs.get(model_id)
         return rec[0] if rec is not None else None
+
+    def deposit_wire(
+        self,
+        content: str,
+        target_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Send raw HTTP wire content to the Commons-side peninsula. Fire-and-forget, fail-soft.
+
+        Unlike deposit() (routing outcomes), this carries raw text, not a pre-computed
+        embedding — the Commons-side owns NGEmbed and embeds on receipt (see
+        tid_peninsula_commons.py _forward_wire_experience). No connection -> silent no-op;
+        this call never blocks, never raises, and never falls back to another write path.
+        """
+        with self._conn_lock:
+            conn = self._conn
+        if conn is None:
+            return
+        if not content or not target_id:
+            return
+
+        try:
+            payload = msgpack.packb({
+                "type": "wire_experience",
+                "content": content,
+                "target_id": target_id,
+                "metadata": metadata or {},
+            }, use_bin_type=True)
+            with self._send_lock:
+                _send_frame(conn, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("TID peninsula: wire_experience send failed: %s", exc)
 
 
 # Module-level singleton — created at TID startup.
