@@ -290,6 +290,12 @@ class ShimObserver:
             return self._neutral
 
         except EmbeddingUnavailableError:
+            # Fail closed: zero graph writes, and the outage is signaled —
+            # "no embedder" must not be indistinguishable from "no opinion".
+            logger.warning(
+                "Shim query_confidence for %s/%s: embedding unavailable — returning neutral",
+                model_id, operation,
+            )
             return self._neutral
         except Exception as exc:
             logger.debug("Shim query_confidence failed: %s", exc)

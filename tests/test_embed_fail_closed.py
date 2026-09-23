@@ -90,6 +90,10 @@ class TestDreamCycleFailClosed:
 
     def test_teach_substrate_no_record_outcome_on_embed_failure(self):
         ng = MagicMock()
+        # embed_fn is bound unwrapped exactly as app.py wires it:
+        # `from ng_embed import embed as _ng_embed; _dc_embed_fn = _ng_embed`
+        # (inference_difference/app.py:908-909). No try/except wrapper, so a
+        # raised failure can never reach record_outcome as a None embedding.
         cycle = DreamCycle(ng_ecosystem=ng, embed_fn=ng_embed.embed)
         insights = {
             "coding": [
@@ -109,3 +113,42 @@ class TestDreamCycleFailClosed:
             cycle._teach_substrate(insights)
         ng.record_outcome.assert_not_called()
         assert cycle._substrate_teach_count == 0
+
+
+class TestAppFailClosed:
+    """app.py — 503 handler and _substrate_tier_mapping fail-closed behavior.
+
+    Skipped in environments without fastapi (pre-existing gap in the system
+    interpreter); runs anywhere the app is importable.
+    """
+
+    def test_substrate_tier_mapping_defaults_on_embed_failure(self):
+        pytest.importorskip("fastapi")
+        from unittest.mock import MagicMock as _M
+        from inference_difference import app as tid_app
+        from inference_difference.config import InferenceDifferenceConfig
+
+        tid_app._state.config = InferenceDifferenceConfig()
+        tid_app._state.ng_ecosystem = _M()
+        with patch.object(
+            ng_embed.NGEmbed, "embed", side_effect=EmbeddingUnavailableError("x"),
+        ):
+            complexity, priority = tid_app._substrate_tier_mapping("performance")
+        # Bootstrap defaults returned, no exception, no graph write.
+        assert priority == tid_app._state.config.tier_priority_performance
+        tid_app._state.ng_ecosystem.get_recommendations.assert_not_called()
+
+    def test_classify_endpoint_returns_503_when_embedding_unavailable(self):
+        pytest.importorskip("fastapi")
+        pytest.importorskip("httpx")
+        from fastapi.testclient import TestClient
+        from inference_difference import app as tid_app
+
+        client = TestClient(tid_app.app, raise_server_exceptions=False)
+        _force_model_failed()
+        try:
+            resp = client.post("/classify", json={"message": "Write a Python function"})
+        finally:
+            ng_embed.NGEmbed.reset_instance()
+        assert resp.status_code == 503
+        assert "unavailable" in resp.json()["detail"].lower()
