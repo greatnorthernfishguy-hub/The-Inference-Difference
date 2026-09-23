@@ -2,6 +2,15 @@
 Dream Cycle Enhancement for Dynamic Model Catalog Selection (§4.5.5).
 
 # ---- Changelog ----
+# [2026-09-23] Claude Code — fail closed on EmbeddingUnavailableError (LAW 4/7)
+#   What: _teach_substrate catches EmbeddingUnavailableError explicitly and
+#     skips the record_outcome with a warning. Removed `if embedding is None`.
+#   Why:  Canonical ng_embed.embed() raises when the model cannot load — it
+#     never returns None. A failed embed must leave zero graph writes and be
+#     signaled, not swallowed at debug level.
+#   How:  Import EmbeddingUnavailableError at module top; embed failure raises
+#     before record_outcome is reached, so no forged vector is deposited.
+# -------------------
 # [2026-04-29] CC (punchlist #227) — Add background pulse to trigger analysis
 #   What: DreamCycle.start_pulse(interval_seconds=300) starts a daemon thread
 #     that calls analyze_model_property_correlations() every 5 minutes.
@@ -60,6 +69,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+
+from ng_embed import EmbeddingUnavailableError
 
 logger = logging.getLogger("inference_difference.dream_cycle")
 
@@ -319,8 +330,6 @@ class DreamCycle:
                 try:
                     # Embed the insight's observation (the semantic content)
                     embedding = self._embed_fn(insight.observation)
-                    if embedding is None:
-                        continue
 
                     # Record to substrate — the insight IS the experience
                     target_id = f"dreamcycle:{insight.property_name}:{route}"
@@ -339,6 +348,13 @@ class DreamCycle:
                     )
                     self._substrate_teach_count += 1
 
+                except EmbeddingUnavailableError:
+                    # Fail closed (LAW 4/7): embed raised, so record_outcome was
+                    # never reached — zero graph writes. Signaled, not silent.
+                    logger.warning(
+                        "DreamCycle substrate teach skipped (%s/%s): embedding unavailable",
+                        route, insight.property_name,
+                    )
                 except Exception as exc:
                     logger.debug(
                         "DreamCycle substrate teach failed (%s/%s): %s",

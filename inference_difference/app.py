@@ -239,6 +239,7 @@ from inference_difference.responses_endpoint import (
     _ToolContext,
 )
 import inference_difference.responses_endpoint as _resp_ep
+from ng_embed import EmbeddingUnavailableError
 
 logger = logging.getLogger("inference_difference.app")
 
@@ -564,6 +565,13 @@ def _substrate_tier_mapping(
             return (_tier_weight_to_complexity(substrate_complexity),
                     substrate_priority)
 
+    except EmbeddingUnavailableError:
+        # Fail closed on the substrate query (LAW 4/7): no embedding, no
+        # fabricated vector, no graph write — bootstrap defaults are read-only.
+        logger.warning(
+            "Substrate tier query for '%s': embedding unavailable — using defaults",
+            provider_tier,
+        )
     except Exception as exc:
         logger.debug(
             "Substrate tier query failed for '%s': %s — using defaults",
@@ -1100,6 +1108,28 @@ async def api_key_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 _IS_PRODUCTION = os.environ.get("TID_ENV", "").lower() == "production"
+
+
+# ---- Changelog ----
+# [2026-09-23] Claude Code — fail-closed handler for EmbeddingUnavailableError (LAW 4/7)
+#   What: Dedicated exception handler returns HTTP 503 when the embedding model
+#     is unavailable, instead of the generic 500.
+#   Why:  Canonical ng_embed raises EmbeddingUnavailableError rather than
+#     fabricating a hash vector. A failed embed is a real infrastructure
+#     failure — the turn must fail cleanly with no forged data written.
+#   How:  FastAPI exception handler on EmbeddingUnavailableError → 503.
+# -------------------
+@app.exception_handler(EmbeddingUnavailableError)
+async def embedding_unavailable_handler(request: Request, exc: EmbeddingUnavailableError):
+    """Embedding model unavailable → 503 Service Unavailable (fail closed)."""
+    logger.error(
+        "Embedding unavailable on %s: %s — failing request closed (no forged vectors)",
+        request.url.path, exc,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Embedding service unavailable — request failed closed"},
+    )
 
 
 @app.exception_handler(Exception)

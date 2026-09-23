@@ -57,7 +57,6 @@ Changelog (Grok audit response, 2026-02-19):
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -173,8 +172,6 @@ URGENCY_PATTERNS = [
 # Semantic embedder — lazy-loaded, ecosystem-standard model
 # ---------------------------------------------------------------------------
 
-_EMBEDDING_DIM = 768
-
 
 def _semantic_embed(text: str) -> np.ndarray:
     """Embed text via ng_embed (centralized ecosystem embedding).
@@ -183,19 +180,21 @@ def _semantic_embed(text: str) -> np.ndarray:
     This is the raw semantic embedding that replaces
     _classification_to_embedding() (punch list #28). The substrate
     learns from actual message content instead of domain labels.
-    """
-    try:
-        from ng_embed import embed
-        return embed(text)
-    except Exception:
-        pass
 
-    # Hash fallback — deterministic but not semantic
-    rng_seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16) % (2**32)
-    rng = np.random.RandomState(rng_seed)
-    vec = rng.randn(_EMBEDDING_DIM).astype(np.float32)
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
+    # ---- Changelog ----
+    # [2026-09-23] Claude Code — remove hash fallback, fail closed (LAW 4/7)
+    #   What: _semantic_embed now propagates EmbeddingUnavailableError instead
+    #     of catching all exceptions and returning a synthetic SHA-256 vector.
+    #   Why:  Canonical ng_embed.py no longer provides SHA-384 hash fallback.
+    #     Returning a forged embedding would deposit incompatible vectors into
+    #     the substrate and corrupt the River.
+    #   How:  Let embed() raise EmbeddingUnavailableError; classify_request
+    #     propagates it to the endpoint, which returns HTTP 503. Removed
+    #     hashlib import and _EMBEDDING_DIM fallback constant.
+    # -------------------
+    """
+    from ng_embed import embed
+    return embed(text)
 
 
 def classify_request(
