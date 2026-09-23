@@ -190,6 +190,12 @@ class ShimObserver:
         #     exception would drop learning observations without notice.
         #   How:  Import EmbeddingUnavailableError at module top; explicit except branch
         #     logs a warning and returns before any record_outcome call.
+        # [2026-09-23] Claude Code — enforcer R-2: query_confidence warning signal
+        #   What: query_confidence's EmbeddingUnavailableError branch now logs a
+        #     warning naming model+operation before returning neutral.
+        #   Why:  Packet 077 enforcer: "no embedder" must be distinguishable from
+        #     "no opinion" — zero writes alone is not fail-closed.
+        #   How:  logger.warning added in the except branch; generic branch stays debug.
         # -------------------
         """
         if self._ng is None:
