@@ -35,6 +35,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from ng_embed import EmbeddingUnavailableError
+
 logger = logging.getLogger("inference_difference.translation_shim")
 
 
@@ -178,6 +180,17 @@ class ShimObserver:
                 args_dict_to_string, orphan_strip, alias_resolve.
             did_apply: Whether the translation rule actually fired.
             raw_context: Free-form description of what happened (Law 7 — raw).
+
+        # ---- Changelog ----
+        # [2026-09-23] Claude Code — fail closed on EmbeddingUnavailableError (LAW 4/7)
+        #   What: Catch EmbeddingUnavailableError explicitly and return without
+        #     writing to the substrate. Removed `if embedding is None: return` guard.
+        #   Why:  Canonical ng_embed.embed() raises EmbeddingUnavailableError when the
+        #     ONNX model cannot load; it never returns None. Silently swallowing the
+        #     exception would drop learning observations without notice.
+        #   How:  Import EmbeddingUnavailableError at module top; explicit except branch
+        #     logs a warning and returns before any record_outcome call.
+        # -------------------
         """
         if self._ng is None:
             return
@@ -198,8 +211,6 @@ class ShimObserver:
                 description += f": {raw_context[:200]}"
 
             embedding = embed(description)
-            if embedding is None:
-                return
 
             target_id = f"shim:{operation}:{model_id}"
             self._ng.record_outcome(
@@ -216,6 +227,9 @@ class ShimObserver:
                 self._observation_count[key],
             )
 
+        except EmbeddingUnavailableError:
+            # Fail closed: no forged embedding, no graph write.
+            logger.warning("Shim observe skipped: embedding unavailable")
         except Exception as exc:
             logger.debug("Shim observe failed: %s", exc)
 
@@ -235,6 +249,15 @@ class ShimObserver:
         Influence and neutral are set at construction time from config,
         not per-call. Matches _substrate_tier_mapping() pattern.
 
+        # ---- Changelog ----
+        # [2026-09-23] Claude Code — fail closed on EmbeddingUnavailableError (LAW 4/7)
+        #   What: Catch EmbeddingUnavailableError explicitly and return neutral.
+        #     Removed `if query_emb is None: return self._neutral` guard.
+        #   Why:  Canonical ng_embed.embed() raises when the model cannot load,
+        #     so a missing model must not be treated as "no opinion" silently.
+        #   How:  Explicit except EmbeddingUnavailableError returns self._neutral.
+        # -------------------
+
         Args:
             model_id: The model to query about.
             operation: The translation operation name.
@@ -250,8 +273,6 @@ class ShimObserver:
 
             query_text = f"model {model_id} needs {operation} translation"
             query_emb = embed(query_text)
-            if query_emb is None:
-                return self._neutral
 
             recs = self._ng.get_recommendations(query_emb, top_k=5)
             if not recs:
@@ -268,6 +289,8 @@ class ShimObserver:
 
             return self._neutral
 
+        except EmbeddingUnavailableError:
+            return self._neutral
         except Exception as exc:
             logger.debug("Shim query_confidence failed: %s", exc)
             return self._neutral
