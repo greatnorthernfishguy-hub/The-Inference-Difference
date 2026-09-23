@@ -128,15 +128,21 @@ class TestAppFailClosed:
         from inference_difference import app as tid_app
         from inference_difference.config import InferenceDifferenceConfig
 
-        tid_app._state.config = InferenceDifferenceConfig()
-        tid_app._state.ng_ecosystem = _M()
-        with patch.object(
-            ng_embed.NGEmbed, "embed", side_effect=EmbeddingUnavailableError("x"),
-        ):
-            complexity, priority = tid_app._substrate_tier_mapping("performance")
-        # Bootstrap defaults returned, no exception, no graph write.
-        assert priority == tid_app._state.config.tier_priority_performance
-        tid_app._state.ng_ecosystem.get_recommendations.assert_not_called()
+        saved_config = getattr(tid_app._state, "config", None)
+        saved_ng = getattr(tid_app._state, "ng_ecosystem", None)
+        try:
+            tid_app._state.config = InferenceDifferenceConfig()
+            tid_app._state.ng_ecosystem = _M()
+            with patch.object(
+                ng_embed.NGEmbed, "embed", side_effect=EmbeddingUnavailableError("x"),
+            ):
+                complexity, priority = tid_app._substrate_tier_mapping("performance")
+            # Bootstrap defaults returned, no exception, no graph write.
+            assert priority == tid_app._state.config.tier_priority_performance
+            tid_app._state.ng_ecosystem.get_recommendations.assert_not_called()
+        finally:
+            tid_app._state.config = saved_config
+            tid_app._state.ng_ecosystem = saved_ng
 
     def test_classify_endpoint_returns_503_when_embedding_unavailable(self):
         pytest.importorskip("fastapi")
