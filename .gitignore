@@ -30,6 +30,9 @@ fastembed_cache/
 __pycache__/
 *.pyc
 
+# Claude Code nested worktrees (full checkouts — never track)
+.claude/worktrees/
+
 # Credentials — never track
 .env
 .env.*
