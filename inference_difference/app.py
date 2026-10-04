@@ -61,6 +61,7 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-10-03] Claude Opus 5.5 (Executive, laptop MVP) — _register_catalog_models applies catalog_filters.yaml (ceiling/blocklist/allowlist) and drops :batch ids; the routing pool had bypassed both.
 # [2026-06-04] CC Sonnet 4.6 — #282: POST /routing/mode endpoint + routing_state.msgpack
 #   What: AppState.routing_mode, _routing_state_path(), _load_routing_state(),
 #         _save_routing_state(), RoutingModeRequest, POST /routing/mode endpoint.
@@ -635,9 +636,17 @@ def _register_catalog_models() -> None:
 
     # Block models known to be broken/unavailable on OpenRouter.
     # preview-customtools: 404 due to OpenRouter privacy settings, floods logs.
+    # ':batch' ids are OpenRouter's async Batch API variants: chat/completions 404s them.
     _DENYLIST_PATTERNS = re.compile(
-        r'preview-customtools', re.IGNORECASE,
+        r'preview-customtools|:batch$', re.IGNORECASE,
     )
+
+    # [2026-10-03] catalog_filters.yaml (hard ceiling, blocklist, allowlist) applied to the
+    # ROUTING pool too. Before this it only gated profile selection, so the router's pool
+    # held every catalog model regardless of the ceiling or the blocklist.
+    _cm = _state.catalog_manager
+    _allowed = {m.id for m in _cm._apply_allowlist(_cm._apply_blocklist(_cm._apply_hard_ceiling(list(_cm.models))))}
+    rejected_filtered = 0
 
     registered = 0
     rejected_small = 0
@@ -654,6 +663,10 @@ def _register_catalog_models() -> None:
         # Block known-broken models
         if _DENYLIST_PATTERNS.search(cm.id):
             rejected_denied += 1
+            continue
+
+        if cm.id not in _allowed:
+            rejected_filtered += 1
             continue
 
         # Map capabilities to task domains
@@ -699,6 +712,11 @@ def _register_catalog_models() -> None:
         logger.info(
             "Rejected %d denylisted catalog models (known broken/unavailable)",
             rejected_denied,
+        )
+    if rejected_filtered:
+        logger.info(
+            "Rejected %d catalog models by catalog_filters.yaml (ceiling/blocklist/allowlist)",
+            rejected_filtered,
         )
     if registered:
         logger.info(

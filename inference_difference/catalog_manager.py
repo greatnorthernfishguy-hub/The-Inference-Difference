@@ -19,6 +19,9 @@ Key design decisions:
   remain valid alongside dynamic profile references (new format).
 """
 # ---- Changelog ----
+# [2026-10-03] Claude Opus 5.5 (Executive, laptop MVP) — with OPENROUTER_API_KEY set, fetch /models/user (the account's own
+#   guardrail/privacy-filtered list) instead of the public list; a failure keeps the cache, never widens to the public list.
+#   Why: TID kept routing to models the account cannot use (73 ':batch' ids, guardrail-blocked endpoints), each a 404.
 # [2026-05-31] Claude Code (Sonnet 4.6) — #94: OSS heuristic (provider + name patterns)
 #   What: _OSS_PROVIDERS set + _OSS_MODEL_RE + _is_known_oss() helper.
 #         _fetch_openrouter_catalog now uses heuristic alongside hugging_face_id.
@@ -183,6 +186,8 @@ class CatalogManager:
     """
 
     OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+    # Per-account list: only models this key can actually use (guardrails, privacy, provider prefs).
+    OPENROUTER_USER_CATALOG_URL = "https://openrouter.ai/api/v1/models/user"
     HF_CATALOG_URL = "https://huggingface.co/api/models"
 
     def __init__(
@@ -485,11 +490,18 @@ class CatalogManager:
             )
             return []
 
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        url, headers = self.OPENROUTER_CATALOG_URL, {"Accept": "application/json"}
+        if api_key:
+            # The account's own filtered list. On failure the caller keeps the cached
+            # catalog; it never falls back to the wider public list.
+            url = self.OPENROUTER_USER_CATALOG_URL
+            headers["Authorization"] = f"Bearer {api_key}"
         try:
             resp = httpx.get(
-                self.OPENROUTER_CATALOG_URL,
+                url,
                 timeout=30.0,
-                headers={"Accept": "application/json"},
+                headers=headers,
             )
             resp.raise_for_status()
             data = resp.json()
