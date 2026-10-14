@@ -61,6 +61,8 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — _save_routing_state() writes routing_state.msgpack atomically
+#   (inference_difference.atomic_io.atomic_write_bytes; same payload and path). Josh 2026-10-14 "be atomic".
 # [2026-10-03] Claude Opus 5.5 (Executive, laptop MVP) — _register_catalog_models applies catalog_filters.yaml (ceiling/blocklist/allowlist) and drops :batch ids; the routing pool had bypassed both.
 # [2026-06-04] CC Sonnet 4.6 — #282: POST /routing/mode endpoint + routing_state.msgpack
 #   What: AppState.routing_mode, _routing_state_path(), _load_routing_state(),
@@ -815,8 +817,8 @@ def _save_routing_state() -> None:
     import msgpack
     path = _routing_state_path()
     try:
-        with open(path, "wb") as f:
-            f.write(msgpack.packb({"routing_mode": _state.routing_mode}))
+        from inference_difference.atomic_io import atomic_write_bytes
+        atomic_write_bytes(path, msgpack.packb({"routing_mode": _state.routing_mode}))
     except Exception as e:
         logger.warning("Failed to save routing_state.msgpack: %s", e)
 
