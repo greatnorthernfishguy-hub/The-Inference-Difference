@@ -35,14 +35,17 @@ Connectivity tiers:
     connects to SaaS and upgrades to Tier 3 — all without code changes.
     If SaaS disconnects, it falls back to Tier 2 or 1 automatically.
 
-Serialization format notes:
-    NG-Lite uses JSON for persistence. This is deliberate:
-    - JSON is stdlib (no extra dependency)
-    - NG-Lite state is small (≤1000 nodes, ≤5000 synapses)
-    - Human-readable state files aid debugging
-    - The full NeuroGraph Foundation uses msgpack for its much larger
-      graphs (10K+ nodes with spike histories, numpy arrays, etc.)
-    - Format translation happens in the bridge layer, not here.
+Serialization format notes (2026-10-13, Josh: "JSON will have NOTHING to do
+with saves, period"):
+    - Saves are msgpack only, on both cores. ``save("x.json")`` writes
+      ``x.msgpack``; any other name is written as given. The content is the
+      ``_export_state()`` dict, embeddings / prototypes as msgpack float32.
+      The Python core needs the ``msgpack`` package (no JSON fallback).
+    - ``load()`` reads that msgpack. A legacy JSON state (``x.json``, or the
+      JSON the old Python core wrote into a ``.msgpack``-named file, #1098)
+      is converted ONCE: imported, re-saved as msgpack, and the JSON kept
+      aside as ``<file>.legacy-json``.
+    - Format translation for bridges still happens in the bridge layer.
 
 Weight range notes:
     NG-Lite weights are bounded [0.0, 1.0] for simplicity.
@@ -66,6 +69,74 @@ Author: Josh + Claude
 Date: February 2026
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane mean-centre) — #1107: mean-centred comparisons; the rim threshold; space tag
+# What: (1) Every similarity comparison subtracts the embedding model's fixed centre (ng_embed.embedding_centre(),
+#   versioned ng_embed.CENTRE_VERSION) from both sides and re-normalises before the cosine: node matching
+#   (_find_similar_node), novelty (detect_novelty), the receptor snap (_snap_to_prototype) and its k-means assignment
+#   (_init_prototypes). Stored vectors stay RAW (node embeddings, prototypes, hashes, saves): centring happens only at
+#   the comparison, so the substrate keeps the raw experience (LAW 7) and a new centre version needs no re-embedding.
+#   Applies when embedding_dim == ng_embed.EMBEDDING_DIM and config "mean_centre" is true (default); other dims (test
+#   fixtures) compare raw. (2) Thresholds re-calibrated on centred real data (MEAN_CENTRE.md §3):
+#   novelty_threshold 0.7 -> 0.40 (match at centred cosine >= 0.60; tunable bounds 0.30-0.95 -> 0.20-0.60),
+#   receptor_prototype_threshold stays 0.75 (now centred), and a separate constitutional_threshold 0.55 (not runtime-tunable — the rim is immutable): a constitutional node catches an
+#   input only at centred cosine >= constitutional_threshold, and when it does it takes priority over ordinary nodes;
+#   ordinary nodes match at >= 1 - novelty_threshold as before. (3) Saves carry "embedding_space" = {model, dim,
+#   centre_version}; load() refuses a state recorded under another model (EmbeddingSpaceError, ERROR once), refuses an
+#   untagged state or a rim whose vectors are off the model's manifold (cosine to the centre direction), and resets
+#   the space-dependent thresholds to this instance's values when the state was calibrated under another centre
+#   version (incl. untagged = raw-cosine era).
+# Why: Josh 2026-10-14 "Mean center" (#1107). Snowflake vectors share a common direction: unrelated texts sit at
+#   ~0.69 raw cosine, so the 0.30 snap matched nearly everything — the CC Commons put 4,767 synapses on 4 nodes
+#   (#1094), TID's NG-Lite had 2 nodes, and a 768-d Elmer rim would have caught 100% of inputs. The rim is immutable
+#   ("Running without the Rim defeats the entire point"), so it needs a threshold that catches rim-relevant inputs
+#   and not ordinary ones. The dimension guard could not see same-dim foreign vectors (DIM_GUARD.md §11).
+# How: _centre_vec / _centre_rows (the Rust core mirrors them bit for bit, ng-tract-rs
+#   cc-laptop-mean-centre-rs-20261014); _resolve_space at construction; _space_check before import (both cores);
+#   _space_migrate_config after import. No change for non-model dims beyond the rim threshold rule.
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: fail loud on a wrong embedding dimension
+# What: Every vector that enters NG-Lite is checked against ``embedding_dim`` (the active embedding
+#   model's dimension; ng_embed's 768 by default, pinned by tests/test_dim_guard.py):
+#   - inputs to find_or_create_node / record_outcome / get_recommendations / detect_novelty;
+#   - constitutional (rim) entries at seeding (constructor and after a load);
+#   - a loaded state's node embeddings and receptor prototypes (load / _import_state), with the
+#     state file named in the error.
+#   A mismatch raises EmbeddingDimensionError (a ValueError subclass, so existing handlers still
+#   catch it) whose message names the module, what was wrong, the file, both dimensions and the
+#   counts per dimension; the same message is logged at ERROR once per distinct mismatch, so a
+#   caller's broad ``except`` can no longer make it silent. The check runs in this wrapper before
+#   any dispatch, so it covers the Python and the Rust core alike.
+#   A saved state's config can no longer override ``embedding_dim``: the constructor's value (the
+#   module's model) wins, and the stored vectors are checked against it.
+# Why: #1097 — Elmer's NG-Lite rim was 384-d (all-MiniLM-L6-v2) while every input is 768-d; each
+#   call raised a numpy shape error deep inside the similarity search, a broad except swallowed it,
+#   and the rim did nothing for weeks. Josh 2026-10-14: wrong dims keep surviving sweeps — make it
+#   structurally impossible to run on them quietly (LAW 4: at the source).
+# How: _check_input / _check_rim_entries / _check_state_dims + _dim_error; EmbeddingDimensionError.
+#   No change for correct-dim data (no extra work beyond one shape test per call).
+# -------------------
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: Rust core usable; public reads; msgpack saves
+# What: (1) Public read methods served by whichever core holds the state: node_count / synapse_count /
+#   list_nodes / get_node / list_synapses / get_synapse / remove_synapses / get_history / export_state.
+#   They return snapshot copies (mutating them does not touch the substrate). Consumers stop reading
+#   NGLite.nodes / NGLite.synapses / _embedding_cache / _total_outcomes directly.
+#   (2) The Rust core (ng_tract.NGLiteCore) is used only when NG_LITE_RUST_CORE is truthy (temporary
+#   rollout switch; it goes away with the Python core). Set but unavailable -> a WARNING, Python core.
+#   On the Rust path nodes / synapses are a loud stand-in (RuntimeError on use, naming the public
+#   methods) instead of the old silently-empty dicts; get_stats / export_state / sync_with_bridge /
+#   update_tunable / config / module_id read the core; find_or_create_node returns a fresh node (no
+#   stale stub cached by hash); no double-counted outcomes.
+#   (3) Persistence: msgpack only, both cores (see "Serialization format notes" above). load() returns
+#   True when it loaded something. A legacy JSON state migrates once (kept as <file>.legacy-json).
+# Why: Josh 2026-10-13 rulings on #1096 (dial in on the laptop first, re-vendor later): the Rust core's
+#   path kept no Python-side state, so the Commons' bucket_recent returned 0 rows, its recency windows
+#   and autonomic drop were no-ops, and save() wrote .msgpack while callers loaded only if the .json
+#   existed. Saves are msgpack, never JSON. The #119 line below ("3-5x speedup", "zero API changes")
+#   described a path that never ran (ng_tract never exported NGLiteCore until #1076).
+# How: _rust_core_requested() gate in __init__; each public read dispatches on self._core; _pack_state()
+#   writes the same msgpack bytes the Rust core's save_binary writes (map / array headers, float32
+#   vectors, json-style key coercion); load() sniffs JSON vs msgpack. The Python core's learning
+#   behaviour is unchanged; the three Rust-core quirk fixes (warm-up count persisted, lossless load,
+#   read-only get_recommendations) are in ng_tract (Josh: fix them in the Rust core).
 # [2026-04-08] Claude Code (Opus 4.6) — Punchlist #55: CES attention tunables
 # What: Added surfacing_decay_rate, surfacing_min_confidence, prediction_window
 #   to DEFAULT_CONFIG and TUNABLE_PARAMS.
@@ -214,16 +285,290 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import shutil
+import struct
 import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
 logger = logging.getLogger("ng_lite")
 
 __version__ = "1.0.0"
+
+# Rollout switch for the Rust core (#1096). Temporary: it is removed together with the Python core.
+_RUST_CORE_ENV = "NG_LITE_RUST_CORE"
+
+# A converted legacy JSON state is kept aside under this suffix (never read again by NG-Lite).
+LEGACY_JSON_SUFFIX = ".legacy-json"
+
+
+class EmbeddingDimensionError(ValueError):
+    """A vector's dimension does not match this NG-Lite's ``embedding_dim`` (#1097).
+
+    ``embedding_dim`` is the active embedding model's dimension. Vectors of another dimension come from
+    another model (e.g. the old 384-d all-MiniLM-L6-v2) and cannot be compared with the substrate's own;
+    the stored ones must be re-embedded from their source text, never truncated, padded or skipped.
+    A ValueError subclass, so existing ``except ValueError`` handlers still catch it — the ERROR log
+    written when it is raised is what keeps a broad handler from making it silent.
+    """
+
+
+# Distinct mismatches already logged at ERROR (module, where, got, expected, source) — log once, raise always.
+_DIM_ERRORS_LOGGED: Set[Tuple[str, str, Any, int, str]] = set()
+
+
+def _dim_error(module_id: str, where: str, got: Any, expected: int, source: str = "",
+               detail: str = "") -> EmbeddingDimensionError:
+    """Build (and log at ERROR, once per distinct mismatch) the loud dimension error."""
+    msg = (
+        f"NG-Lite [{module_id}]: {where} is {got}-d but this substrate's embedding_dim (the active "
+        f"embedding model's dimension) is {expected}-d"
+        + (f" — source: {source}" if source else "")
+        + (f" ({detail})" if detail else "")
+        + ". Vectors of different dimensions come from different models and cannot be compared; "
+          "re-embed the stored vectors from their source text with the active model (NeuroGraph "
+          "DIM_GUARD.md) — do not truncate, pad or skip them."
+    )
+    key = (module_id, where, got, expected, source)
+    if key not in _DIM_ERRORS_LOGGED:
+        _DIM_ERRORS_LOGGED.add(key)
+        logger.error(msg)
+    return EmbeddingDimensionError(msg)
+
+
+class EmbeddingSpaceError(ValueError):
+    """Vectors of the right dimension but from another embedding model / space (#1107).
+
+    Raised when a saved state records another model, or when an untagged state or a constitutional rim is off the
+    active model's manifold (its vectors do not share the model's common direction). Same contract as
+    EmbeddingDimensionError: re-embed from the source text with the active model; never load them as they are.
+    """
+
+
+# A vector of the active model has cosine >= this to the model's centre direction (measured on 18,675 live CC
+# Snowflake vectors: p0.1 = 0.363, 2 below 0.30, none below 0.20; bge-base rim 0.19-0.27; hash noise ~0.00).
+MANIFOLD_MIN_COS = 0.30
+
+# Config keys whose values are calibrated for one embedding space + centre version (MEAN_CENTRE.md §3).
+SPACE_KEYS = ("novelty_threshold", "receptor_prototype_threshold", "constitutional_threshold")
+
+_SPACE_ERRORS_LOGGED: Set[Tuple[str, str, str]] = set()
+
+
+def _space_error(module_id: str, where: str, detail: str) -> EmbeddingSpaceError:
+    """Build (and log at ERROR, once per distinct case) the loud embedding-space error."""
+    msg = (f"NG-Lite [{module_id}]: {where} is not in this substrate's embedding space ({detail}). "
+           "Vectors from another model cannot be compared even at the same dimension; re-embed them from their "
+           "source text with the active model (NeuroGraph MEAN_CENTRE.md / DIM_GUARD.md).")
+    key = (module_id, where, detail)
+    if key not in _SPACE_ERRORS_LOGGED:
+        _SPACE_ERRORS_LOGGED.add(key)
+        logger.error(msg)
+    return EmbeddingSpaceError(msg)
+
+
+def _resolve_space(dim: int, want_centre: bool) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
+    """(model name, centre version, centre vector) for a substrate of dimension ``dim``.
+
+    The model is ng_embed's when the dimensions agree; centring is on when ``want_centre`` and the dims agree. An
+    ng_embed that predates #1107 (no embedding_centre) fails loud: ng_lite.py and ng_embed.py are vendored together.
+    """
+    try:
+        import ng_embed  # vendored sibling; importing it loads no model
+    except ImportError as exc:
+        raise RuntimeError(f"NG-Lite needs the vendored ng_embed.py beside it for the embedding space: {exc}") from exc
+    if dim != int(getattr(ng_embed, "EMBEDDING_DIM", -1)):
+        return None, None, None
+    model = ng_embed.MODEL_NAME
+    if not want_centre:
+        return model, None, None
+    if not hasattr(ng_embed, "embedding_centre"):
+        raise RuntimeError(
+            f"ng_embed.py at {getattr(ng_embed, '__file__', '?')} predates #1107 (no embedding_centre): re-vendor "
+            "ng_embed.py together with ng_lite.py")
+    return model, ng_embed.CENTRE_VERSION, ng_embed.embedding_centre()
+
+
+def _manifold_cos(vectors: List[Any], centre: np.ndarray) -> np.ndarray:
+    """Cosine of each vector to the centre direction (0 for a zero vector)."""
+    if not vectors:
+        return np.zeros(0, dtype=np.float32)
+    m = np.asarray([np.asarray(v, dtype=np.float32) for v in vectors], dtype=np.float32)
+    n = np.linalg.norm(m, axis=1)
+    c = centre / float(np.linalg.norm(centre))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = (m @ c) / np.where(n > 0, n, 1.0)
+    return np.where(n > 0, out, 0.0)
+
+
+def _vec_len(v: Any) -> Optional[int]:
+    """Length of a stored vector (list / tuple / 1-D ndarray / raw float32 bytes); None if absent."""
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return len(v) // 4
+    if isinstance(v, np.ndarray):
+        return int(v.shape[-1]) if v.ndim >= 1 else 0
+    try:
+        return len(v)
+    except TypeError:
+        return 0
+
+
+def _rust_core_requested() -> bool:
+    """True when NG_LITE_RUST_CORE is truthy (1 / true / yes / on), the same rule ng_tract's export gate uses."""
+    return os.environ.get(_RUST_CORE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# msgpack persistence (both cores write the same bytes for the same state)
+# ---------------------------------------------------------------------------
+
+def _mp_map_header(n: int) -> bytes:
+    if n <= 15:
+        return bytes((0x80 | n,))
+    if n <= 0xFFFF:
+        return b"\xde" + struct.pack(">H", n)
+    return b"\xdf" + struct.pack(">I", n)
+
+
+def _mp_array_header(n: int) -> bytes:
+    if n <= 15:
+        return bytes((0x90 | n,))
+    if n <= 0xFFFF:
+        return b"\xdc" + struct.pack(">H", n)
+    return b"\xdd" + struct.pack(">I", n)
+
+
+_F32_REC = np.dtype([("m", "u1"), ("v", ">f4")])
+
+
+def _mp_f32_array(vec: np.ndarray) -> bytes:
+    """A 1-D vector as a msgpack array of float32 (0xca) values — what the Rust core writes for embeddings."""
+    v = np.asarray(vec, dtype=np.float32).ravel()
+    rec = np.empty(v.shape[0], dtype=_F32_REC)
+    rec["m"] = 0xCA
+    rec["v"] = v
+    return _mp_array_header(v.shape[0]) + rec.tobytes()
+
+
+def _json_key(k: Any) -> str:
+    """json.dump's dict-key coercion (the Rust core applies the same rule)."""
+    if isinstance(k, str):
+        return k
+    if k is None:
+        return "null"
+    if isinstance(k, bool):
+        return "true" if k else "false"
+    if isinstance(k, float):
+        return repr(k)
+    return str(k)
+
+
+def _pack_state(state: Dict[str, Any]) -> bytes:
+    """Encode an ``_export_state(arrays=True)`` dict as msgpack.
+
+    Containers are written here (dict keys coerced like json.dump), float ndarrays as float32 arrays, every
+    scalar through msgpack's own packer — so the bytes equal the Rust core's ``save_binary`` for the same state.
+    """
+    try:
+        import msgpack
+    except ImportError as exc:  # no JSON fallback (Josh 2026-10-13)
+        raise ImportError(
+            "NG-Lite saves are msgpack only; install the 'msgpack' package in this environment"
+        ) from exc
+    packer = msgpack.Packer(use_bin_type=True)
+    out: List[bytes] = []
+
+    def enc(x: Any) -> None:
+        if isinstance(x, dict):
+            out.append(_mp_map_header(len(x)))
+            for k, v in x.items():
+                out.append(packer.pack(_json_key(k)))
+                enc(v)
+        elif isinstance(x, (list, tuple)):
+            out.append(_mp_array_header(len(x)))
+            for v in x:
+                enc(v)
+        elif isinstance(x, np.ndarray):
+            if x.dtype.kind == "f" and x.ndim == 1:
+                out.append(_mp_f32_array(x))
+            elif x.dtype.kind == "f" and x.ndim == 2:
+                out.append(_mp_array_header(x.shape[0]))
+                for row in x:
+                    out.append(_mp_f32_array(row))
+            else:
+                enc(x.tolist())
+        elif isinstance(x, np.generic):
+            enc(x.item())
+        else:
+            out.append(packer.pack(x))
+
+    enc(state)
+    return b"".join(out)
+
+
+def _unpack_state(data: bytes) -> Dict[str, Any]:
+    try:
+        import msgpack
+    except ImportError as exc:
+        raise ImportError(
+            "NG-Lite states are msgpack; install the 'msgpack' package in this environment"
+        ) from exc
+    return msgpack.unpackb(data, raw=False, strict_map_key=False)
+
+
+def _looks_like_json(head: bytes) -> bool:
+    """A JSON object state (legacy) starts with '{' after optional whitespace; a msgpack state is a map."""
+    stripped = head.lstrip()
+    return stripped[:1] == b"{"
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    """temp file + fsync + rename (the Rust core's save_binary does the same)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class _CoreHeldState:
+    """Stands in for ``NGLite.nodes`` / ``NGLite.synapses`` while the Rust core holds the state.
+
+    Any use raises, naming the public read methods. The old Rust path left these as silently-empty dicts, so a
+    consumer that read them saw an empty substrate and never knew (#1096).
+    """
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str):
+        self._name = name
+
+    def _refuse(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            f"NGLite.{self._name} is held by the Rust core ({_RUST_CORE_ENV}); use the public reads: "
+            "node_count() / list_nodes() / get_node() / synapse_count() / list_synapses() / get_synapse() / "
+            "remove_synapses()"
+        )
+
+    __getitem__ = __setitem__ = __delitem__ = __iter__ = __len__ = __contains__ = __bool__ = _refuse
+    keys = values = items = get = pop = setdefault = update = clear = copy = _refuse
+
+    def __repr__(self) -> str:
+        return f"<NGLite.{self._name}: held by the Rust core>"
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +585,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "success_boost": 0.15,      # Weight increase on success
     "failure_penalty": 0.20,    # Weight decrease on failure
 
-    # Novelty detection
-    "novelty_threshold": 0.7,   # Embedding distance above which = novel
+    # Novelty detection / node matching. Calibrated on MEAN-CENTRED cosines (#1107, MEAN_CENTRE.md §3): an input
+    # matches an existing node at centred cosine >= 1 - novelty_threshold. (0.7 was the raw-cosine value: with
+    # Snowflake's shared direction it matched nearly everything.)
+    "novelty_threshold": 0.40,
+
+    # Cricket rim (#1107): a constitutional node catches an input only at centred cosine >= this, and then wins over
+    # ordinary nodes. Not runtime-tunable (the rim is immutable); calibrated in MEAN_CENTRE.md §4.
+    "constitutional_threshold": 0.55,
+
+    # Mean-centring (#1107): subtract ng_embed's fixed model centre before every comparison (applies when
+    # embedding_dim is the model's dimension). False only for synthetic-vector test fixtures.
+    "mean_centre": True,
 
     # Pruning
     "pruning_threshold": 0.01,  # Synapses below this weight get pruned
@@ -250,7 +605,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "relevance_threshold": 0.30,  # Min cosine similarity to absorb cross-module events
 
     # Embedding
-    "embedding_dim": 768,       # Expected embedding dimensionality (BAAI/bge-base-en-v1.5)
+    "embedding_dim": 768,       # The active embedding model's dimension (ng_embed: Snowflake/snowflake-arctic-embed-m-v1.5,
+                                # 768). Every vector in and out of NG-Lite is checked against it (#1097,
+                                # EmbeddingDimensionError); tests/test_dim_guard.py pins it to ng_embed's.
     "hash_dims": 128,           # Dims used for hashing (first N of embedding)
 
     # Persistence
@@ -264,7 +621,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Receptor Layer (#43) — vector quantization via adaptive prototypes
     "receptor_layer_enabled": True,
     "receptor_layer_k": 256,                # Initial prototype count
-    "receptor_prototype_threshold": 0.75,   # Cosine similarity to snap to prototype
+    "receptor_prototype_threshold": 0.75,   # Centred cosine to snap to a prototype (#1107, MEAN_CENTRE.md §3)
     "receptor_ema_alpha": 0.001,            # Slow drift rate (Elmer will tune later)
     "receptor_warmup_count": 256,           # Inputs before k-means init fires
 }
@@ -502,22 +859,43 @@ class NGLite:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self._bridge = bridge
 
-        # Rust core — if available, all hot-path methods delegate here.
-        # Python fallback remains intact for modules without the wheel.
-        self._core = None
-        try:
-            from ng_tract import NGLiteCore
-            self._core = NGLiteCore(module_id, self.config)
-            # Seed constitutional nodes in Rust core
-            entries = self.config.get("constitutional_embeddings", [])
-            if entries:
-                self._core.seed_constitutional(entries)
-        except ImportError:
-            pass  # Pure Python fallback
+        # #1097: the active embedding model's dimension. Fixed for this instance's lifetime — a loaded state
+        # cannot change it (its vectors are checked against it instead).
+        self._embedding_dim = int(self.config["embedding_dim"])
+        if self._embedding_dim <= 0:
+            raise ValueError(f"NG-Lite [{module_id}]: embedding_dim must be a positive int, got {self._embedding_dim}")
+        # #1107: the embedding space — model, centre version and the fixed centre (None: compare raw). Fixed for this
+        # instance's lifetime, like embedding_dim; a loaded state cannot change it.
+        self._mean_centre = bool(self.config.get("mean_centre", True))
+        self._model, self._centre_version, self._centre = _resolve_space(self._embedding_dim, self._mean_centre)
+        # The instance's own values of the space-calibrated keys (restored when a loaded state was calibrated under
+        # another centre version, see _space_migrate_config).
+        self._space_values = {k: self.config[k] for k in SPACE_KEYS if k in self.config}
+        self._check_rim_entries(self.config.get("constitutional_embeddings", []), "constitutional_embeddings (config)")
 
-        # Core collections (used by Python fallback, also for bridge/stats)
-        self.nodes: Dict[str, NGLiteNode] = {}
-        self.synapses: Dict[Tuple[str, str], NGLiteSynapse] = {}
+        # Rust core (#1096): used only when NG_LITE_RUST_CORE is truthy (temporary rollout switch). It then
+        # holds ALL learning state; the public reads below serve it. Otherwise the Python core runs.
+        self._core = None
+        if _rust_core_requested():
+            try:
+                from ng_tract import NGLiteCore
+            except ImportError as exc:
+                logger.warning(
+                    "%s is set but ng_tract.NGLiteCore is unavailable (%s); module '%s' runs the Python core",
+                    _RUST_CORE_ENV, exc, module_id,
+                )
+            else:
+                self._core = NGLiteCore(module_id, self.config)
+                self._core.set_space(self._model, self._centre_version, self._centre, self._embedding_dim)
+                entries = self.config.get("constitutional_embeddings", [])
+                if entries:
+                    self._core.seed_constitutional(entries)
+
+        # Core collections (Python core only; on the Rust core any use raises — see _CoreHeldState)
+        self.nodes: Dict[str, NGLiteNode] = {} if self._core is None else _CoreHeldState("nodes")  # type: ignore[assignment]
+        self.synapses: Dict[Tuple[str, str], NGLiteSynapse] = (
+            {} if self._core is None else _CoreHeldState("synapses")  # type: ignore[assignment]
+        )
 
         # Embedding cache: hash -> full embedding (for similarity search)
         self._embedding_cache: Dict[str, np.ndarray] = {}
@@ -526,6 +904,10 @@ class NGLite:
         # Initialized via k-means after warmup_count inputs, then drifts via EMA.
         # Prototypes are a routing lens above existing nodes, not a replacement.
         self._prototypes: Optional[np.ndarray] = None  # (K, D) matrix or None
+        # #1107: centred copies, recomputed only when the raw vector changes (a row's centring does not depend on the
+        # other rows, so these are the exact bits _centre_rows would give for the whole matrix)
+        self._centred_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}  # hash -> (raw array, centred row)
+        self._centred_protos: Optional[Tuple[np.ndarray, np.ndarray]] = None  # (prototypes array, centred matrix)
         self._prototype_counts: Optional[np.ndarray] = None  # activation counts per prototype
         self._receptor_input_count: int = 0  # inputs seen before init
 
@@ -543,7 +925,211 @@ class NGLite:
         # learn — the survival instinct. Synapses from constitutional nodes
         # are frozen. LRU pruning skips them. The bucket comes up empty
         # for inputs that land in constitutional semantic space.
-        self._seed_constitutional_nodes()
+        # (On the Rust core the seeding happened above, in the core.)
+        if self._core is None:
+            self._seed_constitutional_nodes()
+
+    # -------------------------------------------------------------------
+    # Dimension guard (#1097)
+    # -------------------------------------------------------------------
+
+    @property
+    def embedding_dim(self) -> int:
+        """The dimension every vector in this substrate must have (the active embedding model's)."""
+        return self._embedding_dim
+
+    def _check_input(self, embedding: Any, where: str) -> None:
+        """Raise EmbeddingDimensionError (logged at ERROR) when a 1-D input is not ``embedding_dim`` long.
+
+        Non-1-D inputs are left to the existing checks (record_outcome's ndim ValueError).
+        """
+        n = getattr(embedding, "ndim", None)
+        if n is None:
+            try:
+                embedding = np.asarray(embedding)
+            except Exception:  # noqa: BLE001 — not array-like: the existing paths report it
+                return
+            n = embedding.ndim
+        if n == 1 and embedding.shape[0] != self._embedding_dim:
+            raise _dim_error(self.module_id, f"the input embedding to {where}()", int(embedding.shape[0]),
+                             self._embedding_dim)
+
+    def _check_rim_entries(self, entries: Any, source: str) -> None:
+        """Every constitutional (rim) entry's embedding must be ``embedding_dim`` long."""
+        if not entries:
+            return
+        bad: Dict[int, List[str]] = {}
+        for i, entry in enumerate(entries):
+            raw = entry.get("embedding") if isinstance(entry, dict) else None
+            d = _vec_len(raw)
+            if d is not None and d != self._embedding_dim:
+                label = entry.get("category") or entry.get("description", "")[:40] or f"#{i}"
+                bad.setdefault(d, []).append(str(label))
+        if bad:
+            got = "/".join(str(d) for d in sorted(bad))
+            detail = "; ".join(f"{len(v)} of {len(entries)} entries are {d}-d (e.g. {v[0]!r})"
+                               for d, v in sorted(bad.items()))
+            raise _dim_error(self.module_id, "the constitutional rim", got, self._embedding_dim, source, detail)
+        # #1107: the rim must also be in the model's space (a same-dim rim from another model passes the dim check)
+        centre = getattr(self, "_centre", None)
+        if centre is not None:
+            vecs = [e.get("embedding") for e in entries if isinstance(e, dict) and e.get("embedding") is not None]
+            cos = _manifold_cos(vecs, centre)
+            off = int((cos < MANIFOLD_MIN_COS).sum())
+            if off:
+                raise _space_error(
+                    self.module_id, "the constitutional rim",
+                    f"{off} of {len(vecs)} entries have cosine < {MANIFOLD_MIN_COS} to the {self._model} centre "
+                    f"direction (min {float(cos.min()):.3f}; this model's own vectors sit at ~0.85) — source: {source}")
+
+    def _check_state_dims(self, state: Dict[str, Any], source: str) -> None:
+        """A state's node embeddings and receptor prototypes must all be ``embedding_dim`` long.
+
+        Runs BEFORE the state is imported (either core), so a wrong-dim state is never half-loaded.
+        Counts every vector, so the error says how much of the state is affected.
+        """
+        counts: Dict[int, int] = {}
+        total = 0
+        for node in (state.get("nodes") or {}).values():
+            d = _vec_len(node.get("embedding")) if isinstance(node, dict) else None
+            if d is not None:
+                total += 1
+                counts[d] = counts.get(d, 0) + 1
+        protos = (state.get("receptor_layer") or {}).get("prototypes")
+        p_counts: Dict[int, int] = {}
+        if protos is not None and len(protos):
+            for p in protos:
+                d = _vec_len(p)
+                p_counts[d] = p_counts.get(d, 0) + 1
+        bad_nodes = {d: c for d, c in counts.items() if d != self._embedding_dim}
+        bad_protos = {d: c for d, c in p_counts.items() if d != self._embedding_dim}
+        if bad_nodes or bad_protos:
+            parts = []
+            if bad_nodes:
+                parts.append("node embeddings by dim: " + ", ".join(f"{d}-d x{c}" for d, c in sorted(counts.items()))
+                             + f" (of {total})")
+            if bad_protos:
+                parts.append("receptor prototypes by dim: "
+                             + ", ".join(f"{d}-d x{c}" for d, c in sorted(p_counts.items())))
+            got = "/".join(str(d) for d in sorted(set(bad_nodes) | set(bad_protos)))
+            raise _dim_error(self.module_id, "the stored state", got, self._embedding_dim, source, "; ".join(parts))
+        saved_dim = (state.get("config") or {}).get("embedding_dim")
+        if saved_dim is not None and int(saved_dim) != self._embedding_dim:
+            logger.warning(
+                "NG-Lite [%s]: %s records embedding_dim=%s but this substrate runs %d-d; its vectors match %d-d, "
+                "so it loads (the saved value is ignored)", self.module_id, source, saved_dim,
+                self._embedding_dim, self._embedding_dim,
+            )
+        # A saved rim is used only when the constructor brought none (see _import_state)
+        if not self.config.get("constitutional_embeddings"):
+            self._check_rim_entries((state.get("config") or {}).get("constitutional_embeddings", []),
+                                    f"{source} (saved config)")
+
+    def _check_state_space(self, state: Dict[str, Any], source: str) -> None:
+        """#1107: a state must be in this substrate's embedding space. Runs BEFORE import (either core).
+
+        A state records ``embedding_space.model``; another model is refused. An untagged (pre-#1107) state is checked
+        on the model's manifold instead: refused when the median cosine of its vectors to the centre direction is
+        below MANIFOLD_MIN_COS (hash noise / another model). No check for non-model dimensions (test fixtures).
+        """
+        if self._model is None:
+            return
+        space = state.get("embedding_space") or {}
+        model = space.get("model")
+        if model is not None:
+            if model != self._model:
+                raise _space_error(self.module_id, "the stored state",
+                                   f"it records model {model!r}, this substrate runs {self._model!r} — source: {source}")
+            return
+        if self._centre is None:
+            return
+        vecs = [n.get("embedding") for n in (state.get("nodes") or {}).values()
+                if isinstance(n, dict) and n.get("embedding") is not None]
+        vecs += list((state.get("receptor_layer") or {}).get("prototypes") or [])
+        if not vecs:
+            return
+        med = float(np.median(_manifold_cos(vecs, self._centre)))
+        if med < MANIFOLD_MIN_COS:
+            raise _space_error(
+                self.module_id, "the stored state (untagged)",
+                f"median cosine of its {len(vecs)} vectors to the {self._model} centre direction is {med:.3f} < "
+                f"{MANIFOLD_MIN_COS} (this model's own vectors sit at ~0.85) — source: {source}")
+
+    def _space_migrate_config(self, state: Dict[str, Any], source: str) -> None:
+        """#1107: after an import, the space-calibrated thresholds follow THIS instance when the state was calibrated
+        under another centre version (an untagged state = the raw-cosine era). The instance's ``mean_centre`` wins too.
+        Same values on both cores."""
+        saved_version = (state.get("embedding_space") or {}).get("centre_version")
+        updates: Dict[str, Any] = {"mean_centre": self._mean_centre}
+        if saved_version != self._centre_version:
+            changed = {k: (self.config.get(k), v) for k, v in self._space_values.items() if self.config.get(k) != v}
+            if changed:
+                logger.warning(
+                    "NG-Lite [%s]: %s was calibrated under centre %r, this substrate runs %r: space thresholds reset "
+                    "to this instance's values %s", self.module_id, source, saved_version, self._centre_version,
+                    {k: f"{a} -> {b}" for k, (a, b) in changed.items()})
+            updates.update(self._space_values)
+        for k, v in updates.items():
+            if self._core is not None:
+                self._core.set_config_value(k, v)
+            self.config[k] = v
+
+    def _space_tag(self) -> Dict[str, Any]:
+        """The ``embedding_space`` record written into every save (#1107)."""
+        return {"model": self._model, "dim": self._embedding_dim, "centre_version": self._centre_version}
+
+    # -------------------------------------------------------------------
+    # Mean-centring (#1107) — every comparison goes through these two. The Rust core mirrors them bit for bit:
+    # a single vector is re-normalised with _normalize (sqrt(dot)), a matrix row-wise like the prototype renorm.
+    # -------------------------------------------------------------------
+
+    def _centre_vec(self, emb: np.ndarray) -> np.ndarray:
+        """``normalize(emb - centre)`` (float32); ``emb`` itself when centring is off."""
+        if self._centre is None:
+            return emb
+        return self._normalize(emb - self._centre)
+
+    def _centre_rows(self, m: np.ndarray) -> np.ndarray:
+        """Row-wise ``(m - centre) / max(norm(axis=1), 1e-12)`` (float32); ``m`` itself when centring is off."""
+        if self._centre is None:
+            return m
+        c = m - self._centre
+        return c / np.maximum(np.linalg.norm(c, axis=1, keepdims=True), 1e-12)
+
+    def _centred_cache_rows(self) -> Tuple[List[str], np.ndarray]:
+        """(cache keys, the cached embeddings as a centred matrix) — what node matching and novelty compare against.
+        Each row is centred once per raw vector (validated by identity, so a replaced embedding is re-centred)."""
+        keys = list(self._embedding_cache.keys())
+        if self._centre is None:
+            return keys, np.stack(list(self._embedding_cache.values()))
+        cc = self._centred_cache
+        rows = []
+        for k in keys:
+            raw = self._embedding_cache[k]
+            hit = cc.get(k)
+            if hit is None or hit[0] is not raw:
+                hit = (raw, self._centre_rows(raw[None, :])[0])
+                cc[k] = hit
+            rows.append(hit[1])
+        if len(cc) > 2 * len(keys) + 64:  # drop entries of pruned / replaced nodes
+            live = set(keys)
+            for k in [k for k in cc if k not in live]:
+                del cc[k]
+        return keys, np.stack(rows)
+
+    def _centred_prototypes(self) -> np.ndarray:
+        """The prototypes, centred (cached per prototypes array; the snap's EMA drift re-centres its one row)."""
+        if self._centre is None:
+            return self._prototypes
+        hit = self._centred_protos
+        if hit is None or hit[0] is not self._prototypes:
+            hit = (self._prototypes, self._centre_rows(self._prototypes))
+            self._centred_protos = hit
+        return hit[1]
+
+    def _snap_sims(self, emb: np.ndarray) -> np.ndarray:
+        """Similarities of a normalised input to every prototype (centred) — the receptor snap's comparison."""
+        return self._centred_prototypes() @ self._centre_vec(emb)
 
     def _seed_constitutional_nodes(self) -> None:
         """Seed constitutional nodes from config embeddings.
@@ -602,20 +1188,18 @@ class NGLite:
         Returns:
             The matched or newly created NGLiteNode.
         """
-        # Rust fast path
+        self._check_input(embedding, "find_or_create_node")
+        # Rust core: a fresh node built from the core's answer (never a stub cached by hash — after the core
+        # prunes and re-creates a node with the same hash such a stub carried a stale node_id, #1096).
         if self._core is not None:
-            result = self._core.find_or_create_node(embedding)
-            # Return a lightweight node-like object for callers that need it
-            emb_hash = result.get("embedding_hash", "")
-            if emb_hash not in self.nodes:
-                self.nodes[emb_hash] = NGLiteNode(
-                    node_id=result["node_id"],
-                    embedding_hash=emb_hash,
-                    activation_count=result.get("activation_count", 1),
-                    last_activation=time.time(),
-                    constitutional=result.get("constitutional", False),
-                )
-            return self.nodes[emb_hash]
+            r = self._core.find_or_create_node(embedding)
+            return NGLiteNode(
+                node_id=r["node_id"],
+                embedding_hash=r["embedding_hash"],
+                activation_count=r["activation_count"],
+                last_activation=r["last_activation"],
+                constitutional=r["constitutional"],
+            )
 
         emb = self._normalize(embedding)
 
@@ -704,11 +1288,16 @@ class NGLite:
         Raises:
             ValueError: If embedding is not a 1-D numpy array.
         """
-        # Rust fast path — Hebbian learning, Welford variance, all in Rust
+        self._check_input(embedding, "record_outcome")
+        # Rust core — Hebbian learning, Welford variance and the outcome counters all live in the core
         if self._core is not None:
             result = self._core.record_outcome(
                 embedding, target_id, success, strength, metadata,
             )
+            if not result.get("constitutional"):
+                self._history.append(result)
+                if len(self._history) > self._history_max:
+                    self._history = self._history[-self._history_max:]
             # Bridge forwarding stays in Python
             if self._bridge and self._bridge.is_connected():
                 try:
@@ -723,9 +1312,6 @@ class NGLite:
                         result["bridge_response"] = enriched
                 except Exception as e:
                     logger.warning("Bridge record_outcome failed: %s", e)
-            self._total_outcomes += 1
-            if success:
-                self._total_successes += 1
             return result
 
         # Input validation (Grok review: defensive boundary check)
@@ -849,6 +1435,7 @@ class NGLite:
             weight, activation volume, and strength signature.
             Empty list if no learned routes exist for this pattern.
         """
+        self._check_input(embedding, "get_recommendations")
         # Try bridge first
         if self._bridge and self._bridge.is_connected():
             try:
@@ -862,7 +1449,7 @@ class NGLite:
             except Exception as e:
                 logger.warning("Bridge get_recommendations failed: %s", e)
 
-        # Rust fast path
+        # Rust core — read-only there (it creates / activates no node; ng_tract quirk fix c)
         if self._core is not None:
             return self._core.get_recommendations(embedding, top_k)
 
@@ -932,6 +1519,7 @@ class NGLite:
         Returns:
             Novelty score from 0.0 (routine/known) to 1.0 (completely novel).
         """
+        self._check_input(embedding, "detect_novelty")
         # Try bridge first
         if self._bridge and self._bridge.is_connected():
             try:
@@ -944,7 +1532,7 @@ class NGLite:
             except Exception as e:
                 logger.warning("Bridge detect_novelty failed: %s", e)
 
-        # Rust fast path
+        # Rust core
         if self._core is not None:
             return self._core.detect_novelty(embedding)
 
@@ -955,7 +1543,13 @@ class NGLite:
         emb = self._normalize(embedding)
         max_similarity = 0.0
 
-        for cached_emb in self._embedding_cache.values():
+        # #1107: compare mean-centred vectors (raw when centring is off)
+        if self._centre is None:
+            rows: Iterable[np.ndarray] = self._embedding_cache.values()
+        else:
+            emb = self._centre_vec(emb)
+            rows = self._centred_cache_rows()[1]
+        for cached_emb in rows:
             similarity = float(np.dot(emb, cached_emb))
             if similarity > max_similarity:
                 max_similarity = similarity
@@ -1013,77 +1607,131 @@ class NGLite:
     # Persistence
     # -------------------------------------------------------------------
 
-    def save(self, filepath: str) -> None:
-        """Save full state to binary (msgpack) via Rust.
+    @staticmethod
+    def state_paths(filepath: str) -> Tuple[str, Optional[str]]:
+        """(msgpack path, legacy JSON path or None) for a state path given by a caller.
 
-        Falls back to JSON if Rust core is unavailable.
-        Binary path: Rust serializes directly to bytes, writes to disk.
-        No Python dicts, no JSON, no inflation.
+        ``x.json`` -> (``x.msgpack``, ``x.json``); ``x.msgpack`` -> (``x.msgpack``, ``x.json``);
+        any other name -> (that name, None).
+        """
+        p = str(filepath)
+        if p.endswith(".json"):
+            return p[: -len(".json")] + ".msgpack", p
+        if p.endswith(".msgpack"):
+            return p, p[: -len(".msgpack")] + ".json"
+        return p, None
+
+    @classmethod
+    def state_exists(cls, filepath: str) -> bool:
+        """True when ``load(filepath)`` would find a state (the msgpack save or a legacy JSON)."""
+        bin_path, legacy = cls.state_paths(filepath)
+        return os.path.exists(bin_path) or (legacy is not None and os.path.exists(legacy))
+
+    def save(self, filepath: str) -> str:
+        """Save the full state as msgpack (both cores; never JSON — Josh 2026-10-13).
+
+        ``x.json`` is written as ``x.msgpack``; any other name as given. temp file + fsync + rename.
 
         Args:
-            filepath: Path to write the state file.
+            filepath: Path of the state (a ``.json`` name is mapped to its ``.msgpack`` sibling).
+
+        Returns:
+            The path written.
         """
+        bin_path, _ = self.state_paths(filepath)
         if self._core is not None:
-            # Binary persistence — Rust handles everything
-            bin_path = filepath.replace(".json", ".msgpack")
             self._core.save_binary(bin_path)
-            logger.info("NG-Lite state saved (binary) to %s", bin_path)
-            return
-
-        # Python fallback — JSON
-        state = self._export_state()
-        with open(filepath, "w") as f:
-            json.dump(state, f, indent=2)
+            logger.info("NG-Lite state saved (Rust core) to %s", bin_path)
+            return bin_path
+        _atomic_write(bin_path, _pack_state(self._export_state(arrays=True)))
         logger.info("NG-Lite state saved to %s (%d nodes, %d synapses)",
-                     filepath, len(self.nodes), len(self.synapses))
+                    bin_path, len(self.nodes), len(self.synapses))
+        return bin_path
 
-    def load(self, filepath: str) -> None:
-        """Load state from binary (msgpack) or JSON.
+    def load(self, filepath: str) -> bool:
+        """Load the state saved for ``filepath`` (see ``state_paths``). No-op when there is none.
 
-        Tries binary first (.msgpack), falls back to JSON (.json).
-        If loading JSON into Rust core, migrates via import_state.
+        Reads the msgpack save. A legacy JSON state — ``x.json`` with no msgpack beside it (or a newer one), or
+        JSON content inside the ``.msgpack`` file (#1098) — is converted ONCE: imported, re-saved as msgpack, and
+        the JSON kept aside as ``<file>.legacy-json``.
 
-        Args:
-            filepath: Path to the state file (.json or .msgpack).
+        Returns:
+            True if a state was loaded.
         """
-        import os
+        bin_path, legacy = self.state_paths(filepath)
+        has_bin = os.path.exists(bin_path)
+        has_json = legacy is not None and os.path.exists(legacy)
+        if has_bin and has_json and os.path.getmtime(legacy) > os.path.getmtime(bin_path):
+            logger.warning(
+                "NG-Lite: legacy JSON %s is newer than %s; converting the JSON (the msgpack is replaced)",
+                legacy, bin_path,
+            )
+            has_bin = False
 
-        bin_path = filepath.replace(".json", ".msgpack")
-
-        if self._core is not None:
-            # Try binary first
-            if os.path.exists(bin_path):
-                self._core.load_binary(bin_path)
-                logger.info("NG-Lite state loaded (binary) from %s", bin_path)
-                return
-            # JSON migration — read JSON, import into Rust core, then
-            # save binary so next load is native
-            if os.path.exists(filepath):
-                with open(filepath, "r") as f:
+        if has_bin:
+            with open(bin_path, "rb") as f:
+                head = f.read(64)
+            if _looks_like_json(head):
+                # #1098: the old Python core wrote JSON into this .msgpack-named file — convert it once
+                with open(bin_path, "r") as f:
                     state = json.load(f)
-                self._core.import_state(state)
-                self._core.save_binary(bin_path)
-                logger.info(
-                    "NG-Lite state migrated from JSON to binary: %s → %s",
-                    filepath, bin_path,
-                )
-                return
+                self._import_state(state, source=bin_path)
+                shutil.copy2(bin_path, bin_path + LEGACY_JSON_SUFFIX)
+                self.save(bin_path)
+                logger.info("NG-Lite: converted the JSON inside %s to msgpack (JSON kept as %s)",
+                            bin_path, bin_path + LEGACY_JSON_SUFFIX)
+            elif self._core is not None:
+                # #1097: check the stored vectors before the core takes the state (never half-load a wrong-dim one)
+                with open(bin_path, "rb") as f:
+                    st = _unpack_state(f.read())
+                self._check_state_dims(st, bin_path)
+                self._check_state_space(st, bin_path)
+                self._core.load_binary(bin_path)
+                self._sync_from_core()
+                self._space_migrate_config(st, bin_path)
+                logger.info("NG-Lite state loaded (Rust core) from %s", bin_path)
+            else:
+                with open(bin_path, "rb") as f:
+                    state = _unpack_state(f.read())
+                self._import_state(state, source=bin_path)
+                logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
+                            bin_path, len(self.nodes), len(self.synapses))
+            return True
 
-        # Pure Python fallback
-        if os.path.exists(filepath):
-            with open(filepath, "r") as f:
+        if has_json:
+            with open(legacy, "r") as f:
                 state = json.load(f)
-            self._import_state(state)
-            logger.info("NG-Lite state loaded from %s (%d nodes, %d synapses)",
-                         filepath, len(self.nodes), len(self.synapses))
+            self._import_state(state, source=legacy)
+            self.save(bin_path)
+            os.replace(legacy, legacy + LEGACY_JSON_SUFFIX)
+            logger.info("NG-Lite: migrated legacy JSON %s to msgpack %s (JSON kept as %s)",
+                        legacy, bin_path, legacy + LEGACY_JSON_SUFFIX)
+            return True
+        return False
 
-    def _export_state(self) -> Dict[str, Any]:
+    def _sync_from_core(self) -> None:
+        """After the Rust core replaced its state: the wrapper's config / module_id follow the core, and the
+        in-memory history restarts (as the Python core's _import_state does)."""
+        self.config = self._core.get_config()
+        self.config["embedding_dim"] = self._embedding_dim  # #1097: the instance's model dimension, never the saved one
+        self.module_id = self._core.get_module_id()
+        self._history.clear()
+
+    def export_state(self) -> Dict[str, Any]:
+        """The full state as a plain dict (the persisted schema), from whichever core holds it."""
+        return self._export_state()
+
+    def _export_state(self, arrays: bool = False) -> Dict[str, Any]:
         """Export full state as a serializable dict.
 
         Synapse keys are converted from (source_id, target_id) tuples
-        to "source_id|target_id" strings for JSON compatibility.
+        to "source_id|target_id" strings. ``arrays=True`` (the msgpack writer) leaves embeddings and prototypes
+        as float32 ndarrays instead of lists. On the Rust core this is the core's export (lists).
         """
-        # Convert synapse keys from tuples to strings for JSON
+        if self._core is not None:
+            return self._core.export_state()
+
+        # Convert synapse keys from tuples to strings
         synapses_serialized = {}
         for (src, tgt), syn in self.synapses.items():
             key = f"{src}|{tgt}"
@@ -1093,7 +1741,7 @@ class NGLite:
         receptor_state = {}
         if self._prototypes is not None:
             receptor_state = {
-                "prototypes": self._prototypes.tolist(),
+                "prototypes": self._prototypes if arrays else self._prototypes.tolist(),
                 "prototype_counts": self._prototype_counts.tolist(),
                 "input_count": self._receptor_input_count,
             }
@@ -1103,7 +1751,7 @@ class NGLite:
             "module_id": self.module_id,
             "timestamp": time.time(),
             "config": self.config,
-            "nodes": {k: self._serialize_node(v) for k, v in self.nodes.items()},
+            "nodes": {k: self._serialize_node(v, arrays) for k, v in self.nodes.items()},
             "synapses": synapses_serialized,
             "counters": {
                 "node_id_counter": self._node_id_counter,
@@ -1111,10 +1759,22 @@ class NGLite:
                 "total_successes": self._total_successes,
             },
             "receptor_layer": receptor_state,
+            "embedding_space": self._space_tag(),  # #1107
         }
 
-    def _import_state(self, state: Dict[str, Any]) -> None:
-        """Import state from a deserialized dict."""
+    def _import_state(self, state: Dict[str, Any], source: str = "<state dict>") -> None:
+        """Import state from a deserialized dict.
+
+        #1097: the state's vectors are checked against ``embedding_dim`` first (EmbeddingDimensionError names
+        ``source`` and both dimensions); nothing is imported when they do not match.
+        """
+        self._check_state_dims(state, source)
+        self._check_state_space(state, source)
+        if self._core is not None:
+            self._core.import_state(state)
+            self._sync_from_core()
+            self._space_migrate_config(state, source)
+            return
         self.module_id = state.get("module_id", self.module_id)
 
         # Restore config (merge with defaults for forward compatibility).
@@ -1124,8 +1784,10 @@ class NGLite:
         saved_config = state.get("config", {})
         live_constitutional = self.config.get("constitutional_embeddings", [])
         self.config = {**DEFAULT_CONFIG, **saved_config}
+        self.config["embedding_dim"] = self._embedding_dim  # #1097: the instance's model dimension wins
         if live_constitutional:
             self.config["constitutional_embeddings"] = live_constitutional
+        self._space_migrate_config(state, source)  # #1107
 
         # Clear caches before rebuild
         self._embedding_cache.clear()
@@ -1187,7 +1849,7 @@ class NGLite:
     TUNABLE_PARAMS: Dict[str, Tuple[float, float]] = {
         "success_boost":              (0.01,  0.50),
         "failure_penalty":            (0.01,  0.50),
-        "novelty_threshold":          (0.30,  0.95),
+        "novelty_threshold":          (0.20,  0.60),   # #1107: centred match 0.40..0.80
         "pruning_threshold":          (0.001, 0.10),
         "receptor_ema_alpha":         (0.0001, 0.01),
         "receptor_prototype_threshold": (0.50, 0.95),
@@ -1207,22 +1869,20 @@ class NGLite:
         Returns dict with old_value, new_value, clamped (bool).
         Raises KeyError if key is not tunable.
         """
-        # Update Rust core if present
-        if self._core is not None:
-            try:
-                self._core.update_config(key, float(value))
-            except Exception:
-                pass  # Rust core may not have this key yet
-
         if key not in self.TUNABLE_PARAMS:
             raise KeyError(
                 f"'{key}' is not a tunable parameter. "
                 f"Allowed: {sorted(self.TUNABLE_PARAMS.keys())}"
             )
         lo, hi = self.TUNABLE_PARAMS[key]
-        old_value = self.config[key]
-        clamped = value < lo or value > hi
-        new_value = max(lo, min(hi, float(value)))
+        if self._core is not None:
+            # The core validates and clamps the same way and is the source of truth for its config.
+            r = self._core.update_config(key, float(value))
+            old_value, new_value, clamped = r["old_value"], r["new_value"], r["clamped"]
+        else:
+            old_value = self.config[key]
+            clamped = value < lo or value > hi
+            new_value = max(lo, min(hi, float(value)))
         self.config[key] = new_value
         logger.info(
             "Tunable updated: %s %.6f → %.6f%s",
@@ -1264,6 +1924,25 @@ class NGLite:
         or display to users. All routing/learning decisions should
         be queryable per transparency obligations.
         """
+        bridge_connected = self._bridge is not None and self._bridge.is_connected()
+        if self._core is not None:
+            c = self._core.get_stats()
+            return {
+                "version": __version__,
+                "module_id": self.module_id,
+                "node_count": c["node_count"],
+                "synapse_count": c["synapse_count"],
+                "max_nodes": c["max_nodes"],
+                "max_synapses": c["max_synapses"],
+                "memory_estimate_bytes": c["memory_estimate_bytes"],
+                "total_outcomes": c["total_outcomes"],
+                "total_successes": c["total_successes"],
+                "success_rate": c["success_rate"],
+                "avg_synapse_weight": c["avg_synapse_weight"],
+                "bridge_connected": bridge_connected,
+                "embedding_cache_size": c["embedding_cache_size"],
+                "embedding_space": self._space_tag(),
+            }
         synapse_weights = [s.weight for s in self.synapses.values()]
         return {
             "version": __version__,
@@ -1283,27 +1962,163 @@ class NGLite:
                 float(np.mean(synapse_weights))
                 if synapse_weights else 0.0
             ),
-            "bridge_connected": (
-                self._bridge is not None
-                and self._bridge.is_connected()
-            ),
+            "bridge_connected": bridge_connected,
             "embedding_cache_size": len(self._embedding_cache),
+            "embedding_space": self._space_tag(),
         }
+
+    # -------------------------------------------------------------------
+    # Public reads (#1096) — served by whichever core holds the state.
+    # Consumers use these instead of NGLite.nodes / .synapses / private fields.
+    # Every row is a snapshot copy: mutating it does not change the substrate.
+    # -------------------------------------------------------------------
+
+    def node_count(self) -> int:
+        """Number of pattern nodes (incl. constitutional ones)."""
+        if self._core is not None:
+            return self._core.counts()[0]
+        return len(self.nodes)
+
+    def synapse_count(self) -> int:
+        """Number of synapses."""
+        if self._core is not None:
+            return self._core.counts()[1]
+        return len(self.synapses)
+
+    # Row -> dataclass without running the generated __init__ (a few µs per row; list_* builds thousands).
+    _NODE_ROW_FIELDS = ("node_id", "embedding_hash", "activation_count", "last_activation", "metadata",
+                        "embedding", "constitutional")
+    _SYN_ROW_FIELDS = ("source_id", "target_id", "weight", "activation_count", "success_count", "failure_count",
+                       "last_updated", "metadata", "welford_count", "welford_mean", "welford_m2")
+
+    @staticmethod
+    def _node_from_row(row: Tuple) -> NGLiteNode:
+        n = object.__new__(NGLiteNode)
+        n.__dict__.update(zip(NGLite._NODE_ROW_FIELDS, row[1:]))
+        return n
+
+    @staticmethod
+    def _copy_node(n: NGLiteNode, with_embedding: bool) -> NGLiteNode:
+        emb = n.embedding.copy() if (with_embedding and n.embedding is not None) else None
+        return NGLiteNode(node_id=n.node_id, embedding_hash=n.embedding_hash, activation_count=n.activation_count,
+                          last_activation=n.last_activation, metadata=dict(n.metadata), embedding=emb,
+                          constitutional=n.constitutional)
+
+    def list_nodes(self, with_embedding: bool = True) -> List[NGLiteNode]:
+        """All pattern nodes, in storage order. ``with_embedding=False`` skips the vectors (embedding=None)."""
+        if self._core is not None:
+            return [self._node_from_row(r) for r in self._core.list_nodes(with_embedding)]
+        return [self._copy_node(n, with_embedding) for n in list(self.nodes.values())]
+
+    def get_node(self, node_id: str) -> Optional[NGLiteNode]:
+        """The node with this node_id (a synapse's ``source_id``), with its embedding, or None."""
+        if self._core is not None:
+            r = self._core.get_node(node_id)
+            return None if r is None else self._node_from_row(r)
+        for n in list(self.nodes.values()):
+            if n.node_id == node_id:
+                return self._copy_node(n, True)
+        return None
+
+    @staticmethod
+    def _synapse_from_row(row: Tuple) -> NGLiteSynapse:
+        s = object.__new__(NGLiteSynapse)
+        d = s.__dict__
+        d.update(zip(NGLite._SYN_ROW_FIELDS, row))
+        if d["metadata"] is None:
+            d["metadata"] = {}
+        return s
+
+    @staticmethod
+    def _copy_synapse(s: NGLiteSynapse, with_metadata: bool) -> NGLiteSynapse:
+        c = object.__new__(NGLiteSynapse)
+        c.__dict__.update(s.__dict__)
+        c.metadata = dict(s.metadata) if with_metadata else {}
+        return c
+
+    def list_synapses(
+        self,
+        *,
+        source_id: Optional[str] = None,
+        target_id: Optional[str] = None,
+        target_prefix: Optional[str] = None,
+        since: Optional[float] = None,
+        with_metadata: bool = True,
+        newest_first: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[NGLiteSynapse]:
+        """Synapses in storage (insertion) order, optionally filtered (filters AND together).
+
+        Args:
+            source_id: only synapses from this node_id.
+            target_id: only synapses to exactly this target.
+            target_prefix: only targets starting with this string (e.g. ``"metrics:elmer:cpu:"``).
+            since: only synapses with ``last_updated > since``.
+            with_metadata: False -> ``metadata`` is ``{}`` (cheap scans; ``get_synapse`` the rows you keep).
+            newest_first: sort by ``last_updated`` descending (stable: ties keep storage order).
+            limit: keep only the first ``limit`` rows (after the sort) — only those are copied out.
+        """
+        if self._core is not None:
+            return [self._synapse_from_row(r) for r in self._core.list_synapses(
+                source_id, target_id, target_prefix, since, with_metadata, newest_first, limit)]
+        sel = []
+        for s in list(self.synapses.values()):
+            if source_id is not None and s.source_id != source_id:
+                continue
+            if target_id is not None and s.target_id != target_id:
+                continue
+            if target_prefix is not None and not s.target_id.startswith(target_prefix):
+                continue
+            if since is not None and not s.last_updated > since:
+                continue
+            sel.append(s)
+        if newest_first:
+            sel.sort(key=lambda s: s.last_updated, reverse=True)
+        if limit is not None:
+            sel = sel[:max(int(limit), 0)]
+        return [self._copy_synapse(s, with_metadata) for s in sel]
+
+    def get_synapse(self, source_id: str, target_id: str) -> Optional[NGLiteSynapse]:
+        """The synapse (source_id -> target_id), with metadata, or None."""
+        if self._core is not None:
+            r = self._core.get_synapse(source_id, target_id)
+            return None if r is None else self._synapse_from_row(r)
+        s = self.synapses.get((source_id, target_id))
+        return None if s is None else self._copy_synapse(s, True)
+
+    def remove_synapses(self, keys: Iterable[Tuple[str, str]]) -> int:
+        """Remove these (source_id, target_id) synapses; returns how many existed.
+
+        The one write among the public methods: housekeeping that callers already did by deleting from
+        ``NGLite.synapses`` (the Commons' recency windows and its autonomic drop on restore).
+        """
+        ks = [(str(k[0]), str(k[1])) for k in keys]
+        if self._core is not None:
+            return self._core.remove_synapses(ks)
+        n = 0
+        for k in ks:
+            if self.synapses.pop(k, None) is not None:
+                n += 1
+        return n
+
+    def get_history(self) -> List[Dict[str, Any]]:
+        """Recent record_outcome results (in memory only, bounded; not persisted)."""
+        return list(self._history)
 
     # -------------------------------------------------------------------
     # Internal Methods
     # -------------------------------------------------------------------
 
-    def _serialize_node(self, node: NGLiteNode) -> Dict[str, Any]:
-        """Serialize a node to a JSON-compatible dict.
+    def _serialize_node(self, node: NGLiteNode, arrays: bool = False) -> Dict[str, Any]:
+        """Serialize a node to a plain dict.
 
-        Converts embedding from np.ndarray to list for JSON.
-        Omits embedding key when None (backward-compatible with
-        state files created before embedding persistence).
+        Converts embedding from np.ndarray to list (``arrays=True``: kept as the
+        ndarray, for the msgpack writer). Omits embedding key when None
+        (backward-compatible with state files created before embedding persistence).
         """
         d = asdict(node)
         if node.embedding is not None:
-            d["embedding"] = node.embedding.tolist()
+            d["embedding"] = node.embedding if arrays else node.embedding.tolist()
         else:
             d.pop("embedding", None)
         return d
@@ -1362,9 +2177,9 @@ class NGLite:
             if self._prototypes is None:
                 return embedding
 
-        # Vectorized cosine similarity against all prototypes
+        # Vectorized cosine similarity against all prototypes (mean-centred, #1107)
         threshold = self.config["receptor_prototype_threshold"]
-        similarities = self._prototypes @ embedding  # (K,)
+        similarities = self._snap_sims(embedding)  # (K,)
         best_idx = int(np.argmax(similarities))
         best_sim = float(similarities[best_idx])
 
@@ -1374,6 +2189,8 @@ class NGLite:
             self._prototypes[best_idx] = self._normalize(
                 (1.0 - alpha) * self._prototypes[best_idx] + alpha * embedding
             )
+            if self._centred_protos is not None and self._centred_protos[0] is self._prototypes:
+                self._centred_protos[1][best_idx] = self._centre_rows(self._prototypes[best_idx:best_idx + 1])[0]
             self._prototype_counts[best_idx] += 1
             return self._prototypes[best_idx].copy()
 
@@ -1401,9 +2218,10 @@ class NGLite:
         indices = rng.choice(n, size=k, replace=False)
         centroids = embeddings[indices].copy()
 
+        centred = self._centre_rows(embeddings)  # #1107: assign by centred cosine; centroids stay raw means
         for _ in range(20):
             # Assign each embedding to nearest centroid
-            sims = embeddings @ centroids.T  # (N, K)
+            sims = centred @ self._centre_rows(centroids).T  # (N, K)
             assignments = np.argmax(sims, axis=1)
 
             # Recompute centroids
@@ -1441,12 +2259,26 @@ class NGLite:
             return None
 
         # Vectorized similarity: stack all cached embeddings into a matrix
-        # and compute cosine similarities in one np.dot call.
-        cache_keys = list(self._embedding_cache.keys())
-        cache_matrix = np.stack(list(self._embedding_cache.values()))
-        similarities = cache_matrix @ embedding  # (N,) cosine similarities
+        # and compute cosine similarities in one np.dot call (mean-centred, #1107).
+        cache_keys, cache_matrix = self._centred_cache_rows()
+        similarities = cache_matrix @ self._centre_vec(embedding)  # (N,) cosine similarities
 
-        best_idx = int(np.argmax(similarities))
+        # Cricket rim (#1107): a constitutional node catches the input at >= constitutional_threshold and then wins;
+        # below it a rim node matches nothing, and the ordinary nodes compete as before.
+        rim = np.fromiter(
+            (k in self.nodes and self.nodes[k].constitutional for k in cache_keys), dtype=bool, count=len(cache_keys))
+        if rim.any():
+            rim_idx = np.flatnonzero(rim)
+            rim_sims = similarities[rim_idx]
+            r = int(np.argmax(rim_sims))
+            if float(rim_sims[r]) >= self.config["constitutional_threshold"]:
+                return self.nodes[cache_keys[int(rim_idx[r])]]
+            ord_idx = np.flatnonzero(~rim)
+            if len(ord_idx) == 0:
+                return None
+            best_idx = int(ord_idx[int(np.argmax(similarities[ord_idx]))])
+        else:
+            best_idx = int(np.argmax(similarities))
         best_similarity = float(similarities[best_idx])
 
         if best_similarity >= (1.0 - threshold):

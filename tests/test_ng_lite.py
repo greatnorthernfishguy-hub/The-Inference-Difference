@@ -2,12 +2,28 @@
 Tests for NG-Lite — Lightweight NeuroGraph Learning Substrate.
 
 Covers: node management, synapse learning, novelty detection,
-persistence, bridge interface, capacity limits, and stats.
+persistence, bridge interface, capacity limits, stats, and
+NGSaaSBridge integration.
+
+# ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane dim-guard) — #1097: test vectors are 768-d (the substrate's embedding_dim)
+#   What: every 384-d test vector / shape assertion is 768-d.
+#   Why: the tests fed 384-d vectors to a 768-d NG-Lite — the mismatch the dimension guard now refuses.
+#   How: literal 384 -> 768; test_single_dim_embedding now asserts the intended contract (works at
+#   embedding_dim=1, refused on the 768-d default) instead of the old silent acceptance.
+# [2026-10-13] Claude Code (Opus 5.5, lane nglite-rustcore) — #1096: persistence tests follow msgpack-only saves
+# What: TestPersistence reads the saved state as msgpack (the file save() returns), the JSON-validity test is now a
+#   msgpack-validity test, the legacy-node test feeds a legacy JSON state (migrated once on load), and cleanup
+#   removes the .json / .msgpack / .legacy-json trio.
+# Why: Josh 2026-10-13: saves are msgpack, never JSON; a legacy JSON state is converted once on load.
+# How: _cleanup() + msgpack.unpackb; the assertions about the state's content are unchanged.
+# -------------------
 """
 
 import json
 import os
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -20,6 +36,21 @@ from ng_lite import (
     NGLiteSynapse,
     __version__,
 )
+from ng_bridge import NGSaaSBridge
+import msgpack
+
+
+def _cleanup(filepath):
+    """Remove a test state in every form it can take (x.json, x.msgpack, x.json.legacy-json)."""
+    bin_path, legacy = NGLite.state_paths(filepath)
+    for p in (filepath, bin_path, legacy, (legacy or "") + ".legacy-json", bin_path + ".legacy-json"):
+        if p and os.path.exists(p):
+            os.unlink(p)
+
+
+def _read_saved(filepath):
+    with open(NGLite.state_paths(filepath)[0], "rb") as f:
+        return msgpack.unpackb(f.read(), raw=False)
 
 
 # ---------------------------------------------------------------------------
@@ -43,17 +74,17 @@ def small_ng():
 
 @pytest.fixture
 def embedding():
-    """A random 384-dim embedding, normalized."""
+    """A random 768-dim embedding, normalized."""
     rng = np.random.RandomState(42)
-    emb = rng.randn(384)
+    emb = rng.randn(768)
     return emb / np.linalg.norm(emb)
 
 
 @pytest.fixture
 def different_embedding():
-    """A different random 384-dim embedding."""
+    """A different random 768-dim embedding."""
     rng = np.random.RandomState(99)
-    emb = rng.randn(384)
+    emb = rng.randn(768)
     return emb / np.linalg.norm(emb)
 
 
@@ -80,7 +111,8 @@ class TestNodeManagement:
         """Slightly perturbed embedding should match existing node."""
         node1 = ng.find_or_create_node(embedding)
         # Add small noise
-        noisy = embedding + np.random.randn(384) * 0.01
+        rng = np.random.RandomState(123)
+        noisy = embedding + rng.randn(768) * 0.01
         noisy = noisy / np.linalg.norm(noisy)
         node2 = ng.find_or_create_node(noisy)
         assert node1.node_id == node2.node_id
@@ -96,7 +128,7 @@ class TestNodeManagement:
         embeddings = []
         for i in range(4):
             rng = np.random.RandomState(i * 100)
-            emb = rng.randn(384)
+            emb = rng.randn(768)
             emb = emb / np.linalg.norm(emb)
             embeddings.append(emb)
 
@@ -112,6 +144,13 @@ class TestNodeManagement:
         # Adding 4th should prune the least used
         small_ng.find_or_create_node(embeddings[3])
         assert len(small_ng.nodes) == 3  # Still at capacity
+
+    def test_node_id_incremental(self, ng, embedding, different_embedding):
+        """Node IDs follow n_1, n_2, ... pattern."""
+        node1 = ng.find_or_create_node(embedding)
+        node2 = ng.find_or_create_node(different_embedding)
+        assert node1.node_id == "n_1"
+        assert node2.node_id == "n_2"
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +242,7 @@ class TestRecommendations:
             ng.record_outcome(embedding, "model_a", success=True)
         for _ in range(10):
             ng.record_outcome(embedding, "model_b", success=False)
-        ng.record_outcome(embedding, "model_b", success=True)  # Keep it above prune threshold
+        ng.record_outcome(embedding, "model_b", success=True)  # Keep above prune
 
         recs = ng.get_recommendations(embedding, top_k=5)
         assert len(recs) >= 2
@@ -240,7 +279,8 @@ class TestNovelty:
     def test_similar_pattern_moderate_novelty(self, ng, embedding):
         ng.find_or_create_node(embedding)
         # Add moderate noise
-        noisy = embedding + np.random.randn(384) * 0.3
+        rng = np.random.RandomState(777)
+        noisy = embedding + rng.randn(768) * 0.3
         noisy = noisy / np.linalg.norm(noisy)
         novelty = ng.detect_novelty(noisy)
         assert 0.0 < novelty < 1.0
@@ -272,7 +312,7 @@ class TestPersistence:
             assert ng2._total_successes == ng._total_successes
             assert ng2.module_id == ng.module_id
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
     def test_saved_weights_preserved(self, ng, embedding):
         for _ in range(20):
@@ -291,24 +331,46 @@ class TestPersistence:
                 assert key in ng2.synapses
                 assert abs(ng.synapses[key].weight - ng2.synapses[key].weight) < 1e-10
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
 
-    def test_save_file_is_valid_json(self, ng, embedding):
+    def test_save_file_is_msgpack(self, ng, embedding):
         ng.record_outcome(embedding, "test", success=True)
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             filepath = f.name
 
         try:
-            ng.save(filepath)
-            with open(filepath) as f:
-                data = json.load(f)
+            written = ng.save(filepath)
+            assert written == filepath[: -len(".json")] + ".msgpack"
+            with open(written, "rb") as f:
+                assert f.read(1) != b"{"  # not JSON (Josh 2026-10-13: saves are msgpack, never JSON)
+            data = _read_saved(filepath)
             assert "version" in data
             assert "nodes" in data
             assert "synapses" in data
             assert data["module_id"] == "test_module"
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
+
+    def test_synapse_key_serialization(self, ng, embedding):
+        """Synapse tuple keys serialize as pipe-delimited strings."""
+        ng.record_outcome(embedding, "target_a", success=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            data = _read_saved(filepath)
+
+            # Synapse keys should be "source|target" format
+            for key in data["synapses"]:
+                assert "|" in key
+                parts = key.split("|", 1)
+                assert len(parts) == 2
+                assert parts[0].startswith("n_")
+        finally:
+            _cleanup(filepath)
 
     def test_load_forward_compatible(self, ng):
         """Loading a state with missing new config keys should use defaults."""
@@ -330,9 +392,163 @@ class TestPersistence:
         try:
             ng.load(filepath)
             assert ng.config["max_nodes"] == 500  # Overridden
-            assert ng.config["max_synapses"] == DEFAULT_CONFIG["max_synapses"]  # Default
+            assert ng.config["max_synapses"] == DEFAULT_CONFIG["max_synapses"]
         finally:
-            os.unlink(filepath)
+            _cleanup(filepath)
+
+    def test_counters_preserved(self, ng, embedding):
+        """Node ID counter survives save/load."""
+        ng.record_outcome(embedding, "a", success=True)
+        assert ng._node_id_counter == 1
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+            assert ng2._node_id_counter == 1
+        finally:
+            _cleanup(filepath)
+
+    def test_embedding_persists_across_load(self, ng, embedding):
+        """Embeddings survive save/load and rebuild the cache."""
+        ng.record_outcome(embedding, "model_a", success=True)
+        assert len(ng._embedding_cache) == 1
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+
+            # Cache should be rebuilt from persisted embeddings
+            assert len(ng2._embedding_cache) == 1
+
+            # Node should have its embedding
+            node = list(ng2.nodes.values())[0]
+            assert node.embedding is not None
+            assert node.embedding.shape == (768,)
+        finally:
+            _cleanup(filepath)
+
+    def test_similarity_works_after_load(self, ng, embedding):
+        """After save/load, similar embeddings snap to existing nodes."""
+        ng.record_outcome(embedding, "model_a", success=True)
+        assert len(ng.nodes) == 1
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+
+            # Slightly noisy version of same embedding
+            rng = np.random.RandomState(123)
+            noisy = embedding + rng.randn(768) * 0.01
+            noisy = noisy / np.linalg.norm(noisy)
+
+            # Should snap to existing node, not create new
+            node = ng2.find_or_create_node(noisy)
+            assert len(ng2.nodes) == 1
+            assert node.activation_count == 2  # original + this one
+        finally:
+            _cleanup(filepath)
+
+    def test_no_sprawl_after_load(self, ng, embedding):
+        """Recording same outcomes after load doesn't create duplicate nodes."""
+        ng.record_outcome(embedding, "model_a", success=True)
+        ng.record_outcome(embedding, "model_b", success=True)
+        node_count_before = len(ng.nodes)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+            ng2 = NGLite()
+            ng2.load(filepath)
+
+            # Re-record same outcomes
+            ng2.record_outcome(embedding, "model_a", success=True)
+            ng2.record_outcome(embedding, "model_b", success=True)
+
+            assert len(ng2.nodes) == node_count_before
+        finally:
+            _cleanup(filepath)
+
+    def test_legacy_state_loads_without_embeddings(self, ng):
+        """State files from before embedding persistence load cleanly."""
+        # Simulate old-format state with no embedding field on nodes
+        state = {
+            "version": "1.0.0",
+            "module_id": "legacy_module",
+            "config": DEFAULT_CONFIG,
+            "nodes": {
+                "abc123": {
+                    "node_id": "n_1",
+                    "embedding_hash": "abc123",
+                    "activation_count": 5,
+                    "last_activation": 1000.0,
+                    "metadata": {},
+                }
+            },
+            "synapses": {},
+            "counters": {"node_id_counter": 1},
+        }
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", delete=False, mode="w"
+        ) as f:
+            json.dump(state, f)
+            filepath = f.name
+
+        try:
+            ng.load(filepath)
+            assert len(ng.nodes) == 1
+            node = ng.nodes["abc123"]
+            assert node.embedding is None
+            # Cache should be empty — no embeddings to rebuild from
+            assert len(ng._embedding_cache) == 0
+        finally:
+            _cleanup(filepath)
+
+    def test_similarity_backfill_on_legacy_node(self, ng, embedding):
+        """Legacy nodes (no embedding) get backfilled on similarity match."""
+        # Create a node and save
+        ng.record_outcome(embedding, "model_a", success=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            filepath = f.name
+
+        try:
+            ng.save(filepath)
+
+            # Manually strip embeddings to simulate a legacy JSON state (migrated once on load)
+            state = _read_saved(filepath)
+            for node_data in state["nodes"].values():
+                node_data.pop("embedding", None)
+            os.unlink(NGLite.state_paths(filepath)[0])
+            with open(filepath, "w") as f:
+                json.dump(state, f)
+
+            # Load legacy state
+            ng2 = NGLite()
+            ng2.load(filepath)
+            node = list(ng2.nodes.values())[0]
+            assert node.embedding is None
+
+            # Feed exact same embedding — hash match backfills
+            node_found = ng2.find_or_create_node(embedding)
+            assert node_found.node_id == node.node_id
+            assert node_found.embedding is not None
+        finally:
+            _cleanup(filepath)
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +695,215 @@ class TestStats:
 
 
 # ---------------------------------------------------------------------------
+# NGSaaSBridge Tests
+# ---------------------------------------------------------------------------
+
+class TestNGSaaSBridge:
+
+    def _make_mock_memory(self):
+        """Create a mock NeuroGraphMemory for testing."""
+        memory = MagicMock()
+        memory.on_message.return_value = {
+            "status": "ingested",
+            "nodes_created": 2,
+            "synapses_created": 1,
+        }
+        memory.recall.return_value = [
+            {
+                "content": "[test_mod] outcome: target=model_a success=True",
+                "similarity": 0.85,
+                "node_id": "uuid-123",
+            }
+        ]
+        memory.stats.return_value = {
+            "nodes": 100,
+            "synapses": 200,
+            "firing_rate": 0.05,
+            "prediction_accuracy": 0.75,
+        }
+        memory.save.return_value = "/tmp/checkpoint.msgpack"
+        return memory
+
+    def test_is_connected(self):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        assert bridge.is_connected() is True
+
+    def test_disconnect_reconnect(self):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        bridge.disconnect()
+        assert bridge.is_connected() is False
+        bridge.reconnect()
+        assert bridge.is_connected() is True
+
+    def test_record_outcome_forwards(self, embedding):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        result = bridge.record_outcome(
+            embedding, "model_a", True, "test_mod"
+        )
+        assert result is not None
+        assert result["cross_module"] is True
+        assert result["graph_nodes"] == 100
+        memory.on_message.assert_called_once()
+
+    def test_record_outcome_disconnected(self, embedding):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        bridge.disconnect()
+        result = bridge.record_outcome(
+            embedding, "model_a", True, "test_mod"
+        )
+        assert result is None
+        memory.on_message.assert_not_called()
+
+    def test_get_recommendations(self, embedding):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        recs = bridge.get_recommendations(embedding, "test_mod", top_k=3)
+        assert recs is not None
+        assert len(recs) == 1
+        assert recs[0][0] == "model_a"
+        assert recs[0][1] == 0.85
+
+    def test_get_recommendations_no_results(self, embedding):
+        memory = self._make_mock_memory()
+        memory.recall.return_value = []
+        bridge = NGSaaSBridge(memory)
+        recs = bridge.get_recommendations(embedding, "test_mod")
+        assert recs is None
+
+    def test_detect_novelty(self, embedding):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        novelty = bridge.detect_novelty(embedding, "test_mod")
+        assert novelty is not None
+        assert novelty == pytest.approx(0.15, abs=0.01)  # 1 - 0.85
+
+    def test_detect_novelty_empty_graph(self, embedding):
+        memory = self._make_mock_memory()
+        memory.recall.return_value = []
+        bridge = NGSaaSBridge(memory)
+        novelty = bridge.detect_novelty(embedding, "test_mod")
+        assert novelty == 1.0
+
+    def test_sync_state(self, ng, embedding):
+        ng.record_outcome(embedding, "model_a", success=True)
+        for _ in range(10):
+            ng.record_outcome(embedding, "model_a", success=True)
+
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        local_state = ng._export_state()
+        result = bridge.sync_state(local_state, "test_mod")
+
+        assert result is not None
+        assert result["synced"] is True
+        assert result["sync_number"] == 1
+        assert result["patterns_ingested"] >= 1
+        memory.save.assert_called_once()
+
+    def test_sync_disconnected(self, ng, embedding):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory)
+        bridge.disconnect()
+        result = bridge.sync_state({}, "test_mod")
+        assert result is None
+
+    def test_weight_normalization(self):
+        memory = self._make_mock_memory()
+        bridge = NGSaaSBridge(memory, max_weight=5.0)
+        assert bridge._normalize_weight_to_full(0.5) == 2.5
+        assert bridge._normalize_weight_to_full(1.0) == 5.0
+        assert bridge._normalize_weight_to_full(0.0) == 0.0
+        assert bridge._normalize_weight_to_lite(2.5) == 0.5
+        assert bridge._normalize_weight_to_lite(5.0) == 1.0
+        assert bridge._normalize_weight_to_lite(0.0) == 0.0
+
+    def test_extract_target(self):
+        assert NGSaaSBridge._extract_target_from_content(
+            "[mod] outcome: target=model_a success=True"
+        ) == "model_a"
+        assert NGSaaSBridge._extract_target_from_content(
+            "no target here"
+        ) is None
+        assert NGSaaSBridge._extract_target_from_content(
+            "target=last_one"
+        ) == "last_one"
+
+
+# ---------------------------------------------------------------------------
+# Integration: NG-Lite with NGSaaSBridge
+# ---------------------------------------------------------------------------
+
+class TestIntegration:
+
+    def test_full_pipeline_with_bridge(self, embedding):
+        """NG-Lite + NGSaaSBridge end-to-end flow."""
+        memory = MagicMock()
+        memory.on_message.return_value = {
+            "status": "ingested", "nodes_created": 1,
+            "synapses_created": 0,
+        }
+        memory.recall.return_value = [
+            {
+                "content": "[test] outcome: target=api_model success=True",
+                "similarity": 0.9,
+                "node_id": "uuid-456",
+            }
+        ]
+        memory.stats.return_value = {
+            "nodes": 50, "synapses": 100,
+            "firing_rate": 0.03, "prediction_accuracy": 0.8,
+        }
+        memory.save.return_value = "/tmp/test.msgpack"
+
+        bridge = NGSaaSBridge(memory)
+        ng = NGLite(module_id="integration_test", bridge=bridge)
+
+        # Record outcome — should forward to bridge
+        result = ng.record_outcome(embedding, "local_model", success=True)
+        assert "bridge_response" in result
+        assert result["bridge_response"]["cross_module"] is True
+
+        # Get recommendations — should use bridge
+        recs = ng.get_recommendations(embedding, top_k=5)
+        assert recs[0][0] == "api_model"
+
+        # Detect novelty — should use bridge
+        novelty = ng.detect_novelty(embedding)
+        assert novelty == pytest.approx(0.1, abs=0.01)
+
+        # Sync
+        sync_result = ng.sync_with_bridge()
+        assert sync_result is not None
+        assert sync_result["synced"] is True
+
+    def test_bridge_disconnect_fallback(self, embedding):
+        """Disconnecting bridge falls back to local learning."""
+        memory = MagicMock()
+        memory.on_message.return_value = {"status": "ingested", "nodes_created": 1}
+        memory.stats.return_value = {"nodes": 10, "synapses": 5}
+
+        bridge = NGSaaSBridge(memory)
+        ng = NGLite(module_id="fallback_test", bridge=bridge)
+
+        # Learn locally first
+        ng.record_outcome(embedding, "local_model", success=True)
+
+        # Disconnect bridge
+        bridge.disconnect()
+
+        # Recommendations should fall back to local
+        recs = ng.get_recommendations(embedding, top_k=3)
+        assert recs[0][0] == "local_model"
+
+        # Sync should return None
+        assert ng.sync_with_bridge() is None
+
+
+# ---------------------------------------------------------------------------
 # Edge Cases
 # ---------------------------------------------------------------------------
 
@@ -486,22 +911,24 @@ class TestEdgeCases:
 
     def test_zero_vector(self, ng):
         """Zero vector should be handled gracefully."""
-        zero = np.zeros(384)
+        zero = np.zeros(768)
         node = ng.find_or_create_node(zero)
         assert node is not None
 
     def test_single_dim_embedding(self, ng):
-        """Very short embedding should work (uses what's available)."""
+        """A very short embedding works on a substrate of that dimension, and is refused loudly on a 768-d one (#1097)."""
+        from ng_lite import EmbeddingDimensionError
         short = np.array([1.0])
-        node = ng.find_or_create_node(short)
-        assert node is not None
+        tiny = NGLite(module_id="tiny", config={"embedding_dim": 1, "receptor_layer_enabled": False})
+        assert tiny.find_or_create_node(short) is not None
+        with pytest.raises(EmbeddingDimensionError):
+            ng.find_or_create_node(short)
 
     def test_concurrent_targets_same_node(self, ng, embedding):
         """Same pattern mapping to many different targets."""
         for i in range(20):
             success = i % 3 != 0
             ng.record_outcome(embedding, f"target_{i}", success=success)
-        # Should have 1 node and 20 synapses
         assert len(ng.nodes) == 1
         assert len(ng.synapses) == 20
 
@@ -510,3 +937,6 @@ class TestEdgeCases:
         assert ng.module_id == ""
         stats = ng.get_stats()
         assert stats["module_id"] == ""
+
+    def test_version_string(self):
+        assert __version__ == "1.0.0"
