@@ -33,6 +33,20 @@ Date: February 2026
 License: AGPL-3.0
 
 Changelog:
+    [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing §3.B,
+        approved by Josh 2026-10-15) — served provider + typed error facts per call (#1040 / #1126)
+        What: ModelResponse / StreamResult carry the provider that actually served an OpenRouter call (`provider`,
+            from the response body / stream chunks, else GET /api/v1/generation?id=… when the response lacks it),
+            plus http_status, OpenRouter's typed error_type, the error's provider_name, previous_errors providers,
+            Retry-After, the generation id, and (streaming) the final usage block. A 200 whose body is an OpenRouter
+            error envelope with no content is now success=False (it was a silent empty "success").
+        Why: TID learned and penalised per MODEL; failures are provider-specific. Routing at (model, provider) needs
+            to know who served each call and who failed it, on both the blocking and the streaming path.
+        How: _or_error_facts() parses the full error body (not the 200-char log excerpt); _retry_after() reads the
+            header; _lookup_generation_provider() is the documented generation-metadata fallback (config
+            provider_generation_lookup / _timeout_s, env TID_PROVIDER_GENERATION_LOOKUP / _TIMEOUT_S; default on, 3s).
+            A 429 that names its provider no longer starts the whole-model cooldown (the router's pair box owns
+            it); the duplicated 429 block is removed. Raw facts only — attribution is the router's job.
     [2026-07-11] CC (Opus 4.8) — #384: penalty-box triage for repeating 401s
         What: 401 now boxes the model (_policy_blocked + _AUTH_BLOCKED_TTL_S=600s TTL,
             both blocking and streaming paths) and a new _is_policy_blocked() helper makes
@@ -173,6 +187,66 @@ def _provider_from_base_url(base_url: str) -> str:
     if "11434" in b or "localhost" in b or "127.0.0.1" in b:
         return "ollama"
     return "unknown"
+
+
+def _or_error_facts(body: Any) -> Dict[str, Any]:
+    """Raw facts from an OpenRouter error envelope: typed error_type, provider_name, previous_errors providers.
+
+    Shape per OpenRouter's errors-and-debugging docs: {"error": {"code", "message", "metadata": {"error_type",
+    "provider_name", "provider_code", "raw", "previous_errors": [{"code", "provider_name", ...}]}}}.
+    Tolerates a JSON string, a dict, or junk (returns {}).
+    """
+    try:
+        d = json.loads(body) if isinstance(body, (str, bytes)) else body
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    err = d.get("error")
+    if not isinstance(err, dict):
+        return {}
+    md = err.get("metadata") if isinstance(err.get("metadata"), dict) else {}
+    prev = []
+    for pe in md.get("previous_errors") or []:
+        if isinstance(pe, dict) and pe.get("provider_name"):
+            prev.append({"provider": str(pe.get("provider_name")), "code": pe.get("code")})
+    return {
+        "error_type": str(md.get("error_type") or err.get("error_type") or ""),
+        "error_provider": str(md.get("provider_name") or d.get("provider") or ""),
+        "error_previous_providers": prev,
+        "error_code": err.get("code"),
+    }
+
+
+def _retry_after(headers: Any) -> Optional[float]:
+    """Seconds from a Retry-After header (delta-seconds form), else None."""
+    try:
+        v = headers.get("Retry-After") if headers is not None else None
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _lookup_generation_provider(generation_id: str, api_key: str, timeout: float) -> str:
+    """Fallback for a response that did not name its provider: GET /api/v1/generation?id=… -> data.provider_name.
+
+    Best-effort and short (the record can lag the response); "" on any failure. On/off and timeout come from
+    InferenceDifferenceConfig (provider_generation_lookup*, env TID_PROVIDER_GENERATION_LOOKUP*) via ModelClient.
+    """
+    if not generation_id or not str(generation_id).startswith("gen-") or not api_key:
+        return ""
+    try:
+        import urllib.parse as _up
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/generation?id=" + _up.quote(str(generation_id)),
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8")).get("data") or {}
+        return str(data.get("provider_name") or "")
+    except Exception as exc:  # noqa: BLE001 — never break the call path
+        logger.debug("generation provider lookup failed (non-fatal): %s", exc)
+        return ""
 
 
 _credit_alert_lock = threading.Lock()
@@ -333,6 +407,15 @@ class StreamResult:
     latency_ms: float = 0.0
     success: bool = True
     error: str = ""
+    # [2026-10-15] provider-level routing (§3.B): raw per-call facts
+    provider: str = ""                 # who served it (OpenRouter display name), "" if unknown
+    generation_id: str = ""
+    usage: Dict[str, Any] = field(default_factory=dict)
+    http_status: Optional[int] = None
+    error_type: str = ""
+    error_provider: str = ""
+    error_previous_providers: List[Dict[str, Any]] = field(default_factory=list)
+    retry_after_s: Optional[float] = None
 
 
 @dataclass
@@ -364,6 +447,13 @@ class ModelResponse:
     raw: Dict[str, Any] = field(default_factory=dict)
     success: bool = True
     error: str = ""
+    # [2026-10-15] provider-level routing (§3.B): raw per-call facts
+    provider: str = ""                 # who served it (OpenRouter display name), "" if unknown
+    http_status: Optional[int] = None
+    error_type: str = ""
+    error_provider: str = ""
+    error_previous_providers: List[Dict[str, Any]] = field(default_factory=list)
+    retry_after_s: Optional[float] = None
 
     def to_openai_dict(self) -> Dict[str, Any]:
         """Format as OpenAI-compatible chat completion response."""
@@ -410,8 +500,12 @@ class ModelClient:
         # response.to_openai_dict() gives OpenAI-format JSON
     """
 
-    def __init__(self, timeout: int = _DEFAULT_TIMEOUT):
+    def __init__(self, timeout: int = _DEFAULT_TIMEOUT, generation_lookup: bool = True,
+                 generation_lookup_timeout_s: float = 3.0):
         self._timeout = timeout
+        # [2026-10-15] §3.B generation-metadata fallback (config-driven; see InferenceDifferenceConfig)
+        self._generation_lookup = bool(generation_lookup)
+        self._generation_lookup_timeout_s = float(generation_lookup_timeout_s)
         self._policy_blocked: set = set()
         self._policy_blocked_expiry: Dict[str, float] = {}
         self._load_policy_blocked_cache()
@@ -702,6 +796,14 @@ class ModelClient:
                 tool_calls = msg.get("tool_calls") or None
                 finish_reason = choices[0].get("finish_reason", "stop")
 
+            # [2026-10-15] §3.B — who served it; an in-body error envelope with nothing usable is a failure.
+            _served = str(resp_body.get("provider") or "")
+            _ef = _or_error_facts(resp_body) if isinstance(resp_body.get("error"), dict) else {}
+            _ok = not (_ef and not content and not tool_calls)
+            if _ok and not _served and "openrouter" in base_url and self._generation_lookup:
+                _served = _lookup_generation_provider(resp_body.get("id", ""), api_key,
+                                                      self._generation_lookup_timeout_s)
+
             return ModelResponse(
                 id=resp_body.get("id", ""),
                 model=resp_body.get("model", model_name),
@@ -715,7 +817,13 @@ class ModelClient:
                 }),
                 latency_ms=latency,
                 raw=resp_body,
-                success=True,
+                success=_ok,
+                error=("" if _ok else "in-body error: " + json.dumps(resp_body.get("error"))[:200]),
+                provider=_served,
+                http_status=(_ef.get("error_code") if _ef else _resp_status),
+                error_type=_ef.get("error_type", "") if _ef else "",
+                error_provider=_ef.get("error_provider", "") if _ef else "",
+                error_previous_providers=_ef.get("error_previous_providers", []) if _ef else [],
             )
 
         except urllib.error.HTTPError as e:
@@ -727,16 +835,13 @@ class ModelClient:
                 pass
             # Cache permanent failures so we don't retry them
             error_lower = error_body.lower()
-            if e.code == 429:
-                hits = self._rate_limit_hits.get(model_name, 0) + 1
-                self._rate_limit_hits[model_name] = hits
-                backoff_s = min(60 * (2 ** (hits - 1)), 1800)
-                self._rate_limited[model_name] = time.time() + backoff_s
-                logger.info(
-                    "Model %s 429 hit #%d -- cooldown %.0fs",
-                    model_name, hits, backoff_s,
-                )
-            if e.code == 429:
+            # [2026-10-15] §3.D: a 429 that OpenRouter attributes to a NAMED provider is that provider's fault —
+            # the router's (model, provider) pair box owns it, so the whole-model cooldown below is skipped (it
+            # benched every provider of the model). The duplicated 429 block (pasted twice in c119c31,
+            # 2026-04-19: two hits per 429, first cooldown 120s not 60s) is removed.
+            _429_named = (e.code == 429 and "openrouter" in base_url
+                          and bool(_or_error_facts(error_body).get("error_provider")))
+            if e.code == 429 and not _429_named:
                 hits = self._rate_limit_hits.get(model_name, 0) + 1
                 self._rate_limit_hits[model_name] = hits
                 backoff_s = min(60 * (2 ** (hits - 1)), 1800)
@@ -797,11 +902,17 @@ class ModelClient:
                 )
             except Exception:
                 pass
+            _ef = _or_error_facts(error_body)
             return ModelResponse(
                 model=model_name,
                 latency_ms=latency,
                 success=False,
                 error=f"HTTP {e.code}: {error_body[:200]}",
+                http_status=e.code,
+                error_type=_ef.get("error_type", ""),
+                error_provider=_ef.get("error_provider", ""),
+                error_previous_providers=_ef.get("error_previous_providers", []),
+                retry_after_s=_retry_after(getattr(e, "headers", None)),
             )
 
         except Exception as e:
@@ -1147,6 +1258,11 @@ class ModelClient:
                         )
                         result.content = "".join(collected_content)
                         result.success = True
+                        if result.http_status is None:
+                            result.http_status = 200
+                        if not result.provider and "openrouter" in base_url and self._generation_lookup:
+                            result.provider = _lookup_generation_provider(
+                                result.generation_id, api_key, self._generation_lookup_timeout_s)
                         chunk_ms = int((time.monotonic() - stream_start_mono) * 1000)
                         raw_stream_lines.append(f": chunk_ms={chunk_ms}")
                         raw_stream_lines.append("data: [DONE]")
@@ -1172,6 +1288,21 @@ class ModelClient:
                         # Extract content delta for aggregation
                         try:
                             chunk_data = json.loads(line[6:])
+                            # [2026-10-15] §3.B — served provider, generation id, usage, mid-stream error facts
+                            if isinstance(chunk_data, dict):
+                                if chunk_data.get("provider") and not result.provider:
+                                    result.provider = str(chunk_data["provider"])
+                                if chunk_data.get("id") and not result.generation_id:
+                                    result.generation_id = str(chunk_data["id"])
+                                if isinstance(chunk_data.get("usage"), dict):
+                                    result.usage = dict(chunk_data["usage"])
+                                if isinstance(chunk_data.get("error"), dict):
+                                    _mef = _or_error_facts(chunk_data)
+                                    result.error_type = _mef.get("error_type", "")
+                                    result.error_provider = _mef.get("error_provider", "")
+                                    result.error_previous_providers = _mef.get("error_previous_providers", [])
+                                    if isinstance(_mef.get("error_code"), int):
+                                        result.http_status = _mef["error_code"]
                             choices = chunk_data.get("choices", [])
                             if choices:
                                 delta = choices[0].get("delta", {})
@@ -1215,6 +1346,13 @@ class ModelClient:
             except Exception:
                 pass
             result.error = f"HTTP {e.code}: {error_body[:200]}"
+            # [2026-10-15] §3.B — typed error facts from the full body
+            _sef = _or_error_facts(error_body)
+            result.http_status = e.code
+            result.error_type = _sef.get("error_type", "")
+            result.error_provider = _sef.get("error_provider", "")
+            result.error_previous_providers = _sef.get("error_previous_providers", [])
+            result.retry_after_s = _retry_after(getattr(e, "headers", None))
             logger.warning(
                 "Stream call failed: %s %d — %s",
                 model_name, e.code, error_body[:200],
@@ -1329,6 +1467,14 @@ class ModelClient:
             latency_ms=response.latency_ms,
             success=response.success,
             error=response.error,
+            provider=response.provider,
+            generation_id=response.id,
+            usage=dict(response.usage or {}),
+            http_status=response.http_status,
+            error_type=response.error_type,
+            error_provider=response.error_provider,
+            error_previous_providers=list(response.error_previous_providers or []),
+            retry_after_s=response.retry_after_s,
         )
 
         def _generate() -> Iterator[str]:
