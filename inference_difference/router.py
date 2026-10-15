@@ -47,6 +47,10 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, Executive review; Josh "this sounds good as proposed") — network-down not deposited
+#   What: report_outcome() skips the NG-Lite and peninsula deposits when the failure is a transport fault.
+#   Why:  the call never reached a model or a provider; it is not experience of either (it already charged nobody).
+#   How:  `fault != "transport"` on both deposit guards; every other outcome is still deposited raw (LAW 7).
 # [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing,
 #   approved by Josh 2026-10-15) — learn and route at the (model, provider) level (#1040, folds in #1126)
 #   What: (D) report_outcome() attributes each failure: provider faults (429 / overloaded / provider 5xx / timeout)
@@ -740,8 +744,9 @@ class RoutingEngine:
             )
         self._stats_dirty = True
 
-        # Teach NG-Lite
-        if self._ng_lite is not None and decision.classification is not None:
+        # Teach NG-Lite. A local-network failure (fault == "transport") never reached a model or a provider, so it is
+        # not experience of either and is not deposited (Josh 2026-10-15); every other outcome goes in raw (LAW 7).
+        if self._ng_lite is not None and decision.classification is not None and fault != "transport":
             embedding = self._classification_to_embedding(
                 decision.classification
             )
@@ -762,7 +767,7 @@ class RoutingEngine:
             )
 
         # Peninsula deposit — send raw outcome to Commons-side for SNN enrichment.
-        if self._peninsula is not None and decision.classification is not None:
+        if self._peninsula is not None and decision.classification is not None and fault != "transport":
             try:
                 dep_emb = self._classification_to_embedding(decision.classification)
                 her_fit = float(getattr(decision.model_entry, 'conversational_quality', 0.5)

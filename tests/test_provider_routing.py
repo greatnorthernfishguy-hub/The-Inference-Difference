@@ -316,10 +316,20 @@ def test_deposit_target_includes_provider_when_known_raw(tmp_path):
     eng.report_outcome(dec, success=True, latency_ms=900,
                        metadata={"served_provider": "DeepInfra", "completion_tokens": 9, "finish_reason": "stop"})
     eng.report_outcome(dec, success=False, metadata={"error": "<urlopen error Name or service not known>"})
-    (t1, s1, md1), (t2, _s2, _md2) = eng._ng_lite.deposits
+    eng.report_outcome(dec, success=False, metadata={"error": "HTTP 400: bad", "http_status": 400})
+    (t1, s1, md1), (t2, s2, _md2) = eng._ng_lite.deposits   # the network-down outcome is NOT among them
     assert t1 == f"{M1}@deepinfra" and s1 is True
     assert md1["served_provider"] == "DeepInfra" and md1["completion_tokens"] == 9  # raw values, unclassified
-    assert t2 == M1  # provider unknown -> model-only target
+    assert t2 == M1 and s2 is False  # provider unknown -> model-only target
+
+
+def test_network_down_is_not_deposited(tmp_path):
+    """Josh 2026-10-15: a local-network failure never reached a model or provider, so it is not experience of either."""
+    eng = _engine(tmp_path, facts=TWO_PROVIDERS)
+    eng._ng_lite = _FakeNG()
+    eng.report_outcome(RoutingDecision(model_id=M1, classification=_cls()), success=False,
+                       metadata={"error": "<urlopen error [Errno -2] Name or service not known>"})
+    assert eng._ng_lite.deposits == []
 
 
 # ---------------------------------------------------------------- D. pair penalty box
