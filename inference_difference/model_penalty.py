@@ -1,4 +1,16 @@
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing §3.D,
+#   approved by Josh 2026-10-15) — (model, provider) pair box + legacy tag on migrated model entries
+# What: ProviderPenaltyBox — a SHORT, capped backoff keyed by (model_id, provider_slug) for provider faults (429 /
+#   provider-overloaded / 5xx from a named provider). It never escalates past its own last rung; the long model
+#   ladder above is untouched and only moves for model faults (or all-providers-failing, decided by the router).
+#   ModelPenaltyBox entries may now carry legacy=True (set by the one-time migration of the pre-pair sidecar) so an
+#   operator can clear exactly the migrated entries (clear_legacy()); serialization keeps the old shape + the flag.
+# Why: #1126 — every candidate sat in the per-model box (307/334 at L7 on the laptop, 2026-10-15) because upstream,
+#   provider-specific failures climbed the MODEL ladder to the 2-month rung and blacklist.
+# How: same veto-only contract (state + boolean queries, no score). Time injected for deterministic tests.
+#   Pair state persists via to_dict/from_dict ("model\tprovider" keys), TTL-exempt like the model box.
+# -------------------
 # [2026-06-12] Claude Code (Opus 4.8, Anima/Codemine CC) — TID routing substrate-authority fix, Layer B
 # What: ModelPenaltyBox — a per-model escalating-backoff circuit breaker (penalty box) for TID routing.
 #   A model that returns model-attributable failures is EXCLUDED from candidate selection for an
@@ -116,6 +128,27 @@ class ModelPenaltyBox:
         self._state.clear()
         return n
 
+    def mark_legacy(self, model_id: str) -> None:
+        """Tag an entry as migrated from the pre-pair sidecar (design §3.D migration). No-op if absent."""
+        e = self._state.get(model_id)
+        if e is not None:
+            e["legacy"] = 1.0
+
+    def is_legacy(self, model_id: str) -> bool:
+        e = self._state.get(model_id)
+        return bool(e and e.get("legacy"))
+
+    def clear_legacy(self) -> int:
+        """Clear only migrated (legacy) entries — an explicit operator action, never automatic."""
+        legacy = [m for m, e in self._state.items() if e.get("legacy")]
+        for m in legacy:
+            self._state.pop(m, None)
+        return len(legacy)
+
+    def entries(self) -> Dict[str, Dict[str, float]]:
+        """Read-only snapshot (for stats / the router's all-boxed fallthrough ordering)."""
+        return {m: dict(e) for m, e in self._state.items()}
+
     # ----- queries (called from RouterEngine._filter_candidates) ----------
 
     def level(self, model_id: str) -> int:
@@ -138,10 +171,13 @@ class ModelPenaltyBox:
 
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
         """Serialize for the sidecar. Must be loaded back UNCONDITIONALLY (never age-discarded)."""
-        return {
-            mid: {"level": int(e["level"]), "until": float(e["until"])}
-            for mid, e in self._state.items()
-        }
+        out: Dict[str, Dict[str, Any]] = {}
+        for mid, e in self._state.items():
+            d: Dict[str, Any] = {"level": int(e["level"]), "until": float(e["until"])}
+            if e.get("legacy"):
+                d["legacy"] = True  # extra key; pre-pair readers ignore it (rollback-safe)
+            out[mid] = d
+        return out
 
     def from_dict(self, data: Optional[Dict[str, Dict[str, Any]]]) -> None:
         """Restore from the sidecar. Tolerant of absent/malformed input (backward-compatible)."""
@@ -154,5 +190,98 @@ class ModelPenaltyBox:
                     "level": float(int(e["level"])),
                     "until": float(e.get("until", 0.0)),
                 }
-            except (KeyError, TypeError, ValueError):
+                if e.get("legacy"):
+                    self._state[str(mid)]["legacy"] = 1.0
+            except (AttributeError, KeyError, TypeError, ValueError):
                 continue  # skip malformed entries rather than fail the whole load
+
+
+class ProviderPenaltyBox:
+    """Short, capped backoff keyed by ``(model_id, provider_slug)`` — provider faults only.
+
+    VETO-ONLY like ``ModelPenaltyBox``: eligibility + state, never a score. A pair climbs one rung per provider
+    fault (duration ``ladder_seconds[level - 1]``, or the provider's Retry-After when longer, capped at the last
+    rung) and stays at the last rung however many faults arrive — it has no blacklist and never feeds the long
+    model ladder by itself. One success clears the pair (provider faults are transient by nature).
+
+    ``provider == "*"`` is the unattributed slot: a provider fault whose provider could not be identified boxes
+    the whole model for the same short duration (the model-level ladder still does not move).
+    """
+
+    WILDCARD = "*"
+
+    def __init__(self, ladder_seconds=(30, 60, 120, 300, 600),
+                 time_fn: Optional[Callable[[], float]] = None) -> None:
+        self._ladder = [float(x) for x in ladder_seconds] or [30.0]
+        self._time = time_fn or _time.time
+        # (model_id, provider) -> {"level": int, "until": float}
+        self._state: Dict[tuple, Dict[str, float]] = {}
+
+    def _now(self) -> float:
+        return float(self._time())
+
+    def record_failure(self, model_id: str, provider: str, retry_after_s: Optional[float] = None) -> None:
+        key = (model_id, provider or self.WILDCARD)
+        cur = int(self._state.get(key, {}).get("level", 0))
+        new = min(cur + 1, len(self._ladder))
+        dur = self._ladder[new - 1]
+        if retry_after_s:
+            try:
+                dur = max(dur, min(float(retry_after_s), self._ladder[-1]))
+            except (TypeError, ValueError):
+                pass
+        self._state[key] = {"level": float(new), "until": self._now() + dur}
+
+    def record_success(self, model_id: str, provider: str) -> None:
+        self._state.pop((model_id, provider or self.WILDCARD), None)
+        # A success through any provider also proves the model reachable: drop the unattributed box.
+        self._state.pop((model_id, self.WILDCARD), None)
+
+    def is_penalized(self, model_id: str, provider: str) -> bool:
+        e = self._state.get((model_id, provider or self.WILDCARD))
+        return bool(e) and float(e["until"]) > self._now()
+
+    def wildcard_penalized(self, model_id: str) -> bool:
+        return self.is_penalized(model_id, self.WILDCARD)
+
+    def reopen_at(self, model_id: str, provider: str) -> float:
+        e = self._state.get((model_id, provider or self.WILDCARD))
+        return float(e["until"]) if e else 0.0
+
+    def boxed_providers(self, model_id: str) -> list:
+        now = self._now()
+        return sorted(p for (m, p), e in self._state.items()
+                      if m == model_id and p != self.WILDCARD and float(e["until"]) > now)
+
+    def level(self, model_id: str, provider: str) -> int:
+        e = self._state.get((model_id, provider or self.WILDCARD))
+        return int(e["level"]) if e else 0
+
+    def clear(self, model_id: Optional[str] = None) -> int:
+        if model_id is None:
+            n = len(self._state)
+            self._state.clear()
+            return n
+        keys = [k for k in self._state if k[0] == model_id]
+        for k in keys:
+            self._state.pop(k, None)
+        return len(keys)
+
+    def active_count(self) -> int:
+        now = self._now()
+        return sum(1 for e in self._state.values() if float(e["until"]) > now)
+
+    def to_dict(self) -> Dict[str, Dict[str, Any]]:
+        return {f"{m}\t{p}": {"level": int(e["level"]), "until": float(e["until"])}
+                for (m, p), e in self._state.items()}
+
+    def from_dict(self, data: Optional[Dict[str, Dict[str, Any]]]) -> None:
+        self._state = {}
+        if not isinstance(data, dict):
+            return
+        for k, e in data.items():
+            try:
+                m, p = str(k).split("\t", 1)
+                self._state[(m, p)] = {"level": float(int(e["level"])), "until": float(e.get("until", 0.0))}
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue

@@ -26,6 +26,15 @@ Changelog (Grok audit response, 2026-02-19):
   Enum(value) IS from_str(). No custom method needed.
 """
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing,
+#   approved by Josh 2026-10-15) — provider-level routing knobs (#1040 / #1126)
+#   What: provider_* config fields: facts refresher clock + rate limit + path, the short (model, provider) penalty
+#         ladder, the all-providers-failing escalation threshold, hard-filter thresholds (headroom margin, deep-tier
+#         quantization floor, deep-tier minimum output cap), the chat-tier latency floor, task-class domain maps,
+#         scoring blend, request-shaping kill switch, generation-metadata lookup.
+#   Why:  Design §2.3 / §3.E: thresholds live in env / config (LAW 5), not literals.
+#   How:  Each field's default is read from a TID_PROVIDER_* env var at construction (_env_* helpers below), falling
+#         back to the bootstrap default. No existing field changed.
 # [2026-06-27] CC Sonnet 4.6 — #TID-cost-budget: cost_budget_per_request 0.10 → 0.01
 #   What: cost_budget_per_request default reduced from $0.10 to $0.01 per request.
 #   Why:  At $0.10 budget, Opus ($0.005/1k) scores 0.95 on cost — nearly identical to
@@ -60,9 +69,47 @@ Changelog (Grok audit response, 2026-02-19):
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
+
+
+# --- env-backed defaults (LAW 5: env is the source of truth; the literal is only the bootstrap fallback) ---
+
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v.strip() if v is not None and v.strip() != "" else default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(_env_str(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return _env_str(name, "1" if default else "0").lower() not in ("0", "false", "no", "off")
+
+
+def _env_floats(name: str, default: tuple) -> tuple:
+    try:
+        vals = tuple(float(x) for x in _env_str(name, ",".join(str(d) for d in default)).split(",") if x.strip())
+        return vals or tuple(default)
+    except ValueError:
+        return tuple(default)
+
+
+def _env_words(name: str, default: str) -> tuple:
+    return tuple(w.strip().lower() for w in _env_str(name, default).split(",") if w.strip())
 
 
 class ModelType(str, Enum):
@@ -216,6 +263,47 @@ class InferenceDifferenceConfig:
     # Competence Model) — substrate-tunable under Layer A.
     model_penalty_ladder_seconds: tuple = (30, 300, 3600, 86400, 604800, 5184000)
     model_penalty_blacklist_notify: bool = True
+
+    # --- Provider-level routing (design 2026-10-15, #1040/#1126) — env-overridable bootstrap scaffolding ---
+    # A. Provider facts refresher (own clock, LAW 8): per-model OpenRouter endpoints listing.
+    provider_facts_enabled: bool = field(default_factory=lambda: _env_bool("TID_PROVIDER_FACTS_ENABLED", True))
+    provider_facts_refresh_s: float = field(default_factory=lambda: _env_float("TID_PROVIDER_FACTS_REFRESH_S", 3600.0))
+    provider_facts_initial_delay_s: float = field(
+        default_factory=lambda: _env_float("TID_PROVIDER_FACTS_INITIAL_DELAY_S", 20.0))
+    provider_facts_min_spacing_s: float = field(  # rate limit between two endpoints-listing calls
+        default_factory=lambda: _env_float("TID_PROVIDER_FACTS_MIN_SPACING_S", 1.0))
+    provider_facts_path: str = field(default_factory=lambda: _env_str("TID_PROVIDER_FACTS_PATH", ""))  # "" = repo root
+    provider_facts_fetch_timeout_s: float = field(
+        default_factory=lambda: _env_float("TID_PROVIDER_FACTS_FETCH_TIMEOUT_S", 20.0))
+    # B. Served-provider fallback: GET /generation?id=… when a response does not name its provider.
+    provider_generation_lookup: bool = field(default_factory=lambda: _env_bool("TID_PROVIDER_GENERATION_LOOKUP", True))
+    provider_generation_lookup_timeout_s: float = field(
+        default_factory=lambda: _env_float("TID_PROVIDER_GENERATION_LOOKUP_TIMEOUT_S", 3.0))
+    # D. Pair penalty box: SHORT ladder for provider faults (429 / overloaded / provider 5xx). Never the long ladder.
+    provider_penalty_ladder_seconds: tuple = field(
+        default_factory=lambda: _env_floats("TID_PROVIDER_PENALTY_LADDER_S", (30, 60, 120, 300, 600)))
+    # Provider faults move the MODEL-level entry only when every known provider of the model is boxed AND the model
+    # has at least this many known providers (a single-provider model's 429 stays a provider fault).
+    provider_all_fail_min_providers: int = field(
+        default_factory=lambda: _env_int("TID_PROVIDER_ALL_FAIL_MIN_PROVIDERS", 2))
+    # E. Hard filters (only what cannot work).
+    provider_headroom_margin: float = field(default_factory=lambda: _env_float("TID_PROVIDER_HEADROOM_MARGIN", 0.10))
+    provider_deep_quant_floor: str = field(default_factory=lambda: _env_str("TID_PROVIDER_DEEP_QUANT_FLOOR", "fp8"))
+    provider_deep_min_output_tokens: int = field(
+        default_factory=lambda: _env_int("TID_PROVIDER_DEEP_MIN_OUTPUT_TOKENS", 4096))
+    provider_shaping_enabled: bool = field(default_factory=lambda: _env_bool("TID_PROVIDER_SHAPING_ENABLED", True))
+    provider_order_max: int = field(default_factory=lambda: _env_int("TID_PROVIDER_ORDER_MAX", 5))
+    # F. Scoring per task class (§2.1). Latency floor applies to the chat tier only (§2.5).
+    provider_chat_latency_floor_ms: float = field(
+        default_factory=lambda: _env_float("TID_PROVIDER_CHAT_LATENCY_FLOOR_MS", 8000.0))
+    provider_deep_domains: tuple = field(default_factory=lambda: _env_words("TID_PROVIDER_DEEP_DOMAINS", "reasoning"))
+    provider_deep_complexities: tuple = field(
+        default_factory=lambda: _env_words("TID_PROVIDER_DEEP_COMPLEXITIES", "high,extreme"))
+    provider_extraction_domains: tuple = field(
+        default_factory=lambda: _env_words("TID_PROVIDER_EXTRACTION_DOMAINS", "summarization,translation"))
+    provider_stats_window: int = field(default_factory=lambda: _env_int("TID_PROVIDER_STATS_WINDOW", 50))
+    provider_stats_min_samples: int = field(default_factory=lambda: _env_int("TID_PROVIDER_STATS_MIN_SAMPLES", 3))
+    provider_score_blend: float = field(default_factory=lambda: _env_float("TID_PROVIDER_SCORE_BLEND", 0.5))
 
     # Explore-exploit balance (punch list #47)
     # exploration_rate: probability of picking a non-top model to discover
