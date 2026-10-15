@@ -47,6 +47,24 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing,
+#   approved by Josh 2026-10-15) — learn and route at the (model, provider) level (#1040, folds in #1126)
+#   What: (D) report_outcome() attributes each failure: provider faults (429 / overloaded / provider 5xx / timeout)
+#         box the (model, provider) PAIR on a short ladder and never touch the long model ladder or the model's
+#         success-rate samples; transport faults (DNS / network down) charge nobody; model faults keep today's
+#         path. The model ladder moves on provider faults only when EVERY known provider of the model is boxed
+#         (>= provider_all_fail_min_providers providers). A model stays eligible while any provider is eligible.
+#         load_stats() migrates the pre-pair per-model box ONCE (entries kept as model-level, tagged legacy;
+#         nothing dropped); save_stats() keeps the old "penalty" key (rollback-safe) + "penalty_v2" + pair stats.
+#         (C) the NG-Lite deposit target is "<model_id>@<provider>" when the serving provider is known (raw values,
+#         LAW 7), else "<model_id>". (F) _score_learned() folds "<model>@<provider>" weights and the per-pair
+#         task-class window into the model's learned score (best ELIGIBLE provider). (E) provider_preferences()
+#         builds OpenRouter provider.order / provider.ignore / require_parameters; _filter_candidates() drops a
+#         model whose every endpoint fails the hard filter (context / output headroom, deep-tier quantization).
+#   Why:  #1126 — every candidate sat boxed on the laptop (307/334 at L7) because provider-specific upstream
+#         failures escalated the MODEL ladder, so routing fell back to "least-penalised first" and swung with load.
+#   How:  ProviderPenaltyBox (model_penalty.py), provider_facts.py, provider_routing.py. Thresholds from config
+#         (env-backed, LAW 5). Veto-only preserved: boxes only remove providers / models, never add score.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — save_stats() writes model_stats_cache.msgpack atomically
 #   What: inference_difference.atomic_io.atomic_write_bytes (temp + fsync + os.replace) instead of open('wb') in place.
 #   Why:  Josh 2026-10-14 "anything that can't risk a failed save, be atomic"; a kill mid-write left a truncated cache
@@ -175,6 +193,13 @@ from inference_difference.config import (
     TaskDomain,
 )
 from inference_difference.hardware import HardwareProfile
+from inference_difference.provider_facts import (
+    RequestNeeds,
+    hard_filter_endpoints,
+    openrouter_model_name,
+    provider_slug,
+)
+from inference_difference.provider_routing import PairOutcomeStats, classify_failure, task_class
 
 logger = logging.getLogger("inference_difference.router")
 
@@ -281,6 +306,7 @@ class RoutingEngine:
         verbose_reasoning: bool = True,
         catalog_manager: Optional[Any] = None,  # Optional CatalogManager
         dream_cycle: Optional[Any] = None,       # Optional DreamCycle
+        provider_facts: Optional[Any] = None,    # Optional ProviderFactsStore (design 2026-10-15 §3.A)
     ):
         self.config = config
         self.hardware = hardware
@@ -334,6 +360,15 @@ class RoutingEngine:
             time_fn=time.time,
             on_blacklist=self._on_model_blacklist,
         )
+        # (model, provider) pair box — SHORT ladder for provider faults; never the long model ladder (§3.D).
+        from inference_difference.model_penalty import ProviderPenaltyBox
+        self._provider_penalty = ProviderPenaltyBox(
+            ladder_seconds=self.config.provider_penalty_ladder_seconds,
+            time_fn=time.time,
+        )
+        # Raw per-(model, provider) outcome window; task-class scores derived only when read (§3.F).
+        self._pair_stats = PairOutcomeStats(window=self.config.provider_stats_window)
+        self._provider_facts = provider_facts
 
         # Stats persistence — path set here; load/save called from app.py lifespan
         _base_dir = os.path.dirname(os.path.dirname(__file__))
@@ -345,12 +380,17 @@ class RoutingEngine:
         # learned SEPARATELY from her-fit. Persisted TTL-exempt (later task).
         self._tool_competence: Dict[str, float] = {}
 
+    def set_provider_facts(self, store: Optional[Any]) -> None:
+        """Attach the ProviderFactsStore (design 2026-10-15 §3.A). None = model-only behaviour."""
+        self._provider_facts = store
+
     def route(
         self,
         classification: RequestClassification,
         consciousness_score: Optional[float] = None,
         request_id: Optional[str] = None,
         has_tools: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> RoutingDecision:
         """Route a classified request to the best model.
 
@@ -371,7 +411,7 @@ class RoutingEngine:
 
         # Get candidate models (with consciousness quality floor applied)
         candidates, _quality_floor_bypassed = self._filter_candidates(
-            classification, consciousness_score, has_tools=has_tools,
+            classification, consciousness_score, has_tools=has_tools, max_tokens=max_tokens,
         )
 
         # Interactive priority floor — punch list #33 fix: log on fallthrough
@@ -623,10 +663,14 @@ class RoutingEngine:
         if not self.config.enable_learning:
             return
 
+        # (model, provider) attribution (design 2026-10-15 §3.B/§3.D): who served / who failed this call.
+        _prov = self._outcome_provider(decision.model_id, metadata)
+
         # Record in history
         outcome = {
             "request_id": decision.request_id,
             "model_id": decision.model_id,
+            "provider": _prov,
             "success": success,
             "quality_score": quality_score,
             "latency_ms": latency_ms,
@@ -650,6 +694,10 @@ class RoutingEngine:
         tool_kind = self._tool_failure_kind(metadata)  # None | 'structural' | 'unreliable'
         is_provider = self._is_provider_failure(metadata)
 
+        # Fault attribution for a non-tool, non-402 failure: 'model' | 'provider' | 'transport' (§3.D).
+        fault = (classify_failure(metadata)
+                 if (not success and tool_kind is None and not is_provider) else None)
+
         if success:
             # Success credits BOTH axes (her-fit sample + tool gain if tools were in play).
             st = self._model_success_stats.setdefault(decision.model_id, [])
@@ -657,6 +705,7 @@ class RoutingEngine:
             if len(st) > self._SUCCESS_WINDOW:
                 self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
             self._model_penalty.record_success(decision.model_id)
+            self._provider_penalty.record_success(decision.model_id, _prov)
             if metadata and metadata.get("tools_requested") and metadata.get("had_tool_calls"):
                 self._update_tool_competence(decision.model_id, success=True,
                                              model_entry=decision.model_entry)
@@ -665,14 +714,30 @@ class RoutingEngine:
             self._update_tool_competence(decision.model_id, success=False,
                                          structural=(tool_kind == "structural"),
                                          model_entry=decision.model_entry)
-        elif not is_provider:
+        elif is_provider:
+            pass  # provider-wide 402/credit -> neither axis (the model_client provider breaker owns it)
+        elif fault == "transport":
+            pass  # local network down (DNS / unreachable): not the model's fault, not a provider's
+        elif fault == "provider":
+            # 429 / overloaded / provider 5xx / timeout: short box on THIS pair only; never the long ladder
+            # by itself, and no model success-rate sample (that floor would re-create a model-level penalty).
+            self._record_provider_fault(decision.model_id, _prov, metadata)
+        else:
             # Model/conversational failure: her-fit penalty + success-stat sample, as today.
             st = self._model_success_stats.setdefault(decision.model_id, [])
             st.append(False)
             if len(st) > self._SUCCESS_WINDOW:
                 self._model_success_stats[decision.model_id] = st[-self._SUCCESS_WINDOW:]
             self._model_penalty.record_failure(decision.model_id)
-        # else: provider failure -> neither axis (provider breaker owns it)
+        # Raw per-pair window (only when the provider is known and the call reached a provider).
+        if _prov and fault != "transport":
+            md = metadata or {}
+            self._pair_stats.record(
+                decision.model_id, _prov, ok=bool(success),
+                latency_ms=latency_ms, finish_reason=md.get("finish_reason"),
+                prompt_tokens=md.get("prompt_tokens"), completion_tokens=md.get("completion_tokens"),
+                domain=outcome.get("domain"), complexity=outcome.get("complexity"),
+            )
         self._stats_dirty = True
 
         # Teach NG-Lite
@@ -687,9 +752,10 @@ class RoutingEngine:
             # verdict — the deposit no longer carries evaluate_quality's surface+latency judgment.
             # max(0.1, 1.0)=1.0 on success, 1.0 on failure -> uniform; behavior unchanged here.
             outcome_strength = max(0.1, quality_score) if success else 1.0
+            # (C) design 2026-10-15: the provider is part of the target when known — raw, unclassified (LAW 7).
             self._ng_lite.record_outcome(
                 embedding=embedding,
-                target_id=decision.model_id,
+                target_id=(f"{decision.model_id}@{_prov}" if _prov else decision.model_id),
                 success=success,
                 strength=outcome_strength,
                 metadata=metadata,
@@ -813,7 +879,30 @@ class RoutingEngine:
             "exploration_rate": round(self._exploration_rate, 4),
             "exploration_picks": self._exploration_picks,
             "exploration_pick_rate": round(self._exploration_picks / total, 3) if total > 0 else 0.0,
+            "provider_routing": self._provider_routing_stats(),
         }
+
+    def _provider_routing_stats(self) -> Dict[str, Any]:
+        """(model, provider) observability for /stats (design 2026-10-15 §5 acceptance)."""
+        recent: Dict[str, int] = {}
+        for d in self._decision_history:
+            key = f"{d['model_id']}@{d.get('provider') or '?'}"
+            recent[key] = recent.get(key, 0) + 1
+        pairs = self._pair_stats.summary()  # persisted window -> survives restarts / save cycles
+        model_entries = self._model_penalty.entries()
+        now = time.time()
+        out: Dict[str, Any] = {
+            "served": dict(sorted(pairs.items(), key=lambda kv: kv[1]["n"], reverse=True)[:50]),
+            "recent_served": dict(sorted(recent.items(), key=lambda kv: kv[1], reverse=True)[:50]),
+            "pair_boxes_active": self._provider_penalty.active_count(),
+            "model_boxes_active": sum(1 for m in model_entries if self._model_penalty.is_penalized(m)),
+            "model_blacklisted": sum(1 for m in model_entries if self._model_penalty.is_blacklisted(m)),
+            "legacy_entries": sum(1 for e in model_entries.values() if e.get("legacy")),
+            "pairs_observed": len(pairs),
+            "facts": (self._provider_facts.stats() if self._provider_facts is not None else None),
+            "as_of": now,
+        }
+        return out
 
     def set_preference_override(self, oss_boost: float, duration_turns: int) -> None:
         """Temporarily amplify open-source model bias from user feedback.
@@ -881,6 +970,194 @@ class RoutingEngine:
         err = str(metadata.get('error', '')).lower()
         return ('402' in err) or ('insufficient' in err) or ('credit' in err)
 
+    # -------------------------------------------------------------------
+    # (model, provider) level — design 2026-10-15 §3.B/§3.D/§3.E/§3.F
+    # -------------------------------------------------------------------
+
+    def _slug(self, name: Optional[str], model_id: Optional[str] = None) -> str:
+        if not name:
+            return ""
+        if self._provider_facts is not None:
+            try:
+                return self._provider_facts.slug_for_name(name, model_id)
+            except Exception:
+                pass
+        return provider_slug(name)
+
+    def _outcome_provider(self, model_id: str, metadata: Optional[Dict[str, Any]]) -> str:
+        """Base slug of the provider that served (or failed) this call; "" when unknown."""
+        md = metadata or {}
+        return self._slug(md.get("served_provider") or md.get("error_provider"), model_id)
+
+    def _known_provider_slugs(self, model_id: str) -> List[str]:
+        """The model's providers per the facts listing ([] = unknown provider set)."""
+        if self._provider_facts is None:
+            return []
+        try:
+            return list(self._provider_facts.slugs(model_id))
+        except Exception:
+            return []
+
+    def _all_providers_boxed(self, model_id: str) -> bool:
+        known = self._known_provider_slugs(model_id)
+        return bool(known) and all(self._provider_penalty.is_penalized(model_id, p) for p in known)
+
+    def _record_provider_fault(self, model_id: str, provider: str, metadata: Optional[Dict[str, Any]]) -> None:
+        """Short pair box; escalate the MODEL ladder only on the transition to all-providers-boxed."""
+        md = metadata or {}
+        was_all = self._all_providers_boxed(model_id)
+        self._provider_penalty.record_failure(model_id, provider or self._provider_penalty.WILDCARD,
+                                              retry_after_s=md.get("retry_after_s"))
+        # OpenRouter's own earlier attempts in this request (error.metadata.previous_errors) were provider
+        # faults too (e.g. a 504 from Venice after a 429 from DeepInfra): box those pairs as well.
+        for pe in md.get("error_previous_providers") or []:
+            try:
+                code = int(pe.get("code") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            pslug = self._slug(pe.get("provider"), model_id)
+            if pslug and (code == 429 or code == 408 or code >= 500):
+                self._provider_penalty.record_failure(model_id, pslug)
+        known = self._known_provider_slugs(model_id)
+        min_n = int(self.config.provider_all_fail_min_providers)
+        if (not was_all and len(known) >= max(1, min_n) and self._all_providers_boxed(model_id)):
+            logger.info("All %d providers of %s boxed — model-level ladder +1", len(known), model_id)
+            self._model_penalty.record_failure(model_id)
+
+    def _model_eligible(self, model_id: str) -> bool:
+        """Eligible iff the model-level entry is clear AND at least one of its providers is (§3.D)."""
+        if self._model_penalty.is_penalized(model_id):
+            return False
+        if self._provider_penalty.wildcard_penalized(model_id):
+            return False
+        return not self._all_providers_boxed(model_id)
+
+    def _pair_reopen_at(self, model_id: str) -> float:
+        """Earliest moment one of the model's boxed providers reopens (fallthrough ordering only)."""
+        known = self._known_provider_slugs(model_id) or self._provider_penalty.boxed_providers(model_id)
+        times = [self._provider_penalty.reopen_at(model_id, p) for p in known]
+        times.append(self._provider_penalty.reopen_at(model_id, self._provider_penalty.WILDCARD))
+        live = [t for t in times if t > 0]
+        return min(live) if live else 0.0
+
+    def _task_class(self, classification: Optional[RequestClassification]) -> str:
+        if classification is None:
+            return "chat"
+        return task_class(getattr(classification.primary_domain, "value", classification.primary_domain),
+                          getattr(classification.complexity, "value", classification.complexity), self.config)
+
+    def _request_needs(self, classification: RequestClassification,
+                       max_tokens: Optional[int] = None) -> RequestNeeds:
+        """Raw token needs of the request (the classifier's window estimate minus its own safety factor)."""
+        out = int(max_tokens or getattr(classification, "estimated_tokens", 0) or 0)
+        safety = float(self.config.context_window_safety or 1.0)
+        window = int(getattr(classification, "requires_context_window", 0) or 0)
+        est_out = int(getattr(classification, "estimated_tokens", 0) or 0)
+        prompt = max(0, int(window / safety) - est_out)
+        return RequestNeeds(context_tokens=prompt + out, prompt_tokens=prompt, output_tokens=out,
+                            deep=(self._task_class(classification) == "deep"))
+
+    def _split_endpoints(self, model_id: str, needs: RequestNeeds):
+        """(usable, dropped) endpoints per the hard filter; ([], []) when the model has no facts."""
+        if self._provider_facts is None:
+            return [], []
+        eps = self._provider_facts.endpoints(model_id)
+        if not eps:
+            return [], []
+        return hard_filter_endpoints(
+            eps, needs,
+            margin=float(self.config.provider_headroom_margin),
+            quant_floor=str(self.config.provider_deep_quant_floor),
+            deep_min_output=int(self.config.provider_deep_min_output_tokens),
+        )
+
+    def _hard_filtered_out(self, model_id: str, needs: RequestNeeds) -> bool:
+        """True iff the model has facts and NO endpoint can serve this request."""
+        usable, dropped = self._split_endpoints(model_id, needs)
+        return bool(dropped) and not usable
+
+    def _learned_targets(self, model_id: str, classification: RequestClassification):
+        """(model_weight | None, {provider: weight}) from NG-Lite recommendations for this request."""
+        model_w = None
+        pair_w: Dict[str, float] = {}
+        if self._ng_lite is None:
+            return model_w, pair_w
+        embedding = self._classification_to_embedding(classification)
+        recs = self._ng_lite.get_recommendations(embedding, top_k=self.config.learned_top_k)
+        prefix = model_id + "@"
+        for target_id, weight, _reasoning in recs:
+            if target_id == model_id:
+                model_w = weight
+            elif isinstance(target_id, str) and target_id.startswith(prefix):
+                pair_w[target_id[len(prefix):]] = weight
+        return model_w, pair_w
+
+    def _provider_scores(self, model_id: str, classification: RequestClassification,
+                         model_w: Optional[float], pair_w: Dict[str, float]) -> Dict[str, float]:
+        """Learned score per ELIGIBLE provider that has any evidence (pair weight or task-class window)."""
+        neutral = self.config.neutral_score
+        base_default = model_w if model_w is not None else neutral
+        tclass = self._task_class(classification)
+        blend = min(max(float(self.config.provider_score_blend), 0.0), 1.0)
+        cands = set(pair_w) | set(self._pair_stats.providers(model_id)) | set(self._known_provider_slugs(model_id))
+        out: Dict[str, float] = {}
+        for p in cands:
+            if not p or self._provider_penalty.is_penalized(model_id, p):
+                continue
+            q = self._pair_stats.score(model_id, p, tclass, self.config)
+            if p not in pair_w and q is None:
+                continue  # no evidence for this provider — no opinion
+            base = pair_w.get(p, base_default)
+            out[p] = base if q is None else (1.0 - blend) * base + blend * q
+        return out
+
+    def provider_preferences(self, model_id: str, classification: Optional[RequestClassification],
+                             has_tools: bool = False, max_tokens: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """OpenRouter request shaping (§3.E): {"provider": {order, ignore, require_parameters}} or None.
+
+        Only for calls that go to OpenRouter. Boxed pairs and hard-filtered endpoints go to `ignore` — unless that
+        would ignore every endpoint (then nothing is ignored: last-resort behaviour stays as today). Providers with
+        learned evidence go to `order`, best first; OpenRouter's fallbacks stay allowed.
+        """
+        if not self.config.provider_shaping_enabled:
+            return None
+        if openrouter_model_name(model_id) is None:
+            return None
+        prefs: Dict[str, Any] = {}
+        known_all = set()
+        if self._provider_facts is not None:
+            try:
+                known_all = self._provider_facts.known_slugs()
+            except Exception:
+                known_all = set()
+        boxed = set(self._provider_penalty.boxed_providers(model_id))
+        ignore: List[str] = []
+        if classification is not None:
+            needs = self._request_needs(classification, max_tokens)
+            usable, dropped = self._split_endpoints(model_id, needs)
+            eps = usable + [d for d, _ in dropped]
+            if eps:
+                if any(ep.slug not in boxed for ep in usable):
+                    ignore = [ep.tag for ep, _ in dropped if ep.tag]
+                    ignore += sorted(boxed & {ep.slug for ep in eps})
+            else:
+                ignore = sorted(boxed & known_all)
+            model_w, pair_w = self._learned_targets(model_id, classification)
+            scores = self._provider_scores(model_id, classification, model_w, pair_w)
+            emit = set(self._known_provider_slugs(model_id)) or known_all
+            order = [p for p, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+                     if p in emit and p not in ignore]
+            order = order[:max(0, int(self.config.provider_order_max))]
+            if order:
+                prefs["order"] = order
+        else:
+            ignore = sorted(boxed & known_all)
+        if ignore:
+            prefs["ignore"] = list(dict.fromkeys(ignore))
+        if has_tools:
+            prefs["require_parameters"] = True
+        return {"provider": prefs} if prefs else None
+
     # [2026-06-17] CC — two-axis routing (prd 2026-06-17): tool-failure classifier
     def _tool_failure_kind(self, metadata) -> Optional[str]:
         """Classify a tool-attributable failure: 'structural', 'unreliable', or None.
@@ -941,11 +1218,23 @@ class RoutingEngine:
         self._stats_dirty = True
 
     def clear_penalty(self, model_id=None) -> int:
-        """Manual penalty clear (the /routing/penalty/clear endpoint). Returns count cleared."""
+        """Manual penalty clear (the /routing/penalty/clear endpoint). Returns count cleared.
+
+        Clears the model-level entry AND that model's (model, provider) pair boxes (all of them for None).
+        """
         if model_id:
             n = 1 if self._model_penalty.clear(model_id) else 0
+            n += self._provider_penalty.clear(model_id)
         else:
             n = self._model_penalty.clear_all()
+            n += self._provider_penalty.clear(None)
+        if n:
+            self._stats_dirty = True
+        return n
+
+    def clear_legacy_penalties(self) -> int:
+        """Clear only the entries migrated from the pre-pair sidecar (explicit operator action, §3.D)."""
+        n = self._model_penalty.clear_legacy()
         if n:
             self._stats_dirty = True
         return n
@@ -967,6 +1256,20 @@ class RoutingEngine:
             # >24h stale-stats discard, or long-box/blacklist entries evaporate on a
             # quiet-day restart (the recurring bug this feature exists to kill).
             self._model_penalty.from_dict(data.get("penalty"))
+            # (model, provider) pair boxes — TTL-exempt like the model box (design 2026-10-15 §3.D).
+            _v2 = data.get("penalty_v2")
+            if isinstance(_v2, dict):
+                self._provider_penalty.from_dict(_v2.get("pairs"))
+            else:
+                # ONE-TIME migration of the pre-pair sidecar: every per-model entry is KEPT as a model-level
+                # entry (same level, same timer, blacklists stay blacklists) and tagged legacy so an operator can
+                # clear exactly these (POST /routing/penalty/clear {"legacy": true}). Nothing is dropped.
+                _migrated = list(self._model_penalty.entries())
+                for _mid in _migrated:
+                    self._model_penalty.mark_legacy(_mid)
+                self._stats_dirty = True  # persist the v2 marker so the migration never runs again
+                logger.info("Penalty box migrated to (model, provider) format: %d model-level entr(ies) kept "
+                            "as legacy", len(_migrated))
             # tool_competence is learned capability, NOT stale stats — load it
             # UNCONDITIONALLY (TTL-exempt), same rationale as penalty (prd 2026-06-17 §4).
             # ---- Changelog ----
@@ -995,6 +1298,8 @@ class RoutingEngine:
                 for k, vs in raw.items()
                 if isinstance(vs, list)
             }
+            # Per-pair raw window is volatile observation, like the stats above (same 24h discard).
+            self._pair_stats.from_dict(data.get("pair_stats"))
             logger.info(
                 "Loaded success stats for %d models from cache",
                 len(self._model_success_stats),
@@ -1024,6 +1329,10 @@ class RoutingEngine:
                     # How: Dict snapshot alongside penalty; loaded TTL-exempt in load_stats.
                     # -------------------
                     "tool_competence": dict(self._tool_competence),
+                    # [2026-10-15] (model, provider) level — "penalty" above stays the model-level box in the
+                    # pre-pair shape so a rollback to older code still reads it.
+                    "penalty_v2": {"version": 2, "pairs": self._provider_penalty.to_dict()},
+                    "pair_stats": self._pair_stats.to_dict(),
             }))
             self._stats_dirty = False
             logger.debug(
@@ -1042,6 +1351,7 @@ class RoutingEngine:
         classification: RequestClassification,
         consciousness_score: Optional[float] = None,
         has_tools: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> Tuple[List[ModelEntry], bool]:
         """Filter models to those that can handle this request.
 
@@ -1168,9 +1478,24 @@ class RoutingEngine:
         # misses (e.g. wrong-ID 400s that never accumulate 'success' samples). The floor is
         # kept (not removed) precisely because the box starts EMPTY on deploy and must not
         # leave a protection gap (regression 2026-06-13). VETO-ONLY: never contributes a score.
+        # Provider hard filter (design 2026-10-15 §2.3/§3.E): drop a model only when it has provider facts and
+        # NONE of its endpoints can serve this request (context / output headroom; deep tier: quantization floor).
+        # No facts -> no hard filter. Never empties the pool by itself.
+        if candidates and self._provider_facts is not None:
+            _needs = self._request_needs(classification, max_tokens)
+            servable = [m for m in candidates if not self._hard_filtered_out(m.model_id, _needs)]
+            if servable:
+                if len(servable) < len(candidates):
+                    logger.info("Provider hard filter excluded %d model(s)", len(candidates) - len(servable))
+                candidates = servable
+            else:
+                logger.warning("Provider hard filter would exclude ALL %d candidates — keeping pool",
+                               len(candidates))
         if candidates:
-            eligible = [m for m in candidates
-                        if not self._model_penalty.is_penalized(m.model_id)]
+            # (model, provider) level (§3.D): a model is eligible while its model-level entry is clear and at
+            # least one of its providers is unboxed. A model with EVERY provider boxed is treated exactly like a
+            # penalized model below (same exclusion, same all-excluded fallthrough).
+            eligible = [m for m in candidates if self._model_eligible(m.model_id)]
             if eligible:
                 pruned = len(candidates) - len(eligible)
                 if pruned:
@@ -1179,9 +1504,11 @@ class RoutingEngine:
             else:
                 # All candidates penalized — never hard-fail purely from the box.
                 # Fallthrough ORDER: least-penalized first; a blacklisted (L7) model is
-                # the absolute last resort (law-enforcer HIGH).
+                # the absolute last resort (law-enforcer HIGH). Ties (e.g. models that are only
+                # pair-boxed, model level 0) go soonest-reopening first.
                 candidates = sorted(
-                    candidates, key=lambda m: self._model_penalty.level(m.model_id))
+                    candidates, key=lambda m: (self._model_penalty.level(m.model_id),
+                                               self._pair_reopen_at(m.model_id)))
                 logger.warning(
                     "Penalty box would exclude ALL %d candidates — keeping pool, "
                     "least-penalized first (blacklist last), to avoid routing failure",
@@ -1338,14 +1665,17 @@ class RoutingEngine:
         neutral = self.config.neutral_score
 
         # Local NG-Lite score (Tier 1/2 substrate).
+        # (F) design 2026-10-15: "<model>@<provider>" targets fold in — the model scores as its BEST ELIGIBLE
+        # provider (pair weight blended with that pair's task-class window). No pair evidence -> today's
+        # model-only weight. Boxed providers are skipped before the max (the box only excludes; it adds nothing).
         ng_score = neutral
         if self._ng_lite is not None:
-            embedding = self._classification_to_embedding(classification)
-            recs = self._ng_lite.get_recommendations(embedding, top_k=self.config.learned_top_k)
-            for target_id, weight, _reasoning in recs:
-                if target_id == model.model_id:
-                    ng_score = weight
-                    break
+            model_w, pair_w = self._learned_targets(model.model_id, classification)
+            if model_w is not None:
+                ng_score = model_w
+            per_provider = self._provider_scores(model.model_id, classification, model_w, pair_w)
+            if per_provider:
+                ng_score = max(per_provider.values())
 
         # Commons-enhanced score (peninsula; blended by competence trust).
         if self._peninsula is not None and self._commons_competence is not None:

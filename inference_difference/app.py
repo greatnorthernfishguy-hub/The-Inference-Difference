@@ -61,6 +61,20 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing,
+#   approved by Josh 2026-10-15) — (model, provider)-level routing wiring (#1040 / #1126)
+#   What: lifespan builds the ProviderFactsStore (+ loads provider_facts.msgpack) and starts the
+#         ProviderFactsRefresher on its own clock (LAW 8), stopped + saved on shutdown. Every OpenRouter call
+#         (primary, blocking fallbacks, stream attempts) carries the router's provider preferences
+#         (provider.order / ignore / require_parameters) via extra_params. Every outcome report carries the raw
+#         per-call provider facts (served provider, error provider + typed error_type, http status, Retry-After,
+#         tokens, finish_reason). The blocking fallback loop now charges each attempt to the model that was
+#         actually tried (it charged the PRIMARY for every fallback failure, and credited the primary with a
+#         fallback's success — one bad cascade climbed the primary many rungs). Attempt decisions also carry the
+#         attempted model's own ModelEntry (the conversational-quality EMA was updating the primary's entry).
+#         POST /routing/penalty/clear accepts {"legacy": true} (clears only migrated pre-pair entries).
+#   Why:  design §3.B/§3.D/§3.E; #1126 everything-boxed.
+#   How:  _attempt_decision(), _provider_meta(), _provider_extra() helpers; no hook / pipeline order change.
 # [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — _save_routing_state() writes routing_state.msgpack atomically
 #   (inference_difference.atomic_io.atomic_write_bytes; same payload and path). Josh 2026-10-14 "be atomic".
 # [2026-10-03] Claude Opus 5.5 (Executive, laptop MVP) — _register_catalog_models applies catalog_filters.yaml (ceiling/blocklist/allowlist) and drops :batch ids; the routing pool had bypassed both.
@@ -282,6 +296,51 @@ async def _ng_save_loop() -> None:
                 logger.warning("Periodic NG-Lite state save failed: %s", e)
 
 
+def _attempt_decision(decision: Any, model_id: str) -> Any:
+    """The routing decision re-targeted at the model actually attempted (outcome attribution, design §3.D)."""
+    if decision is None or decision.model_id == model_id:
+        return decision
+    from copy import copy
+    d = copy(decision)
+    d.model_id = model_id
+    try:
+        d.model_entry = _state.config.get_model(model_id) or decision.model_entry
+    except Exception:
+        pass
+    return d
+
+
+def _provider_meta(resp: Any) -> Dict[str, Any]:
+    """Raw per-call provider facts for the outcome deposit (design §3.B/§3.C). Unclassified (LAW 7)."""
+    if resp is None:
+        return {}
+    usage = getattr(resp, "usage", None) or {}
+    return {
+        "served_provider": getattr(resp, "provider", "") or "",
+        "error_provider": getattr(resp, "error_provider", "") or "",
+        "error_previous_providers": list(getattr(resp, "error_previous_providers", None) or []),
+        "http_status": getattr(resp, "http_status", None),
+        "error_type": getattr(resp, "error_type", "") or "",
+        "retry_after_s": getattr(resp, "retry_after_s", None),
+        "prompt_tokens": usage.get("prompt_tokens") if isinstance(usage, dict) else None,
+        "completion_tokens": usage.get("completion_tokens") if isinstance(usage, dict) else None,
+        "finish_reason": getattr(resp, "finish_reason", None),
+    }
+
+
+def _provider_extra(model_id: str, classification: Any, has_tools: bool,
+                    max_tokens: Optional[int]) -> Optional[Dict[str, Any]]:
+    """extra_params carrying OpenRouter provider preferences for this attempt (design §3.E), or None."""
+    if _state.engine is None:
+        return None
+    try:
+        return _state.engine.provider_preferences(model_id, classification, has_tools=has_tools,
+                                                  max_tokens=max_tokens)
+    except Exception as e:  # noqa: BLE001 — shaping must never block a call
+        logger.debug("provider preferences failed for %s (sent unshaped): %s", model_id, e)
+        return None
+
+
 async def _stats_flush_loop() -> None:
     """Flush model success stats cache every 60s if dirty."""
     while True:
@@ -457,6 +516,8 @@ class AppState:
     dream_cycle: Optional[DreamCycle] = None
     module_registry: Optional[ModuleRegistry] = None
     ng_ecosystem: Optional[Any] = None
+    provider_facts: Optional[Any] = None
+    provider_facts_refresher: Optional[Any] = None
     start_time: float = 0.0
     routing_mode: str = "personal"
 
@@ -972,13 +1033,40 @@ async def lifespan(app: FastAPI):
         dream_cycle=_state.dream_cycle,
     )
     _state.engine.load_stats()
+    # Provider facts (design 2026-10-15 §3.A): persisted cache + own-clock refresher (LAW 8). Fail-soft: no
+    # facts -> no hard filter and no provider names in requests; routing behaves model-only for that model.
+    try:
+        from inference_difference.provider_facts import ProviderFactsRefresher, ProviderFactsStore
+        _pf_path = _state.config.provider_facts_path or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "provider_facts.msgpack")
+        _state.provider_facts = ProviderFactsStore(_pf_path)
+        _state.provider_facts.load()
+        _state.engine.set_provider_facts(_state.provider_facts)
+        if _state.config.provider_facts_enabled:
+            _state.provider_facts_refresher = ProviderFactsRefresher(
+                _state.provider_facts,
+                models_fn=lambda: [m.model_id for m in _state.config.get_enabled_models()],
+                interval_s=_state.config.provider_facts_refresh_s,
+                initial_delay_s=_state.config.provider_facts_initial_delay_s,
+                min_spacing_s=_state.config.provider_facts_min_spacing_s,
+                fetch_timeout_s=_state.config.provider_facts_fetch_timeout_s,
+            )
+            _state.provider_facts_refresher.start()
+            logger.info("Provider facts refresher started (every %.0fs)", _state.config.provider_facts_refresh_s)
+    except Exception as e:
+        logger.warning("Provider facts init failed (model-only routing): %s", e)
+        _state.provider_facts = None
+        _state.provider_facts_refresher = None
     _load_routing_state()
     if _state.routing_mode != "personal":
         _state.engine.set_routing_mode(_state.routing_mode)
     _state.recent_decisions = {}
 
     # Create model client for forwarding requests to providers
-    _state.model_client = ModelClient()
+    _state.model_client = ModelClient(
+        generation_lookup=_state.config.provider_generation_lookup,
+        generation_lookup_timeout_s=_state.config.provider_generation_lookup_timeout_s,
+    )
 
     # NG Ecosystem already initialized above (uni-bridge pattern)
 
@@ -1074,6 +1162,11 @@ async def lifespan(app: FastAPI):
     if _state.engine is not None:
         _state.engine.save_stats()
     _save_routing_state()
+    if _state.provider_facts_refresher is not None:
+        try:
+            _state.provider_facts_refresher.stop()
+        except Exception as e:
+            logger.warning("Provider facts refresher stop failed: %s", e)
 
     # Shutdown ET modules
     if _state.module_registry is not None:
@@ -1385,6 +1478,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             consciousness_score=consciousness_score,
             request_id=request_id,
             has_tools=bool(req.tools),
+            max_tokens=req.max_tokens,
         )
         ctx.routing_decision = decision
         selected_model = decision.model_id
@@ -1432,6 +1526,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
         messages=req.messages,
         temperature=req.temperature,
         max_tokens=req.max_tokens,
+        extra_params=_provider_extra(selected_model, classification, bool(req.tools), req.max_tokens),
         tools=req.tools,
         tool_choice=req.tool_choice,
     )
@@ -1459,8 +1554,9 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
 
         # Record the failure BEFORE moving on (#19 — retry chain experience)
         if decision is not None and _state.engine is not None:
+            # [2026-10-15] charge the model that was actually tried (was: always the primary).
             _state.engine.report_outcome(
-                decision=decision,
+                decision=_attempt_decision(decision, tried_models[-1]),
                 success=False,
                 quality_score=0.0,
                 latency_ms=model_response.latency_ms,
@@ -1470,6 +1566,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
                     "fallback_to": fallback_id,
                     "error": str(model_response.error)[:200],
                     "tools_requested": bool(req.tools),  # [2026-06-17] CC — two-axis routing (prd 2026-06-17): enable tool-failure classifier
+                    **_provider_meta(model_response),
                 },
             )
 
@@ -1507,6 +1604,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             messages=req.messages,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
+            extra_params=_provider_extra(fallback_id, classification, bool(retry_tools), req.max_tokens),
             tools=retry_tools,
             tool_choice=retry_tool_choice,
         )
@@ -1562,7 +1660,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
             finish_reason=getattr(model_response, "finish_reason", None),
         )
         _state.engine.report_outcome(
-            decision=decision,
+            decision=_attempt_decision(decision, tried_models[-1]),  # [2026-10-15] the model that answered
             success=_succ,
             quality_score=_strength,
             latency_ms=model_response.latency_ms,
@@ -1570,6 +1668,7 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
                 "cascade_depth": len(tried_models) - 1,
                 "cascade_total_ms": time.monotonic() * 1000 - _cascade_start_ms,
                 "models_tried": tried_models,
+                **_provider_meta(model_response),
                 **_raw,
             },
         )
@@ -1719,6 +1818,8 @@ def _stream_response(
                 messages=req.messages,
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
+                extra_params=_provider_extra(model_id, classification,
+                                             bool(None if _wh_s else req.tools), req.max_tokens),
                 tools=(None if _wh_s else req.tools),
                 tool_choice=(None if _wh_s else req.tool_choice),
             )
@@ -1842,20 +1943,21 @@ def _report_stream_outcome(
         tool_calls=None,
         tools_requested=False,
         latency_ms=getattr(stream_result, "latency_ms", None),
+        finish_reason=getattr(stream_result, "finish_reason", None),
     )
 
     # Create a synthetic decision for this specific model
     # so NG-Lite learns about THIS model, not just the primary
-    from copy import copy
-    model_decision = copy(decision)
-    model_decision.model_id = model_id
+    # ([2026-10-15] _attempt_decision also swaps in this model's own ModelEntry)
+    model_decision = _attempt_decision(decision, model_id)
 
     _state.engine.report_outcome(
         decision=model_decision,
         success=_succ,
         quality_score=_strength,
         latency_ms=getattr(stream_result, "latency_ms", None),
-        metadata={"stream_fallback": True, "error": getattr(stream_result, "error", None), **_raw},
+        metadata={"stream_fallback": True, "error": getattr(stream_result, "error", None),
+                  **_provider_meta(stream_result), **_raw},
     )
 
 
@@ -2152,6 +2254,7 @@ class PenaltyClearRequest(BaseModel):
     """Request body for POST /routing/penalty/clear."""
     model_id: str = ""
     all: bool = False
+    legacy: bool = False  # [2026-10-15] clear only entries migrated from the pre-pair sidecar
 
 
 @app.post("/routing/penalty/clear")
@@ -2164,10 +2267,12 @@ async def clear_penalty_endpoint(req: PenaltyClearRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="engine not initialized")
     if req.all:
         n = _state.engine.clear_penalty(None)
+    elif req.legacy:
+        n = _state.engine.clear_legacy_penalties()
     elif req.model_id:
         n = _state.engine.clear_penalty(req.model_id)
     else:
-        raise HTTPException(status_code=422, detail="model_id or all=true required")
+        raise HTTPException(status_code=422, detail="model_id, legacy=true or all=true required")
     _state.engine.save_stats()
     logger.info("Penalty cleared via endpoint: %d entr(ies)", n)
     return {"cleared": n, "ok": True}
