@@ -357,7 +357,8 @@ class TestFilterLoading:
         assert f.hard_ceiling_input == 20.0
         assert f.hard_ceiling_output == 60.0
         assert "openrouter" in f.allowlist_providers
-        assert "venice" in f.allowlist_providers
+        # Venice disconnected 2026-06-25 (Josh, ea1ce8f): unfunded last-ditch malformed her voice
+        assert "venice" not in f.allowlist_providers
         # HuggingFace removed from allowlist — fetch disabled, no valid key
         assert "ollama/qwen2.5:1.5b" in f.blocklist_models
 
