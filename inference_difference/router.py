@@ -47,6 +47,11 @@ Changelog (Grok audit response, 2026-02-19):
   the DreamCycle for analysis.
 
 # ---- Changelog ----
+# [2026-10-14] Claude Code (Opus 5.5, lane atomic-saves) — save_stats() writes model_stats_cache.msgpack atomically
+#   What: inference_difference.atomic_io.atomic_write_bytes (temp + fsync + os.replace) instead of open('wb') in place.
+#   Why:  Josh 2026-10-14 "anything that can't risk a failed save, be atomic"; a kill mid-write left a truncated cache
+#         and load_stats() started cold (tool_competence is TTL-exempt learned state).
+#   How:  same msgpack payload, same path; load_stats() unchanged.
 # [2026-06-30] Claude Code (Sonnet 4.6) — #97 TID Commons valence routing: peninsula body-side
 #   What: Wire TIDPeninsulaBody into RoutingEngine. deposit() called in report_outcome() after
 #     local NG-Lite record. _score_learned() blends enhanced peninsula score with NG-Lite score,
@@ -1006,8 +1011,8 @@ class RoutingEngine:
             return
         import msgpack
         try:
-            with open(self._stats_cache_path, "wb") as f:
-                f.write(msgpack.packb({
+            from inference_difference.atomic_io import atomic_write_bytes
+            atomic_write_bytes(self._stats_cache_path, msgpack.packb({
                     "saved_at": time.time(),
                     "stats": dict(self._model_success_stats),
                     "penalty": self._model_penalty.to_dict(),
@@ -1019,7 +1024,7 @@ class RoutingEngine:
                     # How: Dict snapshot alongside penalty; loaded TTL-exempt in load_stats.
                     # -------------------
                     "tool_competence": dict(self._tool_competence),
-                }))
+            }))
             self._stats_dirty = False
             logger.debug(
                 "model_stats_cache.msgpack flushed (%d models)",
