@@ -26,6 +26,17 @@ Changelog (Grok audit response, 2026-02-19):
   Enum(value) IS from_str(). No custom method needed.
 """
 # ---- Changelog ----
+# [2026-06-27] CC Sonnet 4.6 — #TID-cost-budget: cost_budget_per_request 0.10 → 0.01
+#   What: cost_budget_per_request default reduced from $0.10 to $0.01 per request.
+#   Why:  At $0.10 budget, Opus ($0.005/1k) scores 0.95 on cost — nearly identical to
+#         free models (1.0). The 0.15 cost_efficiency weight produced only a 0.0075
+#         advantage for free models vs Opus's 0.075 quality advantage. Quality dominated
+#         by 10:1, making cost_efficiency a dead dimension. Same root pattern as the
+#         2026-05-31 priority_bonus and consciousness_boost fixes: one factor neutralizing
+#         the composite. At $0.01 budget, Opus scores 0.50 on cost (vs 1.0 for free
+#         models) — a 0.075 cost gap that balances the 0.075 quality gap. All six scoring
+#         factors now contribute meaningfully. No single factor decides.
+#   How:  Default value change only. No behavioral logic change.
 # [2026-06-04] CC Sonnet 4.6 — #282: Routing realignment — complexity ceiling + Venice demotion
 #   What: tier_complexity_standard 0.5→0.75 (→HIGH), complexity_words_high 300→500,
 #         venice_identity_bias 0.02→0.0, Venice static priorities 45/35/50→3.
@@ -190,7 +201,7 @@ class InferenceDifferenceConfig:
     max_retries: int = 2
     quality_threshold: float = 0.7
     latency_budget_ms: float = 5000.0
-    cost_budget_per_request: float = 0.10
+    cost_budget_per_request: float = 0.01
     ng_lite_state_path: str = "ng_lite_state.json"
     enable_learning: bool = True
     enable_consciousness_routing: bool = True

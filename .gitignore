@@ -30,6 +30,12 @@ fastembed_cache/
 __pycache__/
 *.pyc
 
+# Claude Code nested worktrees (full checkouts — never track)
+.claude/worktrees/
+
+# Claude Code subagent memory (machine-local Law Enforcer state — never track)
+.claude/agent-memory/
+
 # Credentials — never track
 .env
 .env.*
