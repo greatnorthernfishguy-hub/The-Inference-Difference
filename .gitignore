@@ -10,6 +10,8 @@ build/
 
 # NG-Lite runtime state (generated during operation/tests)
 ng_lite_state.json
+ng_lite_state.msgpack
+ng_lite_state.json.legacy-json
 inference_difference_ng.json
 
 # Router runtime persistence (generated at runtime; self-expiring cache)
