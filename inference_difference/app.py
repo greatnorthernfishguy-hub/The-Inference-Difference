@@ -61,6 +61,10 @@ Changelog (Transparent Proxy, 2026-02-24):
 - ADDED: GET /v1/models — OpenAI-compatible model listing.
 
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, Executive; Josh "Good catches and calls") — no frontier model per token, explicit too
+#   What: _caller_model_allowed(); chat_completions auto-routes (WARNING) when the caller names a blocklisted model.
+#   Why:  a caller-chosen model skipped the catalog filters, so a named frontier model was forwarded per token.
+#   How:  same CatalogManager.is_blocklisted() the catalog registration uses (catalog_filters.yaml model_patterns).
 # [2026-10-15] Claude Code (Opus 5.5, lane tid-provider-routing; design 2026-10-15-tid-provider-level-routing,
 #   approved by Josh 2026-10-15) — (model, provider)-level routing wiring (#1040 / #1126)
 #   What: lifespan builds the ProviderFactsStore (+ loads provider_facts.msgpack) and starts the
@@ -658,6 +662,17 @@ def _tier_weight_to_complexity(weight: float) -> ComplexityTier:
         return ComplexityTier.MEDIUM
     else:
         return ComplexityTier.LOW
+
+
+def _caller_model_allowed(model_id: str) -> bool:
+    """False when the operator blocklist (catalog_filters.yaml: providers, ids, model_patterns) excludes model_id.
+
+    [2026-10-15] An explicitly requested model used to bypass the catalog filters entirely, so a caller naming a
+    frontier model reached it per token. No catalog manager -> allowed (today's behaviour)."""
+    cm = getattr(_state, "catalog_manager", None)
+    if cm is None or not model_id:
+        return True
+    return not cm.is_blocklisted(model_id, model_id.split("/", 1)[0])
 
 
 def _register_catalog_models() -> None:
@@ -1348,6 +1363,12 @@ async def chat_completions(req: ChatCompletionRequest) -> JSONResponse:
     caller_chose_model = (
         resolved_model != "" and translation_type != "auto"
     )
+    if caller_chose_model and not _caller_model_allowed(resolved_model):
+        # Josh's standing rule (no frontier model per token): a named blocklisted model is never forwarded;
+        # TID auto-routes instead, so the request is still answered.
+        logger.warning("Caller asked for blocklisted model %s (operator blocklist) -- auto-routing instead",
+                       resolved_model)
+        caller_chose_model = False
 
     # Extract the user's last message for classification
     user_message = ""

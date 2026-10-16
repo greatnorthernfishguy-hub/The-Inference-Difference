@@ -27,6 +27,19 @@ blocklist:
     - "openrouter/openai/o3-deep-research"
     - "openrouter/openai/o4-mini-deep-research"
     - "openrouter/alibaba/tongyi-deepresearch-30b-a3b"
+  # [2026-10-15] Josh's standing rule: NO frontier model per token — "OpenRouter is for open-source models ONLY";
+  # frontier models are used only through subscriptions already paid for. Regexes (re.search, case-insensitive)
+  # against the full TID id. Open-weights models from the same labs stay eligible (Gemma, gpt-oss).
+  model_patterns:
+    - "^openrouter/anthropic/"              # Claude (subscription only)
+    - "^openrouter/openai/(?!gpt-oss)"      # GPT / o-series / codex; gpt-oss is open weights
+    - "^openrouter/x-ai/"                   # Grok (subscription only)
+    - "grok"                                # Grok via any other provider (e.g. venice/grok-*)
+    - "^openrouter/google/gemini"           # Gemini (Gemma stays: open weights)
+    - "^openrouter/amazon/nova"             # Amazon Nova
+    - "^openrouter/cohere/command"          # Cohere Command A
+    - "^openrouter/mistralai/mistral-large" # Mistral Large (Josh 2026-10-15: block to be safe)
+    - "^openrouter/openrouter/(auto|auto-beta|pareto-code)$"  # OpenRouter's routers can pick a frontier model
 # If non-empty, ONLY these providers are eligible (overrides blocklist)
 allowlist:
   providers:

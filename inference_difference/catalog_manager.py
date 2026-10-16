@@ -19,6 +19,15 @@ Key design decisions:
   remain valid alongside dynamic profile references (new format).
 """
 # ---- Changelog ----
+# [2026-10-15] Claude Code (Opus 5.5, Executive; Josh "Good catches and calls") — blocklist.model_patterns
+#   What: catalog_filters.yaml gains blocklist.model_patterns (regexes, case-insensitive, matched with re.search
+#         against the full TID id); _apply_blocklist drops any model a pattern matches; get_stats reports them.
+#   Why:  Josh's standing rule — no frontier model per token, OpenRouter is for open-source only. /models/user
+#         still listed 50 frontier-lab ids (Opus/Sonnet/Haiku 5.5, GPT-4o..5.4, Nova, Command A, Mistral Large) and
+#         TID routed real traffic to Haiku 5.5, Sonnet 4.6 and GPT-5.1-codex-mini on 2026-10-14/15. The exact-id
+#         blocklist cannot keep up with new releases; a lab-level pattern does.
+#   How:  patterns compiled once at load; an invalid pattern is logged and skipped (never widens the pool silently
+#         beyond what the valid ones block). Same filter path the catalog registration already uses.
 # [2026-10-03] Claude Opus 5.5 (Executive, laptop MVP) — with OPENROUTER_API_KEY set, fetch /models/user (the account's own
 #   guardrail/privacy-filtered list) instead of the public list; a failure keeps the cache, never widens to the public list.
 #   Why: TID kept routing to models the account cannot use (73 ':batch' ids, guardrail-blocked endpoints), each a 404.
@@ -151,6 +160,7 @@ class CatalogFilters:
     """Operator-level overrides from catalog_filters.yaml (§4.5.4)."""
     blocklist_providers: List[str] = field(default_factory=list)
     blocklist_models: List[str] = field(default_factory=list)
+    blocklist_model_patterns: List[str] = field(default_factory=list)   # regexes (re.search, case-insensitive)
     allowlist_providers: List[str] = field(default_factory=list)
     hard_ceiling_input: float = 20.0     # USD per 1M input tokens
     hard_ceiling_output: float = 60.0    # USD per 1M output tokens
@@ -378,6 +388,7 @@ class CatalogManager:
         self.filters = CatalogFilters(
             blocklist_providers=blocklist.get("providers", []) or [],
             blocklist_models=blocklist.get("models", []) or [],
+            blocklist_model_patterns=blocklist.get("model_patterns", []) or [],
             allowlist_providers=allowlist.get("providers", []) or [],
             hard_ceiling_input=ceiling.get(
                 "max_cost_per_1m_input_tokens", 20.0,
@@ -954,18 +965,38 @@ class CatalogManager:
                 and m.cost_per_1m_output <= self.filters.hard_ceiling_output)
         ]
 
+    def _blocklist_regexes(self) -> List["re.Pattern"]:
+        """Compiled blocklist.model_patterns (cached per filters object). Invalid patterns are logged and skipped."""
+        key = tuple(self.filters.blocklist_model_patterns)
+        cached = getattr(self, "_block_re_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        out = []
+        for pat in key:
+            try:
+                out.append(re.compile(pat, re.IGNORECASE))
+            except re.error as exc:
+                logger.error("catalog_filters: invalid blocklist model pattern %r skipped (%s)", pat, exc)
+        self._block_re_cache = (key, out)
+        return out
+
+    def is_blocklisted(self, model_id: str, provider: str = "") -> bool:
+        """True if the operator blocklist (providers, exact ids, or model_patterns) excludes this model."""
+        if provider and provider in self.filters.blocklist_providers:
+            return True
+        if model_id in self.filters.blocklist_models:
+            return True
+        return any(rx.search(model_id) for rx in self._blocklist_regexes())
+
     def _apply_blocklist(
         self, candidates: List[CatalogModel],
     ) -> List[CatalogModel]:
-        """Remove blocklisted providers and models."""
-        if not self.filters.blocklist_providers and not self.filters.blocklist_models:
+        """Remove blocklisted providers, models and model patterns."""
+        if (not self.filters.blocklist_providers and not self.filters.blocklist_models
+                and not self.filters.blocklist_model_patterns):
             return candidates
 
-        return [
-            m for m in candidates
-            if (m.provider not in self.filters.blocklist_providers
-                and m.id not in self.filters.blocklist_models)
-        ]
+        return [m for m in candidates if not self.is_blocklisted(m.id, m.provider)]
 
     def _apply_allowlist(
         self, candidates: List[CatalogModel],
@@ -1119,6 +1150,7 @@ class CatalogManager:
             "filters": {
                 "blocklist_providers": self.filters.blocklist_providers,
                 "blocklist_models": self.filters.blocklist_models,
+                "blocklist_model_patterns": self.filters.blocklist_model_patterns,
                 "allowlist_providers": self.filters.allowlist_providers,
                 "hard_ceiling_input": self.filters.hard_ceiling_input,
                 "hard_ceiling_output": self.filters.hard_ceiling_output,
